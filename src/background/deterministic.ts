@@ -21,6 +21,46 @@ interface DeterministicResult {
 }
 
 /**
+ * Canonical host for a bare, well-known site name. "gmail" must become
+ * gmail.com (not the invalid https://gmail), "notion" → notion.so, and so on.
+ * Exporting this lets the executor apply the same correction to model-written
+ * URLs like https://gmail.
+ */
+export const KNOWN_DOMAIN_HOSTS: Record<string, string> = {
+  youtube: "youtube.com",
+  google: "google.com",
+  github: "github.com",
+  twitter: "twitter.com",
+  reddit: "reddit.com",
+  facebook: "facebook.com",
+  instagram: "instagram.com",
+  linkedin: "linkedin.com",
+  amazon: "amazon.com",
+  netflix: "netflix.com",
+  spotify: "spotify.com",
+  wikipedia: "wikipedia.org",
+  stackoverflow: "stackoverflow.com",
+  gmail: "gmail.com",
+  outlook: "outlook.com",
+  yahoo: "yahoo.com",
+  bing: "bing.com",
+  discord: "discord.com",
+  slack: "slack.com",
+  notion: "notion.so",
+  figma: "figma.com",
+  linear: "linear.app",
+  vercel: "vercel.com",
+  netlify: "netlify.com",
+};
+
+/** Resolve a bare site name to its canonical host, or null if it is not a known name. */
+export function canonicalHost(raw: string): string | null {
+  const bare = raw.trim().replace(/^www\./i, "").toLowerCase();
+  if (!/^[\w-]+$/.test(bare)) return null; // already contains a dot (real host) or junk
+  return KNOWN_DOMAIN_HOSTS[bare] ?? null;
+}
+
+/**
  * Try to resolve a task description into a concrete action without
  * using the LLM. Returns null if the task is too complex.
  *
@@ -135,12 +175,34 @@ export function tryDeterministic(
 
     // Validate: must look like a URL or domain name.
     const isUrl = /^(https?:\/\/|www\.|[\w-]+\.[\w.-]+(?:\/\S*)?$)/.test(raw);
-    const isKnownDomain = /^(youtube|google|github|twitter|reddit|facebook|instagram|linkedin|amazon|netflix|spotify|wikipedia|stackoverflow|gmail|outlook|yahoo|bing|discord|slack|notion|figma|linear|vercel|netlify)(\.com|\.org|\.io)?$/i.test(raw);
+    const canonical = canonicalHost(raw);
+    if (!isUrl && !canonical) return { resolved: false };
 
-    if (!isUrl && !isKnownDomain) return { resolved: false };
-
-    // Normalize: add https:// if no protocol.
-    const url = /^(https?:\/\/|www\.)/.test(raw) ? raw : `https://${raw}`;
+    // Normalize: add https:// if no protocol. Bare known names get their
+    // canonical TLD appended (gmail → https://gmail.com, never https://gmail).
+    // Protocol-carrying URLs with a bare host (https://gmail) get the same
+    // fix — the planner must not emit invalid URLs even before the executor
+    // gets a chance to correct them.
+    let url: string;
+    if (/^https?:\/\//.test(raw)) {
+      try {
+        const u = new URL(raw);
+        const host = u.hostname.toLowerCase();
+        const isBare = !host.includes(".") && host !== "localhost";
+        const fix = isBare ? canonicalHost(host) : null;
+        if (fix) u.hostname = fix;
+        url = u.toString();
+      } catch {
+        url = raw;
+      }
+    } else if (canonical) {
+      // canonicalHost strips a leading www., so "www.gmail" also lands here.
+      url = `https://${canonical}`;
+    } else if (/^www\./.test(raw)) {
+      url = `https://${raw}`;
+    } else {
+      url = `https://${raw}`;
+    }
 
     return {
       resolved: true,

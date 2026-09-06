@@ -1184,4 +1184,137 @@ ok("rule stays scoped — a different domain mints its own separate rule",
   ),
   JSON.stringify(reflOtherSite.newRules.map((r) => `${r.pattern.domain}:${r.pattern.condition}`)));
 
+// ─── Scenario W: self-improvement — URL fixes, failure causes, lessons/replay, rule lifecycle ──
+console.log("\n=== Scenario W: self-improvement hardening ===\n");
+
+const { canonicalHost } = await import("../src/background/deterministic.ts");
+const { chromeErrorReason } = await import("../src/background/executor.ts");
+const { classifyFailure } = await import("../src/background/failure-causes.ts");
+const { matchLessons } = await import("../src/background/lessons.ts");
+const { matchTrajectories } = await import("../src/background/trajectories.ts");
+const { applyRuleLifecycle } = await import("../src/background/learned-rules.ts");
+
+// 1. Bare known domains resolve to canonical hosts (the gmail bug).
+ok("bare gmail canonicalizes to gmail.com", canonicalHost("gmail") === "gmail.com", canonicalHost("gmail"));
+ok("bare notion canonicalizes to notion.so", canonicalHost("notion") === "notion.so", canonicalHost("notion"));
+ok("bare linear canonicalizes to linear.app", canonicalHost("linear") === "linear.app", canonicalHost("linear"));
+ok("already-hosted name is not a bare known name", canonicalHost("youtube.com") === null);
+ok("unknown bare name canonicalizes to null", canonicalHost("totallyunknownsite") === null);
+
+// 2. The deterministic planner now emits valid URLs for "open gmail".
+const navSnap = {
+  url: "https://mail.google.com",
+  title: "Gmail",
+  elements: [],
+  text: "",
+  truncated: false,
+  scroll: { y: 0, maxY: 0 },
+};
+const detGmail = tryDeterministic("open gmail", navSnap);
+ok("deterministic 'open gmail' resolves", detGmail.resolved, JSON.stringify(detGmail));
+ok("deterministic 'open gmail' → https://gmail.com (was the broken https://gmail)",
+  detGmail.resolved && detGmail.action?.input.url === "https://gmail.com",
+  JSON.stringify(detGmail.action?.input));
+const detWwwGmail = tryDeterministic("open www.gmail", navSnap);
+ok("www-prefixed bare name also canonicalizes (www.gmail → https://gmail.com)",
+  detWwwGmail.resolved && detWwwGmail.action?.input.url === "https://gmail.com",
+  JSON.stringify(detWwwGmail.action?.input));
+const detProtoGmail = tryDeterministic("go to https://gmail", navSnap);
+ok("protocol URL with bare host is also corrected (https://gmail → https://gmail.com/)",
+  detProtoGmail.resolved && String(detProtoGmail.action?.input.url).startsWith("https://gmail.com"),
+  JSON.stringify(detProtoGmail.action?.input));
+
+// 3. Chrome error pages are recognized at the executor layer.
+ok("chrome-error URL yields its error code",
+  chromeErrorReason("chrome-error://chromewebdata/?error=ERR_NAME_NOT_RESOLVED") === "ERR_NAME_NOT_RESOLVED",
+  chromeErrorReason("chrome-error://chromewebdata/?error=ERR_NAME_NOT_RESOLVED"));
+ok("normal URL has no error reason", chromeErrorReason("https://gmail.com/") === undefined);
+
+// 4. Failure taxonomy classifies stable causes.
+ok("navigation failure classifies as page_load_error",
+  classifyFailure("Navigation failed — ERR_NAME_NOT_RESOLVED (chrome-error://…)") === "page_load_error");
+ok("timeout classifies as timeout",
+  classifyFailure("The page did not respond to snapshot within 30s") === "timeout");
+ok("stale element classifies as stale_element",
+  classifyFailure("No element 12 on the current page. The page changed…") === "stale_element");
+ok("declined action classifies as declined", classifyFailure("Declined by user.") === "declined");
+ok("wrong target classifies as wrong_target",
+  classifyFailure("<div> is not a text field.") === "wrong_target");
+ok("missing option classifies as not_found",
+  classifyFailure("No option \"X\". Available: a, b") === "not_found");
+ok("unknown detail classifies as generic", classifyFailure("something odd happened") === "generic");
+
+// 5. Repeated-failure learning: same cause across two visits mints a use_llm rule.
+const failureExp = (id) => ({
+  id,
+  timestamp: Date.now(),
+  task: "open mail",
+  domain: "example.com",
+  pageType: "login",
+  piiDetections: [],
+  actions: [
+    { tool: "navigate", success: false, latencyMs: 120, strategy: "deterministic", error: "Navigation failed — ERR_NAME_NOT_RESOLVED", cause: "page_load_error" },
+  ],
+  taskSuccess: false,
+  durationMs: 3000,
+  piiRedacted: 0,
+  estimatedTokens: 100,
+  rulesGenerated: [],
+  userCorrections: [],
+});
+const failFirst = reflectOnRun(failureExp("f-1"), [], 0, []);
+ok("first failure alone mints no repeated-failure rule",
+  !failFirst.newRules.some((r) => r.pattern.condition?.startsWith("repeated_failure:")),
+  JSON.stringify(failFirst.newRules.map((r) => r.pattern.condition)));
+const failSecond = reflectOnRun(failureExp("f-2"), [], 1, [failureExp("f-1")]);
+const repFailRule = failSecond.newRules.find((r) => r.pattern.condition === "repeated_failure:page_load_error");
+ok("same cause on second visit mints a repeated-failure rule", Boolean(repFailRule), JSON.stringify(failSecond.newRules));
+ok("repeated-failure rule routes to the LLM planner", repFailRule?.pattern.action === "use_llm");
+ok("repeated-failure rule disables the deterministic planner",
+  recommendsLLMOnly([repFailRule]) === true);
+
+// 6. Lessons and trajectories are scoped by domain+page type.
+const lessons = [
+  { id: "l1", domain: "mail.google.com", pageType: "email", text: "wait for the sidebar", createdAt: 1 },
+  { id: "l2", domain: "mail.google.com", pageType: "email", text: "verify the URL", createdAt: 2 },
+  { id: "l3", domain: "youtube.com", pageType: "video", text: "search before clicking", createdAt: 3 },
+];
+ok("matchLessons scopes to domain+page type, newest first",
+  matchLessons(lessons, "mail.google.com", "email", 1).map((l) => l.id).join() === "l2",
+  JSON.stringify(matchLessons(lessons, "mail.google.com", "email", 1)));
+ok("matchLessons returns nothing for an unseen domain", matchLessons(lessons, "bank.com", "login").length === 0);
+
+const trajectories = [
+  { id: "t1", domain: "mail.google.com", pageType: "email", task: "read first email", steps: "navigate → click", answer: "ok", createdAt: 1 },
+  { id: "t2", domain: "mail.google.com", pageType: "compose", task: "draft reply", steps: "navigate → type", answer: "ok", createdAt: 2 },
+  { id: "t3", domain: "youtube.com", pageType: "video", task: "play first video", steps: "navigate → click", answer: "ok", createdAt: 3 },
+];
+ok("matchTrajectories prefers exact page type, then domain-only",
+  matchTrajectories(trajectories, "mail.google.com", "email", 2).map((t) => t.id).join() === "t1,t2",
+  JSON.stringify(matchTrajectories(trajectories, "mail.google.com", "email", 2)));
+
+// 7. Rule lifecycle: fresh rules survive, dormant weak rules expire.
+const now = 1_800_000_000_000;
+const day = 86_400_000;
+const freshRule = {
+  id: "r1", category: "strategy", description: "d", pattern: { condition: "c", action: "use_llm" },
+  confidence: 0.8, confirmedCount: 1, createdAt: now - day, lastConfirmedAt: now - day,
+};
+const staleWeak = {
+  id: "r2", category: "pii_detection", description: "d", pattern: { condition: "false_positive:a:b", action: "reduce_confidence" },
+  confidence: 0.6, confirmedCount: 0, createdAt: now - 40 * day, lastConfirmedAt: now - 40 * day,
+};
+const staleStrong = {
+  id: "r3", category: "strategy", description: "d", pattern: { condition: "c2", action: "use_llm" },
+  confidence: 0.95, confirmedCount: 4, createdAt: now - 40 * day, lastConfirmedAt: now - 40 * day,
+};
+const surviving = applyRuleLifecycle([freshRule, staleWeak, staleStrong], now);
+ok("fresh rule survives the lifecycle untouched-ish",
+  surviving.some((r) => r.id === "r1" && r.confidence > 0.7),
+  JSON.stringify(surviving.map((r) => [r.id, r.confidence])));
+ok("stale + weak rule expires", !surviving.some((r) => r.id === "r2"), JSON.stringify(surviving.map((r) => r.id)));
+ok("stale but high-confidence rule survives with decay",
+  surviving.some((r) => r.id === "r3" && r.confidence > 0.7 && r.confidence < 0.95),
+  JSON.stringify(surviving.map((r) => [r.id, r.confidence])));
+
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

@@ -33,6 +33,8 @@ export interface ActionExperience {
   strategy: "deterministic" | "llm";
   /** Error message if failed. */
   error?: string;
+  /** Stable failure cause when the action failed (see failure-causes.ts). */
+  cause?: string;
 }
 
 export interface SiteExperience {
@@ -133,6 +135,23 @@ export async function recordExperience(experience: RunExperience): Promise<void>
   const experiences = await getExperiences();
   experiences.unshift(experience);
   await saveExperiences(experiences);
+}
+
+/**
+ * Override a stored run's outcome (e.g. from explicit user feedback that a
+ * run was not helpful). Keeps stats and future reflections honest when the
+ * structural success label was wrong.
+ */
+export async function updateExperienceOutcome(
+  id: string,
+  taskSuccess: boolean,
+): Promise<boolean> {
+  const experiences = await getExperiences();
+  const exp = experiences.find((e) => e.id === id);
+  if (!exp) return false;
+  exp.taskSuccess = taskSuccess;
+  await saveExperiences(experiences);
+  return true;
 }
 
 /**

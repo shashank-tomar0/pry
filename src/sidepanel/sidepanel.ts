@@ -517,8 +517,47 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
         void refreshTripwireLog();
       }
       break;
+
+    case "experience":
+      renderOutcomeFeedback(event.experience as unknown as { id: string });
+      break;
   }
 });
+
+// ─── Outcome Feedback (learns from the user, not just structure) ───────────
+
+/**
+ * After a run finishes, offer a quick "was this helpful?" row. The answer
+ * overrides the structural success label in experience memory, so the learning
+ * loop gets a real outcome signal and stops trusting rules from bad runs.
+ */
+function renderOutcomeFeedback(experience: { id?: string }): void {
+  if (!experience?.id) return;
+  document.getElementById("outcome-feedback")?.remove();
+
+  const row = document.createElement("div");
+  row.id = "outcome-feedback";
+  row.className = "outcome-feedback";
+  row.innerHTML = `
+    <span class="outcome-label">Was this helpful?</span>
+    <button type="button" class="outcome-btn" data-helpful="true">👍 Yes</button>
+    <button type="button" class="outcome-btn" data-helpful="false">👎 No</button>
+  `;
+
+  const finish = (helpful: boolean): void => {
+    void send({ kind: "record-outcome", experienceId: experience.id!, helpful });
+    row.classList.add("done");
+    const label = row.querySelector(".outcome-label");
+    if (label) label.textContent = helpful ? "👍 Noted — thanks!" : "👎 Noted — recorded as a failure.";
+    row.querySelectorAll(".outcome-btn").forEach((b) => b.remove());
+  };
+
+  row.querySelector<HTMLButtonElement>(".outcome-btn[data-helpful='true']")?.addEventListener("click", () => finish(true));
+  row.querySelector<HTMLButtonElement>(".outcome-btn[data-helpful='false']")?.addEventListener("click", () => finish(false));
+
+  transcriptEl.appendChild(row);
+  if (atBottom()) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
 
 // ─── Learning Dashboard ───────────────────────────────────────────────────
 

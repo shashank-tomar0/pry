@@ -21,7 +21,36 @@ async function getRules(): Promise<LearnedRule[]> {
   return rules ?? [];
 }
 
+// ─── Rule lifecycle (decay + expiry) ────────────────────────────────────────
+// Rules that keep being confirmed stay fresh; dormant rules fade a little each
+// day and are dropped once they are both stale AND weak, so the store never
+// accumulates dead rules that quietly misfire months later.
+const RULE_DECAY_PER_DAY = 0.005;
+const RULE_STALE_DAYS = 30;
+const RULE_EXPIRY_CONFIDENCE = 0.6;
+
+/**
+ * Pure: apply time-based decay/expiry to a rule list. `now` is injectable so
+ * the harness can test age logic deterministically.
+ */
+export function applyRuleLifecycle(
+  rules: LearnedRule[],
+  now: number = Date.now(),
+): LearnedRule[] {
+  const out: LearnedRule[] = [];
+  for (const rule of rules) {
+    const ageDays = Math.max(0, (now - rule.lastConfirmedAt) / 86_400_000);
+    const decayed = rule.confidence * Math.pow(1 - RULE_DECAY_PER_DAY, ageDays);
+    rule.confidence = decayed;
+    if (decayed < 0.1) continue; // faded out entirely
+    if (ageDays > RULE_STALE_DAYS && decayed < RULE_EXPIRY_CONFIDENCE) continue; // stale + weak
+    out.push(rule);
+  }
+  return out;
+}
+
 async function saveRules(rules: LearnedRule[]): Promise<void> {
+  rules = applyRuleLifecycle(rules);
   if (rules.length > MAX_RULES) {
     // Keep highest-confidence rules.
     rules.sort((a, b) => b.confidence - a.confidence);

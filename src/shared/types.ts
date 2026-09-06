@@ -241,6 +241,13 @@ export type PanelCommand =
       label: string;
       /** The user says this detection was wrong. */
       correction: "false_positive";
+    }
+  | {
+      kind: "record-outcome";
+      /** The run's experience id (`exp-<start time>`). */
+      experienceId: string;
+      /** True = the run satisfied the user; false = it did not. */
+      helpful: boolean;
     };
 
 export interface Settings {

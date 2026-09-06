@@ -74,6 +74,7 @@ export function reflectOnRun(
   experience: RunExperience,
   existingRules: LearnedRule[],
   priorVisitCount: number = 0,
+  priorExperiences: RunExperience[] = [],
 ): ReflectionResult {
   const newRules: LearnedRule[] = [];
   const confirmedRules: string[] = [];
@@ -192,6 +193,33 @@ export function reflectOnRun(
         newRules.push(rule);
         strategyOptimizations++;
       }
+    }
+  }
+
+  // ── 2c. Repeated failure cause (evidence across visits) ────────────────
+  //
+  // When the SAME classified cause (page_load_error, stale_element, …) shows
+  // up in a prior run AND this run, the deterministic planner keeps failing
+  // the same way on this page type. That is durable evidence to switch to the
+  // LLM planner, which re-plans instead of repeating the same doomed action.
+  const failureCauses = new Map<string, number>();
+  for (const a of experience.actions) {
+    if (!a.success && a.cause && a.strategy === "deterministic") {
+      failureCauses.set(a.cause, (failureCauses.get(a.cause) ?? 0) + 1);
+    }
+  }
+  const priorFailureCauses = new Set<string>();
+  for (const prior of priorExperiences) {
+    for (const a of prior.actions) {
+      if (!a.success && a.cause) priorFailureCauses.add(a.cause);
+    }
+  }
+  for (const cause of failureCauses.keys()) {
+    if (!priorFailureCauses.has(cause)) continue;
+    const rule = generateRepeatedFailureRule(experience, cause, existingRules);
+    if (rule) {
+      newRules.push(rule);
+      strategyOptimizations++;
     }
   }
 
@@ -386,6 +414,38 @@ function generateRepeatedSuccessRule(
     },
     confidence: 0.7,
     confirmedCount: 1,
+    createdAt: Date.now(),
+    lastConfirmedAt: Date.now(),
+  };
+}
+
+function generateRepeatedFailureRule(
+  experience: RunExperience,
+  cause: string,
+  existingRules: LearnedRule[],
+): LearnedRule | null {
+  const condition = `repeated_failure:${cause}`;
+  const duplicate = existingRules.find(
+    (r) =>
+      r.category === "strategy" &&
+      r.pattern.condition === condition &&
+      r.pattern.domain === experience.domain &&
+      r.pattern.pageType === experience.pageType,
+  );
+  if (duplicate) return null;
+
+  return {
+    id: `repfail-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    category: "strategy",
+    description: `${experience.domain} ${experience.pageType} actions keep failing with "${cause}" — prefer the LLM planner, which re-plans instead of repeating the same doomed action.`,
+    pattern: {
+      domain: experience.domain,
+      pageType: experience.pageType,
+      condition,
+      action: "use_llm",
+    },
+    confidence: 0.6,
+    confirmedCount: 0,
     createdAt: Date.now(),
     lastConfirmedAt: Date.now(),
   };

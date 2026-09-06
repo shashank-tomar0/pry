@@ -5,6 +5,7 @@ import type {
   PageSnapshot,
 } from "../shared/types";
 import { PAGE_ACTIONS } from "./tools";
+import { canonicalHost } from "./deterministic";
 
 /** How long a content-script round trip may take before we treat it as hung. */
 const CONTENT_TIMEOUT_MS = 30_000;
@@ -104,9 +105,49 @@ export function isRestricted(url: string | undefined): boolean {
 }
 
 function normaliseUrl(raw: string): string {
-  if (/^https?:\/\//i.test(raw)) return raw;
-  if (/^[\w-]+(\.[\w-]+)+/.test(raw)) return `https://${raw}`;
+  if (/^https?:\/\//i.test(raw)) {
+    // A host with no dot (https://gmail) is never a real site: correct known
+    // names to their canonical TLD, otherwise search instead of dead-ending.
+    // localhost and bare IPs are legit (Ollama) and pass through untouched.
+    try {
+      const u = new URL(raw);
+      const host = u.hostname.toLowerCase();
+      const isBare =
+        !host.includes(".") &&
+        host !== "localhost" &&
+        !/^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+      if (isBare) {
+        const canonical = canonicalHost(host);
+        if (canonical) {
+          u.hostname = canonical;
+          return u.toString();
+        }
+        return `https://www.google.com/search?q=${encodeURIComponent(raw)}`;
+      }
+    } catch {
+      // Unparseable — fall through to the raw URL and let the browser decide.
+    }
+    return raw;
+  }
+  if (/^[\w-]+(\.[\w-]+)+/.test(raw)) {
+    // "www.gmail" is www + a bare name — canonicalize it too.
+    const bare = canonicalHost(raw.replace(/^www\./i, ""));
+    if (bare) return `https://${bare}`;
+    return `https://${raw}`;
+  }
   return `https://www.google.com/search?q=${encodeURIComponent(raw)}`;
+}
+
+/**
+ * Chrome error pages (chrome-error://chromewebdata/…) are unreadable by
+ * extensions and invisible to the content script. Detecting them here turns a
+ * confusing dead tab into a clean, explainable failure the planner can recover
+ * from (and the learning loop can classify).
+ */
+export function chromeErrorReason(url: string | undefined): string | undefined {
+  if (!url || !url.startsWith("chrome-error://")) return undefined;
+  const m = url.match(/[?&]error=([^&#]+)/i);
+  return m ? decodeURIComponent(m[1]) : "browser error page";
 }
 
 /**
@@ -141,6 +182,19 @@ export async function execute(
       const url = normaliseUrl(String(input.url ?? ""));
       await chrome.tabs.update(controller.tabId, { url });
       await controller.waitForLoad();
+      const tab = await chrome.tabs.get(controller.tabId).catch(() => null);
+      const errorReason = chromeErrorReason(tab?.url);
+      if (errorReason) {
+        return {
+          result: {
+            ok: false,
+            detail:
+              `Navigation failed — ${errorReason} (${tab?.url ?? url}). ` +
+              `The page never loaded; the URL may be malformed. Re-navigate with a corrected URL.`,
+          },
+          controller,
+        };
+      }
       return { result: { ok: true, detail: `Navigated to ${url}.` }, controller };
     }
 
@@ -148,6 +202,16 @@ export async function execute(
       await chrome.tabs.goBack(controller.tabId).catch(() => undefined);
       await controller.waitForLoad();
       const tab = await chrome.tabs.get(controller.tabId);
+      const errorReason = chromeErrorReason(tab?.url);
+      if (errorReason) {
+        return {
+          result: {
+            ok: false,
+            detail: `Went back, but the page failed to load — ${errorReason}.`,
+          },
+          controller,
+        };
+      }
       return { result: { ok: true, detail: `Went back. Now on ${tab.url}.` }, controller };
     }
 
@@ -156,6 +220,19 @@ export async function execute(
       const tab = await chrome.tabs.create({ url, active: true });
       const next = new TabController(tab.id!);
       await next.waitForLoad();
+      const loaded = await chrome.tabs.get(tab.id!).catch(() => null);
+      const errorReason = chromeErrorReason(loaded?.url);
+      if (errorReason) {
+        return {
+          result: {
+            ok: false,
+            detail:
+              `Opened ${url} in tab ${tab.id}, but the page failed to load — ${errorReason}. ` +
+              `The URL may be malformed; re-navigate with a corrected URL.`,
+          },
+          controller: next,
+        };
+      }
       return {
         result: { ok: true, detail: `Opened ${url} in new tab ${tab.id}. Agent focus moved there.` },
         controller: next,

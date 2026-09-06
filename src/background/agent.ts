@@ -31,8 +31,11 @@ import { createPlanner } from "./providers";
 import type { ConvMessage, ToolOutcome } from "./providers/types";
 import type { ActionExperience, PIIExperience, RunExperience } from "./experience-memory";
 import { extractDomain, classifyPageType } from "./experience-memory";
+import { classifyFailure } from "./failure-causes";
 import { detectContextualPII, contextualToDetectedPII } from "./contextual-pii";
 import { getApplicableRules, buildSuppressionKeys, recommendsLLMOnly } from "./learned-rules";
+import { getLessons, matchLessons } from "./lessons";
+import { getTrajectories, matchTrajectories } from "./trajectories";
 import { piiKindFromOcrLabel } from "./reocr-verification";
 import { observeWithVision, VISION_SUPPORTED, VISION_DEFAULT_MODELS } from "./vision";
 import {
@@ -285,6 +288,10 @@ export async function runTask(
   /** `kind:method` keys of learned rules that fired this run (confirmations). */
   const firedRuleKeys = new Set<string>();
   let taskSuccess = false;
+  // True when the model produced a final answer (a turn with no tool calls).
+  // Runs that end by maxing out steps, looping, or aborting mid-stream never
+  // set this, so they can no longer be recorded as successes.
+  let finalAnswerGiven = false;
   let estimatedTokens = 0;
   let errorCount = 0;
   let sessionEgressBytes = 0;
@@ -396,7 +403,14 @@ export async function runTask(
   // ── Load learned rules for this (domain, page type). This is where the
   //    self-improvement loop is closed: rules stored by previous runs change
   //    what this run detects, suppresses, and how it plans.
-  const applicableRules = await getApplicableRules(domain, pageType);
+  // Load the stored self-improvement state for this (domain, page type) in
+  // parallel: learned rules (FP suppression / planner routing), semantic
+  // lessons (Reflexion-style), and successful trajectories (few-shot replay).
+  const [applicableRules, storedLessons, storedTrajectories] = await Promise.all([
+    getApplicableRules(domain, pageType),
+    getLessons(),
+    getTrajectories(),
+  ]);
   const sanitizeCtx: SanitizeCtx = {
     fpKeys: buildSuppressionKeys(applicableRules),
     llmOnly: recommendsLLMOnly(applicableRules),
@@ -585,6 +599,29 @@ export async function runTask(
     historyBlock = `--- Previous conversation (earlier tasks) ---\n${sanitizedHistory}\n--- End previous conversation ---`;
   }
 
+  // Semantic memory: lessons and successful trajectories from past runs on
+  // this site become few-shot context for the planner. Both were sanitized at
+  // write time (tokenized tasks, redacted answers), so nothing raw reaches
+  // the model here either.
+  const lessonsBlock = (() => {
+    const relevant = matchLessons(storedLessons, domain, pageType);
+    if (relevant.length === 0) return "";
+    return (
+      `--- Lessons learned on this site (from past runs) ---\n` +
+      relevant.map((l) => `- ${l.text}`).join("\n") +
+      `\n--- End lessons ---`
+    );
+  })();
+  const trajectoriesBlock = (() => {
+    const relevant = matchTrajectories(storedTrajectories, domain, pageType);
+    if (relevant.length === 0) return "";
+    return (
+      `--- How similar tasks succeeded here before ---\n` +
+      relevant.map((t) => `Task: ${t.task}\nSteps: ${t.steps}`).join("\n\n") +
+      `\n--- End past successes ---`
+    );
+  })();
+
   // Truncate snapshot to avoid context overflow across all providers.
   if (snapshot && snapshot.elements.length > maxSnapshotElements) {
     // For free-tier: skip offscreen elements entirely for speed.
@@ -603,6 +640,8 @@ export async function runTask(
       role: "user",
       content:
         (historyBlock ? `${historyBlock}\n\n` : "") +
+        (lessonsBlock ? `${lessonsBlock}\n\n` : "") +
+        (trajectoriesBlock ? `${trajectoriesBlock}\n\n` : "") +
         taskPrompt(tokenizedTask, sanitizeUrl(tab.url ?? ""), tab.title ?? "") +
         (snapshot ? `\n\n--- Current page ---\n${renderSnapshot(snapshot)}` : "") +
         (initialVisionNote ? `\n\n${initialVisionNote}` : ""),
@@ -657,7 +696,13 @@ export async function runTask(
     experienceEmitted = true;
 
     const hasSuccessfulActions = trackedActions.some((a) => a.success);
-    taskSuccess = !transcriptHasErrors() && (hasSuccessfulActions || trackedActions.length === 0);
+    // Semantic-ish outcome: no errors, at least one real action (or none was
+    // needed), AND the model actually delivered a final answer. A run that hit
+    // maxSteps or aborted without ever concluding is not a success.
+    taskSuccess =
+      !transcriptHasErrors() &&
+      (hasSuccessfulActions || trackedActions.length === 0) &&
+      finalAnswerGiven;
 
     emit({
       kind: "entry",
@@ -677,7 +722,10 @@ export async function runTask(
     const experience: RunExperience = {
       id: `exp-${runStartTime}`,
       timestamp: runStartTime,
-      task,
+      // Store the tokenized task (vault tokens, not raw values) — experiences
+      // persist to chrome.storage and feed reflection/lessons, so raw PII
+      // typed by the user must never land there.
+      task: tokenizedTask,
       domain,
       pageType,
       piiDetections: trackedPII,
@@ -759,6 +807,7 @@ export async function runTask(
             latencyMs: detLatency,
             strategy: "deterministic",
             error: detOutcome.result.ok ? undefined : safeDetDetail,
+            cause: detOutcome.result.ok ? undefined : classifyFailure(detOutcome.result.detail),
           });
 
           emit({ kind: "patch", id: detId, text: safeDetDetail, pending: false });
@@ -949,7 +998,11 @@ export async function runTask(
     }
 
     // No tools left to call — the model has given its final answer.
-    if (turn.toolCalls.length === 0) { finishTask(); return; }
+    if (turn.toolCalls.length === 0) {
+      finalAnswerGiven = true;
+      finishTask();
+      return;
+    }
 
     const results: ToolOutcome[] = [];
 
@@ -1100,6 +1153,7 @@ ${freshRendered}`,
         latencyMs: actionLatency,
         strategy: "llm",
         error: result.ok ? undefined : safeDetail,
+        cause: result.ok ? undefined : classifyFailure(result.detail),
       });
 
       // Record action in privacy ledger.

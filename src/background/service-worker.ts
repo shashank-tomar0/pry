@@ -10,6 +10,10 @@ import type {
 import { createTripwireAggregator } from "./tripwire-aggregator";
 import { normaliseSettings } from "../shared/types";
 import { runTask } from "./agent";
+import { createPlanner } from "./providers";
+import { generateLessons } from "./lesson-generator";
+import { recordLessons } from "./lessons";
+import { recordTrajectory } from "./trajectories";
 import { saveSession, getSessions, deleteSession, clearHistory } from "./history";
 import { recordExperience, getMemoryStats, getExperiencesForDomain } from "./experience-memory";
 import { reflectOnRun } from "./reflection";
@@ -506,9 +510,17 @@ async function start(task: string, tabId: number): Promise<void> {
         const domainExperiences = await getExperiencesForDomain(lastExperience.domain);
         const priorVisitCount = Math.max(0, domainExperiences.length - 1);
 
-        // Run reflection to generate new rules.
+        // Run reflection to generate new rules. Prior experiences (excluding
+        // this run) give repeated-failure rules their cross-visit evidence.
         const existingRules = await getLearnedRules();
-        const reflectionResult = reflectOnRun(lastExperience, existingRules, priorVisitCount);
+        const thisExperience = lastExperience;
+        const priorExperiences = domainExperiences.filter((e) => e.id !== thisExperience.id);
+        const reflectionResult = reflectOnRun(
+          thisExperience,
+          existingRules,
+          priorVisitCount,
+          priorExperiences,
+        );
 
         // Apply new rules to the rules store.
         if (reflectionResult.newRules.length > 0) {
@@ -518,6 +530,45 @@ async function start(task: string, tabId: number): Promise<void> {
 
         // Emit learning stats to the panel.
         await emitLearningStats(reflectionResult.summary);
+
+        // ── Semantic learning (Reflexion-style) ──
+        // Failed runs get a one-shot LLM lesson pass (the planner explains
+        // what the next run should do differently); successful runs deposit a
+        // compact sanitized trajectory for few-shot replay. Both are rare,
+        // capped, and egress-metered.
+        try {
+          if (!lastExperience.taskSuccess) {
+            const planner = createPlanner(settings);
+            const lessons = await generateLessons(planner, lastExperience);
+            if (lessons.length > 0) {
+              await recordLessons(lastExperience.domain, lastExperience.pageType, lessons);
+              // Honest egress: the lesson prompt/response crossed the wire.
+              const lessonBytes = new Blob([
+                JSON.stringify(lessons),
+              ]).size;
+              emit({ kind: "egress", bytes: (lastExperience.egressBytes ?? 0) + lessonBytes });
+              console.log(`[PRY] Reflection: ${lessons.length} lesson(s) generated.`);
+            }
+          } else {
+            const steps = lastExperience.actions
+              .map((a) => `${a.tool}${a.success ? "" : "✗"}`)
+              .slice(0, 8)
+              .join(" → ");
+            const answer =
+              [...transcript].reverse().find((e) => e.role === "assistant")?.text ?? "";
+            if (steps) {
+              await recordTrajectory({
+                domain: lastExperience.domain,
+                pageType: lastExperience.pageType,
+                task: lastExperience.task.slice(0, 200),
+                steps,
+                answer,
+              });
+            }
+          }
+        } catch (err) {
+          console.warn("[PRY] Semantic learning failed:", err);
+        }
       } catch (err) {
         console.warn("[PRY] Reflection failed:", err);
       }
@@ -660,6 +711,31 @@ chrome.runtime.onMessage.addListener(
           sendResponse({ ledgerSummary });
         })();
         return true;
+
+      case "record-outcome": {
+        void (async () => {
+          const { updateExperienceOutcome } = await import("./experience-memory");
+          const updated = await updateExperienceOutcome(
+            command.experienceId,
+            command.helpful,
+          );
+          if (updated && lastExperience?.id === command.experienceId && !command.helpful) {
+            lastExperience.taskSuccess = false;
+          }
+          if (updated && !command.helpful) {
+            emit({
+              kind: "entry",
+              entry: {
+                id: `fb-${Date.now()}`,
+                role: "system",
+                text: "Feedback noted: this run did not satisfy you — recorded as a failure so the learning loop won't trust its rules.",
+              },
+            });
+          }
+          sendResponse({ ok: updated });
+        })();
+        return true;
+      }
 
       case "get-tripwire-log":
         sendResponse({

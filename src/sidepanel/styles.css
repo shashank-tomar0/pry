@@ -1670,3 +1670,33 @@ body::after {
 }
 .tl-sample { color: var(--color-teal); flex-shrink: 0; }
 .tl-time { color: var(--color-ink-mute); flex-shrink: 0; font-size: 8px; }
+
+/* Outcome feedback row — learns the real outcome from the user. */
+.outcome-feedback {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  border: 1px solid var(--color-rule);
+  background: var(--color-paper-2);
+}
+.outcome-feedback .outcome-label {
+  margin-right: auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-ink-2);
+}
+.outcome-feedback .outcome-btn {
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 10px;
+  border: 1px solid var(--color-rule);
+  border-radius: 999px;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  cursor: pointer;
+}
+.outcome-feedback .outcome-btn:hover { background: var(--color-paper-3); }
+.outcome-feedback.done { opacity: 0.55; }

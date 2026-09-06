@@ -1116,4 +1116,72 @@ agg.reset();
 ok("reset clears totals, counts and hosts",
   agg.total() === 0 && agg.counts().size === 0 && agg.hosts().size === 0);
 
+// ─── Scenario V: repeated-success strategy rules (learning from clean wins) ────
+console.log("\n=== Scenario V: repeated-success strategy rules ===\n");
+
+// A flawless LLM-driven run — no FPs, no misses, no deterministic actions.
+// Before this change such runs NEVER produced a rule, so the dashboard stayed
+// at "0 rules learned" forever despite the loop running.
+const mkCleanLlmExp = (id) => ({
+  id,
+  timestamp: Date.now(),
+  task: "open gmail and read the first email",
+  domain: "mail.google.com",
+  pageType: "email",
+  piiDetections: [
+    { kind: "credential", method: "regex", outcome: "true_positive", confidence: 0.9 },
+    { kind: "pii_text", method: "contextual", outcome: "true_positive", confidence: 0.8 },
+  ],
+  actions: [
+    { tool: "navigate", success: true, latencyMs: 100, strategy: "llm" },
+    { tool: "click", success: true, latencyMs: 80, strategy: "llm" },
+    { tool: "read_page", success: true, latencyMs: 40, strategy: "llm" },
+  ],
+  taskSuccess: true,
+  durationMs: 5000,
+  piiRedacted: 2,
+  estimatedTokens: 300,
+  rulesGenerated: [],
+  userCorrections: [],
+});
+
+const cleanFirst = mkCleanLlmExp("clean-1");
+const cleanSecond = mkCleanLlmExp("clean-2");
+
+const reflFirstVisit = reflectOnRun(cleanFirst, [], 0);
+ok("first clean visit mints no repeated-success rule (needs evidence)",
+  !reflFirstVisit.newRules.some((r) => r.pattern.condition?.startsWith("repeated_success:")),
+  JSON.stringify(reflFirstVisit.newRules.map((r) => r.pattern.condition)));
+
+const reflSecondVisit = reflectOnRun(cleanSecond, [], 1);
+ok("second clean visit to same domain+page type mints a strategy rule",
+  reflSecondVisit.newRules.some(
+    (r) => r.category === "strategy" && r.pattern.condition === "repeated_success:llm",
+  ),
+  JSON.stringify(reflSecondVisit.newRules.map((r) => r.pattern.condition)));
+
+const repRule = reflSecondVisit.newRules.find((r) => r.pattern.condition === "repeated_success:llm");
+ok("repeated-success rule is domain+page scoped and pre-confirmed",
+  repRule?.pattern.domain === "mail.google.com" &&
+    repRule?.pattern.pageType === "email" &&
+    repRule?.confidence === 0.7 &&
+    repRule?.confirmedCount === 1,
+  JSON.stringify(repRule));
+
+const reflSecondVisitDup = reflectOnRun(cleanSecond, reflSecondVisit.newRules, 1);
+ok("a third visit does not duplicate the rule",
+  !reflSecondVisitDup.newRules.some((r) => r.pattern.condition === "repeated_success:llm"),
+  JSON.stringify(reflSecondVisitDup.newRules.map((r) => r.pattern.condition)));
+
+// Rules from other sites must not leak: the rule is scoped to its own domain.
+const otherSite = { ...cleanSecond, id: "clean-other", domain: "youtube.com", pageType: "other" };
+const reflOtherSite = reflectOnRun(otherSite, reflSecondVisit.newRules, 1);
+ok("rule stays scoped — a different domain mints its own separate rule",
+  !reflOtherSite.newRules.some(
+    (r) => r.pattern.condition === "repeated_success:llm" && r.pattern.domain === "mail.google.com",
+  ) && reflOtherSite.newRules.some(
+    (r) => r.pattern.condition === "repeated_success:llm" && r.pattern.domain === "youtube.com",
+  ),
+  JSON.stringify(reflOtherSite.newRules.map((r) => `${r.pattern.domain}:${r.pattern.condition}`)));
+
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

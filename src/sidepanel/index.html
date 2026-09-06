@@ -10,12 +10,11 @@
     <!-- ─── Top Bar ─────────────────────────────────────────────────── -->
     <header class="topbar">
       <div class="topbar-left">
-        <span class="brand-mark">P</span>
+        <img class="brand-mark" src="icons/icon32.png" alt="PRY" width="20" height="20" />
         <span class="brand-name">PRY</span>
         <span class="egress-badge" id="egress-badge">EGRESS —</span>
       </div>
       <div class="topbar-right">
-        <span class="perception-counter" id="perception-counter">PERCEPTION N° 01</span>
         <button class="icon-btn" id="btn-radar" title="Live Egress Tripwire Radar">🛡️</button>
         <button class="icon-btn" id="btn-history" title="Session history">☰</button>
         <button class="icon-btn" id="btn-learning" title="Self-improvement dashboard">🧠</button>
@@ -23,6 +22,29 @@
         <button class="icon-btn" id="btn-settings" title="Settings">⚙</button>
       </div>
     </header>
+
+    <!-- ─── Masthead ────────────────────────────────────────────────── -->
+    <div class="masthead">
+      <span>FREE BROADSHEET<span class="dot-sep">·</span>EDITION 04</span>
+      <span id="perception-counter">PERCEPTION N° 01</span>
+    </div>
+
+    <h1 class="headline">
+      <span class="headline-private">PRIVATE</span> AGENT
+    </h1>
+    <p class="subhead">PII detection, tokenization &amp; redaction run 100% inside your browser. Optional VLM vision when enabled.</p>
+
+    <hr class="rule" />
+
+    <!-- ─── Context Presets ─────────────────────────────────────────── -->
+    <div class="section-header">
+      <span>CONTEXT PRESETS</span>
+      <div class="preset-btns">
+        <button class="preset-btn" data-preset="aadhaar"><span>+ AADHAAR</span></button>
+        <button class="preset-btn" data-preset="pan"><span>+ PAN</span></button>
+        <button class="preset-btn" data-preset="contact"><span>+ CONTACT</span></button>
+      </div>
+    </div>
 
     <!-- ─── Task Input ──────────────────────────────────────────────── -->
     <div class="input-box">
@@ -35,16 +57,15 @@
       <button id="stop-btn" class="run-arrow stop hidden" title="Stop task">■</button>
     </div>
 
-    <!-- ─── Context Presets + Quick Actions (compact chips) ─────────── -->
-    <div class="chips-row">
-      <button class="chip-btn" data-preset="aadhaar">+ AADHAAR</button>
-      <button class="chip-btn" data-preset="pan">+ PAN</button>
-      <button class="chip-btn" data-preset="contact">+ CONTACT</button>
-      <span class="chip-divider" aria-hidden="true"></span>
-      <button class="chip-btn quick" data-action="fill-form">✎ FILL FORM</button>
-      <button class="chip-btn quick" data-action="extract-data">📊 EXTRACT</button>
-      <button class="chip-btn quick" data-action="scan-pii">◎ SCAN PII</button>
-      <button class="chip-btn quick" data-action="click-target">⊘ CLICK</button>
+    <!-- ─── Quick Actions ───────────────────────────────────────────── -->
+    <div class="section-header">
+      <span>QUICK ACTIONS</span>
+    </div>
+    <div class="quick-grid">
+      <button class="quick-btn" data-action="fill-form"><span>✎ FILL FORM</span></button>
+      <button class="quick-btn" data-action="extract-data"><span>📊 EXTRACT DATA</span></button>
+      <button class="quick-btn" data-action="scan-pii"><span>◎ SCAN PII</span></button>
+      <button class="quick-btn" data-action="click-target"><span>⊘ CLICK TARGET</span></button>
     </div>
 
     <hr class="rule-thin" />

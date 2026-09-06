@@ -502,17 +502,6 @@ export async function runTask(
         const verification = processed.verification;
         noteVerification(verification);
 
-        emit({
-          kind: "entry",
-          entry: {
-            id: nextId(),
-            role: "system",
-            text:
-              `Screenshot captured: ${processed.redactedCount} PII items redacted in ${processed.processingTimeMs.toFixed(0)}ms.` +
-              (verification && verification.regionsChecked > 0 ? ` ${verification.summary}` : ""),
-          },
-        });
-
         // Ledger: visual detections + redaction + re-OCR verification proof.
         if (visualDetections.length > 0) {
           recordDetections(visualDetections.map((d) => ({ ...d, method: "visual" }))).catch(() => {});
@@ -801,17 +790,6 @@ export async function runTask(
         // Measurement is best-effort; the run continues regardless.
       }
     }
-
-    // Show that a planner call is in flight — a slow first token otherwise
-    // looks like a freeze between the last log line and the first streamed text.
-    emit({
-      kind: "entry",
-      entry: {
-        id: nextId(),
-        role: "system",
-        text: `Consulting ${planner.label}…`,
-      },
-    });
 
     // One turn = one bounded planner call. Stalls (slow first token, dropped
     // stream, hung connection, rate limit) abort after TURN_TIMEOUT_MS and are

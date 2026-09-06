@@ -765,37 +765,44 @@ export async function runTask(
     const entryId = nextId();
     let opened = false;
 
-    // Mid-task narration is capped ON SCREEN: a chatty model must not bury the
-    // agent's tool steps in paragraphs. The full text still accumulates in the
-    // conversation history (the planner needs it); only the visible card is
-    // limited, and only while the turn is still calling tools. A turn that ends
-    // WITHOUT tool calls is the final answer — its hidden remainder is flushed
-    // so the closing summary always renders in full.
-    const NARRATION_CAP = 110;
-    let emittedChars = 0;
-    let narrationCapped = false;
-    let overflowText = "";
+    // Coalesce the provider's char-by-char deltas into chunkier screen updates.
+    // Each patch makes the panel re-format the card's markdown, so a patch per
+    // character is what turns streaming into a slow crawl. Buffering and
+    // flushing on a short interval renders in readable bursts instead; the
+    // remainder is always flushed before the turn ends, so nothing is lost.
+    const FLUSH_INTERVAL_MS = 60;
+    const FLUSH_CHUNK_CHARS = 200;
+    let pendingText = "";
+    let flushTimer: ReturnType<typeof setInterval> | null = null;
+
+    const flushPending = (): void => {
+      if (pendingText.length === 0) return;
+      const safe = tokenizer.redactValues(pendingText);
+      pendingText = "";
+      if (!opened) {
+        opened = true;
+        emit({ kind: "entry", entry: { id: entryId, role: "assistant", text: safe } });
+      } else {
+        emit({ kind: "patch", id: entryId, text: safe });
+      }
+    };
 
     const onText = (delta: string): void => {
       // Belt-and-braces: never let a raw vault value render in the transcript
       // even if one somehow reached the model's context.
-      const safe = tokenizer.redactValues(delta);
-      if (narrationCapped) {
-        overflowText += safe;
+      pendingText += delta;
+      if (pendingText.length >= FLUSH_CHUNK_CHARS) {
+        flushPending();
         return;
       }
-      const room = Math.max(0, NARRATION_CAP - emittedChars);
-      const visible = room > 0 ? safe.slice(0, room) : "";
-      if (!opened) {
-        opened = true;
-        emit({ kind: "entry", entry: { id: entryId, role: "assistant", text: visible } });
-      } else if (visible.length > 0) {
-        emit({ kind: "patch", id: entryId, text: visible });
-      }
-      emittedChars += visible.length;
-      if (visible.length < safe.length) {
-        narrationCapped = true;
-        overflowText = safe.slice(visible.length);
+      if (flushTimer === null) {
+        flushTimer = setInterval(() => {
+          flushPending();
+          if (pendingText.length === 0 && flushTimer !== null) {
+            clearInterval(flushTimer);
+            flushTimer = null;
+          }
+        }, FLUSH_INTERVAL_MS);
       }
     };
 
@@ -890,16 +897,16 @@ export async function runTask(
         finishTask();
         return;
       }
+    } finally {
+      // Flush any remaining buffered narration so the card always ends complete.
+      flushPending();
+      if (flushTimer !== null) {
+        clearInterval(flushTimer);
+        flushTimer = null;
+      }
     }
 
     messages.push({ role: "assistant", text: turn.text, toolCalls: turn.toolCalls });
-
-    // Final answers (turns with no tool calls) render in full — the cap above
-    // exists only to keep mid-task chatter short.
-    if (opened && narrationCapped && overflowText.length > 0 && turn.toolCalls.length === 0) {
-      const tail = tokenizer.redactValues(overflowText);
-      if (tail.length > 0) emit({ kind: "patch", id: entryId, text: tail });
-    }
 
     if (turn.stopReason === "refusal") {
       errorCount++;

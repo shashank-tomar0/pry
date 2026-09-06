@@ -247,6 +247,8 @@ export interface AgentDeps {
     redactedCount: number;
     verification?: VerificationResult;
   }) => void;
+  /** Compact memory of finished exchanges so follow-ups can continue the chat. */
+  history?: Array<{ task: string; answer: string; timestamp: number }>;
 }
 
 // ─── Main Loop ──────────────────────────────────────────────────────────────
@@ -265,7 +267,7 @@ export async function runTask(
   startTabId: number,
   deps: AgentDeps,
 ): Promise<void> {
-  const { settings, emit, askConfirm, signal, captureScreenshot, recordAudit } = deps;
+  const { settings, emit, askConfirm, signal, captureScreenshot, recordAudit, history } = deps;
 
   // Use a shorter system prompt for small local models to avoid context overflow.
   const isLocalModel = settings.provider === "ollama";
@@ -560,6 +562,29 @@ export async function runTask(
     });
   }
 
+  // Previous-task memory: a compact, re-tokenized recap of the last few runs
+  // so follow-ups ("continue", "also do X on that email") have context. It
+  // runs through the same vault as the page/task, so no raw values reach the
+  // model.
+  let historyBlock = "";
+  if (history && history.length > 0) {
+    const raw = history
+      .map((h) => `You asked: ${h.task}\nYou answered: ${h.answer}`)
+      .join("\n\n");
+    const { task: sanitizedHistory, tokenCount: historyTokenCount } = tokenizer.tokenizeTask(raw);
+    if (historyTokenCount > 0) {
+      emit({
+        kind: "entry",
+        entry: {
+          id: nextId(),
+          role: "system",
+          text: `Memory: tokenized ${historyTokenCount} PII item(s) from earlier tasks in context.`,
+        },
+      });
+    }
+    historyBlock = `--- Previous conversation (earlier tasks) ---\n${sanitizedHistory}\n--- End previous conversation ---`;
+  }
+
   // Truncate snapshot to avoid context overflow across all providers.
   if (snapshot && snapshot.elements.length > maxSnapshotElements) {
     // For free-tier: skip offscreen elements entirely for speed.
@@ -577,6 +602,7 @@ export async function runTask(
     {
       role: "user",
       content:
+        (historyBlock ? `${historyBlock}\n\n` : "") +
         taskPrompt(tokenizedTask, sanitizeUrl(tab.url ?? ""), tab.title ?? "") +
         (snapshot ? `\n\n--- Current page ---\n${renderSnapshot(snapshot)}` : "") +
         (initialVisionNote ? `\n\n${initialVisionNote}` : ""),

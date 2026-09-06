@@ -12,8 +12,8 @@ import { normaliseSettings } from "../shared/types";
 import { runTask } from "./agent";
 import { createPlanner } from "./providers";
 import { generateLessons } from "./lesson-generator";
-import { recordLessons } from "./lessons";
-import { recordTrajectory } from "./trajectories";
+import { getLessons, recordLessons } from "./lessons";
+import { getTrajectories, recordTrajectory } from "./trajectories";
 import { saveSession, getSessions, deleteSession, clearHistory } from "./history";
 import { recordExperience, getMemoryStats, getExperiencesForDomain } from "./experience-memory";
 import { reflectOnRun } from "./reflection";
@@ -81,6 +81,7 @@ async function emitLearningStats(lastReflection: string = ""): Promise<void> {
     }
     const stats = await getMemoryStats();
     const rulesSummary = await getRulesSummary();
+    const [lessons, trajectories] = await Promise.all([getLessons(), getTrajectories()]);
     emit({
       kind: "learning-update",
       stats: {
@@ -96,6 +97,29 @@ async function emitLearningStats(lastReflection: string = ""): Promise<void> {
         corrections: stats.totalUserCorrections,
         rulesSummary,
         lastReflection,
+        lessons: {
+          total: lessons.length,
+          recent: lessons
+            .slice(0, 5)
+            .map((l) => ({
+              domain: l.domain,
+              pageType: l.pageType,
+              text: l.text,
+              createdAt: l.createdAt,
+            })),
+        },
+        trajectories: {
+          total: trajectories.length,
+          recent: trajectories
+            .slice(0, 5)
+            .map((t) => ({
+              domain: t.domain,
+              pageType: t.pageType,
+              task: t.task,
+              steps: t.steps,
+              createdAt: t.createdAt,
+            })),
+        },
       },
     } as AgentEvent);
   } catch (err) {
@@ -660,8 +684,32 @@ chrome.runtime.onMessage.addListener(
         void (async () => {
           const stats = await getMemoryStats();
           const rulesSummary = await getRulesSummary();
+          const [lessons, trajectories] = await Promise.all([getLessons(), getTrajectories()]);
           const { [LAST_REFLECTION_KEY]: lastReflection } = await chrome.storage.local.get(LAST_REFLECTION_KEY);
-          sendResponse({ stats, rulesSummary, lastReflection: lastReflection ?? "" });
+          sendResponse({
+            stats,
+            rulesSummary,
+            lastReflection: lastReflection ?? "",
+            lessons: {
+              total: lessons.length,
+              recent: lessons.slice(0, 5).map((l) => ({
+                domain: l.domain,
+                pageType: l.pageType,
+                text: l.text,
+                createdAt: l.createdAt,
+              })),
+            },
+            trajectories: {
+              total: trajectories.length,
+              recent: trajectories.slice(0, 5).map((t) => ({
+                domain: t.domain,
+                pageType: t.pageType,
+                task: t.task,
+                steps: t.steps,
+                createdAt: t.createdAt,
+              })),
+            },
+          });
         })();
         return true;
 

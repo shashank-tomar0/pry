@@ -1700,3 +1700,43 @@ body::after {
 }
 .outcome-feedback .outcome-btn:hover { background: var(--color-paper-3); }
 .outcome-feedback.done { opacity: 0.55; }
+
+/* Learning dashboard — semantic lessons + replay library. */
+.learning-lessons { padding: 0 16px 8px; }
+.learning-lessons h4 { margin-bottom: 4px; }
+.lesson-list, .traj-list { display: flex; flex-direction: column; gap: 5px; }
+.lesson-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+  border: 1px solid var(--color-hairline);
+  background: var(--color-paper);
+}
+.lesson-page {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  color: var(--color-ink-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.lesson-text {
+  font-family: var(--font-body);
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--color-ink);
+  overflow-wrap: anywhere;
+}
+.traj-task {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--color-ink);
+  overflow-wrap: anywhere;
+}
+.traj-steps {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  color: var(--color-teal);
+  overflow-wrap: anywhere;
+}

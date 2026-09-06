@@ -586,6 +586,14 @@ function renderLearningDashboard(stats: {
       createdAt: number;
     }>;
   };
+  lessons?: {
+    total: number;
+    recent: Array<{ domain: string; pageType: string; text: string; createdAt: number }>;
+  };
+  trajectories?: {
+    total: number;
+    recent: Array<{ domain: string; pageType: string; task: string; steps: string; createdAt: number }>;
+  };
   lastReflection: string;
 }): void {
 
@@ -710,6 +718,66 @@ function renderLearningDashboard(stats: {
     rulesEl.appendChild(note);
   }
 
+  // Semantic lessons — Reflexion-style lessons learned from failed runs.
+  const lessonsEl = $("learning-lessons");
+  const lessonCount = stats.lessons?.total ?? 0;
+  if (lessonCount > 0) {
+    lessonsEl.innerHTML = `<h4>Lessons Learned (${lessonCount})</h4><div class="lesson-list"></div>`;
+    const list = lessonsEl.querySelector(".lesson-list")!;
+    for (const lesson of stats.lessons?.recent ?? []) {
+      const item = document.createElement("div");
+      item.className = "lesson-item";
+      const top = document.createElement("div");
+      top.className = "rule-top";
+      const domain = document.createElement("span");
+      domain.className = "rule-tag strategy";
+      domain.textContent = lesson.domain;
+      const page = document.createElement("span");
+      page.className = "lesson-page";
+      page.textContent = lesson.pageType || "any page";
+      top.appendChild(domain);
+      top.appendChild(page);
+      const text = document.createElement("span");
+      text.className = "lesson-text";
+      text.textContent = lesson.text;
+      item.appendChild(top);
+      item.appendChild(text);
+      list.appendChild(item);
+    }
+  } else {
+    lessonsEl.innerHTML = `<h4>Lessons Learned</h4><p class="empty-sub">Failed runs teach lessons here — so far, none.</p>`;
+  }
+
+  // Replay library — successful trajectories reused as few-shot examples.
+  const trajEl = $("learning-trajectories");
+  const trajCount = stats.trajectories?.total ?? 0;
+  if (trajCount > 0) {
+    trajEl.innerHTML = `<h4>Replay Library (${trajCount})</h4><div class="traj-list"></div>`;
+    const list = trajEl.querySelector(".traj-list")!;
+    for (const t of stats.trajectories?.recent ?? []) {
+      const item = document.createElement("div");
+      item.className = "lesson-item";
+      const top = document.createElement("div");
+      top.className = "rule-top";
+      const domain = document.createElement("span");
+      domain.className = "rule-tag pii_detection";
+      domain.textContent = t.domain;
+      top.appendChild(domain);
+      const task = document.createElement("span");
+      task.className = "traj-task";
+      task.textContent = t.task;
+      const steps = document.createElement("span");
+      steps.className = "traj-steps";
+      steps.textContent = t.steps;
+      item.appendChild(top);
+      item.appendChild(task);
+      item.appendChild(steps);
+      list.appendChild(item);
+    }
+  } else {
+    trajEl.innerHTML = `<h4>Replay Library</h4><p class="empty-sub">Successful runs deposit reusable action sequences here.</p>`;
+  }
+
   // Last reflection.
   const reflectionEl = $("learning-reflection");
   if (stats.lastReflection) {
@@ -807,6 +875,8 @@ async function refreshLearningDashboard(): Promise<void> {
       improvementDelta: s.improvementDelta ?? 0,
       corrections: s.totalUserCorrections ?? 0,
       rulesSummary: response.rulesSummary ?? { total: 0, byCategory: {}, highConfidence: 0, recentlyCreated: 0 },
+      lessons: response.lessons ?? { total: 0, recent: [] },
+      trajectories: response.trajectories ?? { total: 0, recent: [] },
       lastReflection: response.lastReflection ?? "",
     });
   } else {
@@ -815,6 +885,8 @@ async function refreshLearningDashboard(): Promise<void> {
       falsePositives: 0, missedPII: 0, sitesVisited: 0, rulesLearned: 0,
       improvementDelta: 0, corrections: 0,
       rulesSummary: { total: 0, byCategory: {}, highConfidence: 0, recentlyCreated: 0 },
+      lessons: { total: 0, recent: [] },
+      trajectories: { total: 0, recent: [] },
       lastReflection: "",
     });
   }

@@ -114,12 +114,21 @@ export type ContentRequest =
 /** A rendered entry in the side panel transcript. */
 export interface TranscriptEntry {
   id: string;
-  role: "user" | "assistant" | "step" | "error" | "system";
+  role: "user" | "assistant" | "step" | "error" | "system" | "egress";
   text: string;
   /** Set on "step" entries so the UI can show an icon per action type. */
   action?: ActionName;
   /** Set while a step is still running. */
   pending?: boolean;
+}
+
+/** One MAIN-world tripwire intercept forwarded to the panel's radar drawer. */
+export interface TripwireAlertDetail {
+  url: string;
+  method: string;
+  piiType: string;
+  sample: string;
+  timestamp: number;
 }
 
 /** Privacy audit snapshot — captured after each task for the judges. */
@@ -176,6 +185,7 @@ export type AgentEvent =
       };
     }
   | { kind: "experience"; experience: Record<string, unknown> }
+  | { kind: "tripwire-update"; alert: TripwireAlertDetail }
   | {
       kind: "learning-update";
       stats: {
@@ -220,6 +230,7 @@ export type PanelCommand =
   | { kind: "get-learning-stats" }
   | { kind: "clear-learning" }
   | { kind: "get-ledger" }
+  | { kind: "get-tripwire-log" }
   | {
       kind: "record-correction";
       /** Omit to correct the most recent run. */

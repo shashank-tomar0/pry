@@ -6,5 +6,6 @@ dist/
 
 # Test artifacts
 scripts/.verify-out.mjs
+scripts/.tripwire-iife.js
 eng.traineddata
 .ocr-cache/

@@ -24,6 +24,14 @@ let running = false;
 let abort: AbortController | null = null;
 let lastExperience: RunExperience | null = null;
 
+// Compact memory of finished exchanges so the next task can continue the
+// chat. In-memory only (never chrome.storage), cleared on reset; the raw
+// text is re-tokenized through the next run's vault before it reaches a model.
+const conversationMemory: Array<{ task: string; answer: string; timestamp: number }> = [];
+const CONVERSATION_MEMORY_MAX = 3;
+const CONVERSATION_TASK_MAX = 400;
+const CONVERSATION_ANSWER_MAX = 800;
+
 // ─── Tripwire aggregation ─────────────────────────────────────────────────────
 // One live transcript entry instead of one per intercepted request, plus a
 // capped detail log for the radar drawer.
@@ -441,6 +449,7 @@ async function start(task: string, tabId: number): Promise<void> {
       signal: abort.signal,
       captureScreenshot: captureAndProcessScreenshot,
       recordAudit: recordAuditEntry,
+      history: conversationMemory,
     });
   } catch (error) {
     emit({
@@ -470,6 +479,18 @@ async function start(task: string, tabId: number): Promise<void> {
       piiRedacted: auditEntries.reduce((sum, e) => sum + e.redactedCount, 0),
       durationMs: Date.now() - taskStartTime,
     });
+
+    // Conversation memory: remember this exchange so a follow-up task can
+    // continue the chat. Compact summaries only, capped to the last 3.
+    const lastAssistant = [...transcript].reverse().find((e) => e.role === "assistant");
+    if (lastAssistant?.text) {
+      conversationMemory.push({
+        task: task.slice(0, CONVERSATION_TASK_MAX),
+        answer: lastAssistant.text.slice(0, CONVERSATION_ANSWER_MAX),
+        timestamp: Date.now(),
+      });
+      if (conversationMemory.length > CONVERSATION_MEMORY_MAX) conversationMemory.shift();
+    }
 
     // Emit the privacy audit before status so the panel can render it.
     if (auditEntries.length > 0) emitPrivacyAudit();
@@ -550,6 +571,7 @@ chrome.runtime.onMessage.addListener(
       case "reset":
         abort?.abort();
         transcript = [];
+        conversationMemory.length = 0;
         running = false;
         tripwireAggregator.reset();
         tripwireLog.length = 0;

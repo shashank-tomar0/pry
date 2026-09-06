@@ -200,7 +200,7 @@ Detection runs in the service worker for DOM/text PII and in the offscreen docum
 The agent operates in a perceive-plan-act-verify cycle:
 
 1. **Perceive** — Extract a `PageSnapshot` from the content script. Apply the full privacy pipeline (detect, tokenize, redact). For local models, cap element count to 30 (80 for cloud models).
-2. **Plan** — On step 0, the deterministic planner attempts to resolve the task without an LLM. If it fails or the task is complex, the LLM planner (Anthropic/OpenAI/OpenRouter/Ollama) generates tool calls. The system prompt is shorter for local models (`SYSTEM_PROMPT_LOCAL`, ~180 tokens) to avoid context overflow.
+2. **Plan** — On step 0, the deterministic planner attempts to resolve the task without an LLM. If it fails or the task is complex, the LLM planner (Anthropic, OpenAI, OpenRouter, Groq, NVIDIA NIM, or local Ollama) generates tool calls. The system prompt is shorter for local models (`SYSTEM_PROMPT_LOCAL`, ~180 tokens) to avoid context overflow.
 3. **Act** — Each tool call passes through the safety gate. Element IDs are validated against the current snapshot. Tokens are resolved from the vault. The action executes via the content script (page actions) or Chrome APIs (navigation, tabs).
 4. **Verify** — After any action that may have changed the page, a fresh snapshot is captured. The privacy pipeline runs again. If the agent repeats the same action 3 times within 5 steps, it stops with a loop detection error.
 
@@ -224,15 +224,15 @@ The agent detects `provider === "ollama"` and applies several adaptations for lo
 | UI | Vanilla JS (minified) | Side panel with Hallmark Custom-04 broadsheet design |
 | DOM extraction | Native DOM APIs | Page snapshot extraction (~10ms) |
 | Face detection | Chrome FaceDetector API + skin-color heuristic | On-device face detection for screenshot redaction |
-| PII detection | Custom regex engine | Aadhaar, PAN, IFSC, SSN, passport, card numbers, API keys |
+| PII detection | Regex + checksum-gated validation (Verhoeff / Luhn) | Aadhaar, PAN, IFSC, SSN, passport, card numbers, API keys |
 | Redaction | OffscreenCanvas | Blur faces, mask credentials in screenshots |
 | Tokenization | In-memory vault | PII replaced with `<TYPE_N>` tokens, resolved at execution time |
-| LLM planning | Anthropic / OpenAI / OpenRouter / Ollama | Multi-provider with streaming and automatic fallback |
+| LLM planning | Anthropic / OpenAI / OpenRouter / Groq / NVIDIA NIM / Ollama | Multi-provider with streaming and automatic fallback |
 | Deterministic planner | Custom engine | Click-by-text, fill-by-label, scroll, navigate, press-key |
 | Safety gate | Pattern-matching enforcement | Blocks credential typing, confirms irreversible actions |
 | Storage | chrome.storage.local | Settings, session history |
 | Type safety | TypeScript 5.6 | End-to-end type checking |
-| Testing | Vitest | Unit and integration tests |
+| Testing | Node headless harness (esbuild + assert) | Pipeline, tripwire black-box, and OCR verification (190+ assertions) |
 
 ---
 
@@ -288,7 +288,7 @@ src/
 
 ```bash
 # Clone the repository
-git clone https://github.com/shashank-tomar0/super-agent.git
+git clone https://github.com/shashank-tomar0/pry.git
 cd super-agent
 
 # Install dependencies
@@ -324,52 +324,40 @@ Open the extension options page and add an API key for Anthropic, OpenAI, or Ope
 
 ---
 
-## What is Next
+## Release Status (v1.0)
 
-The current implementation provides a functional privacy pipeline for DOM-based PII detection, screenshot redaction, and safe browser automation. The following capabilities would significantly strengthen the product:
+What is documented above is what ships and is verified end-to-end by `npm run
+verify` (190 assertions: privacy pipeline, re-OCR pixel proof, MAIN-world
+tripwire scanner, checksum validation, learning loop). Of the original roadmap:
 
-### Vision Perception (High Priority)
+### Shipped and verified in v1.0
+- **Checksum-gated PII validation** — Verhoeff (Aadhaar), Luhn (cards), format
+  validation (PAN/IFSC). Regex lookalikes become measured false positives, not
+  over-redaction.
+- **MAIN-world egress tripwire** — hooks `fetch`/XHR/`sendBeacon` in the page's
+  real world; intercepts are aggregated into one live EGRESS WATCH entry with a
+  full per-request log in the radar drawer. Card matches require a real BIN
+  prefix; nothing fires inside hex hashes or alphanumeric tokens.
+- **Re-OCR verification** — after redaction, the exact shipped JPEG is re-OCR'd
+  with locally-vendored Tesseract; leaks flip the audit chip to WARNING.
+- **Synthetic semantic surrogates** — redacted credentials are replaced with
+  mathematically-valid dummy values (Verhoeff/Luhn) so VLMs keep layout.
+- **Self-improvement loop** — experience memory, reflection, learned rules
+  (false positives, misses, repeated-success strategy rules), immutable privacy
+  ledger, and a live dashboard.
+- **Egress accounting** — every byte sent to a remote planner is counted and
+  shown honestly in the toolbar badge; local-only (Ollama) runs show 0.
 
-The agent currently relies entirely on DOM extraction for page understanding. Pages with canvas-rendered content, PDFs, images, or dynamically generated text are invisible to the agent.
+### Still on the roadmap (not shipped — no fake claims)
+- **On-device vision models** — Florence-2 / PP-OCR / ONNX page understanding
+  (the `models/` directory is reserved for these; today's perception is DOM +
+  screenshot redaction + optional provider VLM, never raw pixels).
+- **In-page PII badge overlay** — a floating count chip on the page itself.
+- **Adaptive prompt compression** — context-budget-aware snapshot trimming.
+- **Session replay** — step-by-step playback of a completed run.
 
-- **Florence-2 ViT** — Open-vocab object detection (`<OD>`), OCR with bounding boxes (`<OCR_WITH_REGION>`), and page captioning (`<CAPTION>`) via `@huggingface/transformers` in the offscreen document.
-- **PP-OCR** — PaddleOCR detection + recognition via ONNX Runtime Web for lightweight text extraction (18MB model). Supports English and Devanagari.
-- **ScreenGraph Fusion** — Combine DOM, OCR, and ViT signals into a unified representation with IoU-based deduplication.
-
-### Checksum-Gated PII Validation (High Priority)
-
-The current detection uses only regex patterns, which produces false positives (e.g., a 10-digit order ID flagged as Aadhaar). Mathematical validation would eliminate most of these:
-
-- **Aadhaar** — Verhoeff checksum algorithm (12-digit mathematical validation)
-- **PAN Card** — Format + first-character series validation (validating that the first letter is from the correct series)
-- **Credit/Debit Cards** — Luhn algorithm (13-19 digit validation)
-- **IFSC Code** — Structural validation with bank code lookup
-
-### Egress Guard (Medium Priority)
-
-A `guardedFetch` wrapper that intercepts every outbound request PRY itself makes and scans the body with PII detectors before transmission. If checksum-validated PII is found, the request is blocked before it reaches the network.
-
-### MAIN-World Tripwire (Medium Priority)
-
-A separate content script injected into the page's MAIN world that patches `fetch`/`XMLHttpRequest` to observe (not block) which site requests carry PII. Observations feed the privacy audit. This must run in the MAIN world because the content script's isolated world has its own `fetch` — patching it there observes nothing the page does.
-
-### Re-OCR Verification (Medium Priority)
-
-After redacting a screenshot, re-OCR the redacted image and assert that zero PII text remains in the pixels. This proves that redaction actually worked — not a claim, but a measured assertion.
-
-### In-Page PII Badge (Low Priority)
-
-A DOM overlay at the top-center of the page that appears when PII is detected, showing a color-coded breakdown by category (Aadhaar, Phone, PAN, etc.) with a count. Auto-dismisses after 8 seconds. Visible to the user but not in screenshots sent to the LLM.
-
-### Adaptive Prompt Compression (Low Priority)
-
-Dynamically shrink the page snapshot based on remaining context budget. For a model with a 4K context window and a 910-token system prompt, the snapshot should be capped at ~2500 tokens. For a 128K model, it can be much larger. The current approach (hard cap at 30/80 elements) is a coarse approximation.
-
-### Session Replay (Low Priority)
-
-Replay a completed session's transcript step-by-step, showing the snapshot and action at each step. Useful for debugging and demos.
-
----
+These remain future work precisely so the shipped feature set stays honest:
+nothing in v1.0 depends on files that are not bundled in `dist/`.
 
 ## License
 

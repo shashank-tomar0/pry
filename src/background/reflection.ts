@@ -170,6 +170,31 @@ export function reflectOnRun(
     }
   }
 
+  // ── 2b. Repeated successful strategy (evidence across visits) ──────────
+  //
+  // One clean run on a fresh site teaches nothing durable — but the SAME
+  // domain + page type succeeding a second time with the same planner is
+  // real evidence worth remembering ("email pages on this site work with
+  // the LLM planner"). Without this, flawless runs on normal sites never
+  // produce a rule and the learning dashboard stays at zero forever even
+  // though the loop is running. Requires priorVisitCount >= 1 so a single
+  // visit can never brand a domain.
+  if (experience.taskSuccess && priorVisitCount >= 1 && experience.domain) {
+    const llmWon = llmActions.length > 0;
+    const detWon = deterministicActions.length > 0;
+    if (llmWon || detWon) {
+      const strategy: "llm" | "deterministic" =
+        llmWon && (!detWon || llmActions.length >= deterministicActions.length)
+          ? "llm"
+          : "deterministic";
+      const rule = generateRepeatedSuccessRule(experience, strategy, existingRules);
+      if (rule) {
+        newRules.push(rule);
+        strategyOptimizations++;
+      }
+    }
+  }
+
   // ── 3. Analyze Site-Specific Patterns ───────────────────────────────────
 
   // Only after a domain has been visited more than once does a site pattern
@@ -323,6 +348,44 @@ function generateStrategyRule(
     },
     confidence: 0.6,
     confirmedCount: 0,
+    createdAt: Date.now(),
+    lastConfirmedAt: Date.now(),
+  };
+}
+
+/**
+ * Rule minted when the same domain + page type has now succeeded twice with
+ * the same planner — normal successful usage becomes visible learning.
+ * Starts at confidence 0.7 / confirmedCount 1 because two matching runs are
+ * the evidence behind it.
+ */
+function generateRepeatedSuccessRule(
+  experience: RunExperience,
+  winningStrategy: "deterministic" | "llm",
+  existingRules: LearnedRule[],
+): LearnedRule | null {
+  const condition = `repeated_success:${winningStrategy}`;
+  const duplicate = existingRules.find(
+    (r) =>
+      r.category === "strategy" &&
+      r.pattern.condition === condition &&
+      r.pattern.domain === experience.domain &&
+      r.pattern.pageType === experience.pageType,
+  );
+  if (duplicate) return null;
+
+  return {
+    id: `repsucc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    category: "strategy",
+    description: `${experience.domain} ${experience.pageType} tasks succeed with the ${winningStrategy} planner (repeated successful visits).`,
+    pattern: {
+      domain: experience.domain,
+      pageType: experience.pageType,
+      condition,
+      action: `prefer_${winningStrategy}`,
+    },
+    confidence: 0.7,
+    confirmedCount: 1,
     createdAt: Date.now(),
     lastConfirmedAt: Date.now(),
   };

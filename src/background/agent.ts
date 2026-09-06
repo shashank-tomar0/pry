@@ -765,15 +765,37 @@ export async function runTask(
     const entryId = nextId();
     let opened = false;
 
+    // Mid-task narration is capped ON SCREEN: a chatty model must not bury the
+    // agent's tool steps in paragraphs. The full text still accumulates in the
+    // conversation history (the planner needs it); only the visible card is
+    // limited, and only while the turn is still calling tools. A turn that ends
+    // WITHOUT tool calls is the final answer — its hidden remainder is flushed
+    // so the closing summary always renders in full.
+    const NARRATION_CAP = 110;
+    let emittedChars = 0;
+    let narrationCapped = false;
+    let overflowText = "";
+
     const onText = (delta: string): void => {
       // Belt-and-braces: never let a raw vault value render in the transcript
       // even if one somehow reached the model's context.
       const safe = tokenizer.redactValues(delta);
+      if (narrationCapped) {
+        overflowText += safe;
+        return;
+      }
+      const room = Math.max(0, NARRATION_CAP - emittedChars);
+      const visible = room > 0 ? safe.slice(0, room) : "";
       if (!opened) {
         opened = true;
-        emit({ kind: "entry", entry: { id: entryId, role: "assistant", text: safe } });
-      } else {
-        emit({ kind: "patch", id: entryId, text: safe });
+        emit({ kind: "entry", entry: { id: entryId, role: "assistant", text: visible } });
+      } else if (visible.length > 0) {
+        emit({ kind: "patch", id: entryId, text: visible });
+      }
+      emittedChars += visible.length;
+      if (visible.length < safe.length) {
+        narrationCapped = true;
+        overflowText = safe.slice(visible.length);
       }
     };
 
@@ -871,6 +893,13 @@ export async function runTask(
     }
 
     messages.push({ role: "assistant", text: turn.text, toolCalls: turn.toolCalls });
+
+    // Final answers (turns with no tool calls) render in full — the cap above
+    // exists only to keep mid-task chatter short.
+    if (opened && narrationCapped && overflowText.length > 0 && turn.toolCalls.length === 0) {
+      const tail = tokenizer.redactValues(overflowText);
+      if (tail.length > 0) emit({ kind: "patch", id: entryId, text: tail });
+    }
 
     if (turn.stopReason === "refusal") {
       errorCount++;

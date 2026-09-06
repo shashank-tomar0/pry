@@ -10,11 +10,12 @@
     <!-- ─── Top Bar ─────────────────────────────────────────────────── -->
     <header class="topbar">
       <div class="topbar-left">
-        <span class="brand-mark">V</span>
+        <span class="brand-mark">P</span>
         <span class="brand-name">PRY</span>
         <span class="egress-badge" id="egress-badge">EGRESS —</span>
       </div>
       <div class="topbar-right">
+        <button class="icon-btn" id="btn-radar" title="Live Egress Tripwire Radar">🛡️</button>
         <button class="icon-btn" id="btn-history" title="Session history">☰</button>
         <button class="icon-btn" id="btn-learning" title="Self-improvement dashboard">🧠</button>
         <button class="icon-btn" id="btn-perception" title="Privacy audit">◉</button>
@@ -137,6 +138,47 @@
       <div id="audit-screenshots" class="audit-screenshots"></div>
       <div id="audit-detections" class="audit-detections"></div>
       <div id="audit-tokens" class="audit-tokens"></div>
+    </div>
+
+    <!-- ─── Tripwire Radar Panel ──────────────────────────────────────── -->
+    <div id="tripwire-panel" class="tripwire-panel hidden">
+      <div class="audit-header">
+        <span class="audit-title">🛡️ LIVE EGRESS TRIPWIRE RADAR</span>
+        <button id="tripwire-close" class="link-btn">CLOSE ×</button>
+      </div>
+      <div class="tripwire-content">
+        <div class="tripwire-hero">
+          <div class="tripwire-badge pulse">ACTIVE RADAR</div>
+          <p class="tripwire-lead">Active MAIN-World Interception &amp; Zero-Knowledge Egress Proof</p>
+        </div>
+        <div class="tripwire-grid">
+          <div class="tripwire-card">
+            <span class="tw-status ok">ACTIVE</span>
+            <span class="tw-name">MAIN-World Hook</span>
+            <span class="tw-detail">fetch, XHR &amp; sendBeacon hooked</span>
+          </div>
+          <div class="tripwire-card">
+            <span class="tw-status ok">ACTIVE</span>
+            <span class="tw-name">Synthetic Surrogates</span>
+            <span class="tw-detail">AI sees photorealistic dummy layout</span>
+          </div>
+          <div class="tripwire-card">
+            <span class="tw-status ok">ACTIVE</span>
+            <span class="tw-name">Checksum Validation</span>
+            <span class="tw-detail">Verhoeff (Aadhaar) &amp; Luhn (Cards)</span>
+          </div>
+          <div class="tripwire-card">
+            <span class="tw-status ok">GUARDED</span>
+            <span class="tw-name">Agent Egress Guard</span>
+            <span class="tw-detail">0 raw secrets escape to models</span>
+          </div>
+        </div>
+        <div class="tripwire-log" id="tripwire-log">
+          <div class="empty-state" style="padding: 14px;">
+            <p class="empty-sub">No third-party exfiltration detected. Outbound wire clean.</p>
+          </div>
+        </div>
+      </div>
     </div>
 
     <script type="module" src="sidepanel.js"></script>

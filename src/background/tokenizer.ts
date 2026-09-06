@@ -100,6 +100,56 @@ export class PIITokenizer {
     return undefined;
   }
 
+  /** Return all active vault entries (for audit and egress assertion). */
+  getEntries(): TokenEntry[] {
+    return Array.from(this.vault.values());
+  }
+
+  /**
+   * Tokenize sensitive patterns directly in the user prompt (Task-Level Tokenization).
+   * Ensures that user-typed passwords, credit cards, emails, Aadhaar, and credentials
+   * are placed into the vault and converted to tokens before the prompt ever reaches the LLM.
+   */
+  tokenizePrompt(prompt: string): { sanitized: string; tokenCount: number } {
+    let text = prompt;
+    let count = 0;
+
+    // Credit cards (13-19 digits with separators)
+    text = text.replace(/\b(?:\d[ -]*?){13,19}\b/g, (match) => {
+      count++;
+      return this.tokenize(match.trim(), "credential");
+    });
+
+    // Aadhaar numbers (12 digits in 4-4-4 format)
+    text = text.replace(/\b\d{4}[ -]?\d{4}[ -]?\d{4}\b/g, (match) => {
+      count++;
+      return this.tokenize(match.trim(), "id_number");
+    });
+
+    // PAN cards (5 letters + 4 digits + 1 letter)
+    text = text.replace(/\b[A-Z]{5}[0-9]{4}[A-Z]\b/g, (match) => {
+      count++;
+      return this.tokenize(match, "id_number");
+    });
+
+    // Emails
+    text = text.replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, (match) => {
+      count++;
+      return this.tokenize(match, "credential");
+    });
+
+    // Explicit credential / key / password assignments (quoted or unquoted token)
+    text = text.replace(/(?:password|pwd|secret|key|token)[:=]\s*(?:["']([^"']+)["']|(\S+))/gi, (full, qVal, uVal) => {
+      const val = qVal ?? uVal;
+      if (!val) return full;
+      count++;
+      const tok = this.tokenize(val, "credential");
+      return full.replace(val, tok);
+    });
+
+    return { sanitized: text, tokenCount: count };
+  }
+
   /**
    * Tokenize all detected PII in a snapshot's elements and text.
    * Returns a new snapshot with tokens in place of sensitive values.
@@ -262,39 +312,14 @@ export class PIITokenizer {
    * so it can match "Sharma Traders" in the task to <ORG_3> on screen.
    */
   tokenizeTask(task: string): { task: string; tokenCount: number } {
-    let tokenCount = 0;
-    let result = task;
+    // 1. First run high-precision prompt tokenization for credentials, IDs, cards, emails
+    const promptRes = this.tokenizePrompt(task);
+    let result = promptRes.sanitized;
+    let tokenCount = promptRes.tokenCount;
 
-    // Tokenize email addresses.
-    result = result.replace(/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/g, (match) => {
-      tokenCount++;
-      return this.tokenize(match, "credential");
-    });
-
-    // Tokenize phone numbers (Indian format: +91 XXXXX XXXXX, or 10 digits).
-    result = result.replace(/(\+91[\s-]?)?\b\d{5}[\s-]?\d{5}\b/g, (match) => {
-      tokenCount++;
-      return this.tokenize(match, "credential");
-    });
-
-    // Tokenize ID numbers.
-    const idPatterns: Array<{ pattern: RegExp; kind: DetectedPII["kind"] }> = [
-      { pattern: /\b\d{4}\s?\d{4}\s?\d{4}\b/g, kind: "id_number" },  // Aadhaar
-      { pattern: /\b[A-Z]{5}\d{4}[A-Z]\b/g, kind: "id_number" },      // PAN
-      { pattern: /\b\d{3}-\d{2}-\d{4}\b/g, kind: "id_number" },       // SSN
-      { pattern: /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g, kind: "credential" }, // Card
-    ];
-
-    for (const { pattern, kind } of idPatterns) {
-      result = result.replace(pattern, (match) => {
-        tokenCount++;
-        return this.tokenize(match, kind);
-      });
-    }
-
-    // Tokenize names that appear after common patterns.
-    // "from Sharma Traders" → "from <ORG_3>"
-    // "to John Doe" → "to <PERSON_1>"
+    // 2. Tokenize names that appear after common contextual patterns
+    // "from Sharma Traders" → "from <PII_3>"
+    // "to John Doe" → "to <PII_1>"
     const namePatterns = [
       { pattern: /\b(from|to|sender|recipient|addressed to|sent by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/g, kind: "pii_text" as const },
       { pattern: /\b(name|company|business|firm|organization|vendor|supplier|client)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/g, kind: "pii_text" as const },

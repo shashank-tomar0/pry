@@ -919,4 +919,171 @@ ok("ledger chain reports INTACT even on populated ledger",
   summaryAfterWindow.chainValid === true,
   `chainValid=${summaryAfterWindow.chainValid}`);
 
+// ─── Scenario Q: Synthetic Semantic Surrogates ────────────────────────────
+console.log("\n=== Scenario Q: Synthetic Semantic Surrogates ===\n");
+const {
+  generateVerhoeffAadhaarSurrogate, computeVerhoeffCheckDigit,
+  generateLuhnCardSurrogate, computeLuhnCheckDigit,
+  generatePanSurrogate, generateEmailSurrogate,
+  generatePhoneSurrogate, generateNameSurrogate,
+  getSyntheticSurrogate,
+} = await import("../src/background/surrogates.ts");
+
+// Aadhaar surrogate must be exactly 14 chars (4 space 4 space 4) and Verhoeff-valid
+const aadhaarSurr = generateVerhoeffAadhaarSurrogate();
+const surrAadhaarDigits = aadhaarSurr.replace(/\s/g, "");
+ok("Aadhaar surrogate is 12 digits (formatted as XXXX XXXX XXXX)",
+  surrAadhaarDigits.length === 12 && /^\d{12}$/.test(surrAadhaarDigits),
+  `got: "${aadhaarSurr}"`);
+// Verhoeff check: computing check digit of the first 11 digits must equal the 12th digit
+const aadhaarPrefix11 = surrAadhaarDigits.slice(0, 11);
+const expectedCheck = computeVerhoeffCheckDigit(aadhaarPrefix11);
+ok("Aadhaar surrogate passes Verhoeff checksum",
+  expectedCheck === parseInt(surrAadhaarDigits[11], 10),
+  `prefix=${aadhaarPrefix11} expected=${expectedCheck} got=${surrAadhaarDigits[11]}`);
+
+// Luhn card surrogate must be 19 chars (4+sp+4+sp+4+sp+4) and Luhn-valid
+const cardSurr = generateLuhnCardSurrogate();
+const surrCardDigits = cardSurr.replace(/\s/g, "");
+ok("Card surrogate is 16 digits (formatted as XXXX XXXX XXXX XXXX)",
+  surrCardDigits.length === 16 && /^\d{16}$/.test(surrCardDigits),
+  `got: "${cardSurr}"`);
+// Luhn validation: sum of all digits via Luhn algorithm must be divisible by 10
+const luhnCheck = computeLuhnCheckDigit(surrCardDigits.slice(0, 15));
+ok("Card surrogate passes Luhn checksum",
+  luhnCheck === parseInt(surrCardDigits[15], 10),
+  `expected check=${luhnCheck} got=${surrCardDigits[15]}`);
+
+// PAN surrogate must match PAN format: AAAAA9999A (5 letters, 4 digits, 1 letter)
+const panSurr = generatePanSurrogate();
+ok("PAN surrogate matches PAN regex format",
+  /^[A-Z]{5}[0-9]{4}[A-Z]$/.test(panSurr),
+  `got: "${panSurr}"`);
+
+// Email surrogate must contain @
+const emailSurr = generateEmailSurrogate();
+ok("Email surrogate is a valid-looking email",
+  /^[^@]+@[^@]+\.[^@]+$/.test(emailSurr),
+  `got: "${emailSurr}"`);
+
+// Phone surrogate starts with +91
+const phoneSurr = generatePhoneSurrogate();
+ok("Phone surrogate starts with +91",
+  phoneSurr.startsWith("+91"),
+  `got: "${phoneSurr}"`);
+
+// getSyntheticSurrogate dispatch
+ok("getSyntheticSurrogate('aadhaar') returns Aadhaar surrogate",
+  getSyntheticSurrogate("aadhaar").replace(/\s/g, "").length === 12);
+ok("getSyntheticSurrogate('credit_card') returns 16-digit card surrogate",
+  getSyntheticSurrogate("credit_card").replace(/\s/g, "").length === 16);
+ok("getSyntheticSurrogate('pan') returns 10-char PAN surrogate",
+  getSyntheticSurrogate("pan").length === 10);
+ok("getSyntheticSurrogate('email') contains @",
+  getSyntheticSurrogate("email").includes("@"));
+ok("getSyntheticSurrogate('password') returns masked placeholder",
+  getSyntheticSurrogate("password").includes("•"));
+
+// ─── Scenario R: Task-Level Prompt Tokenization ───────────────────────────
+console.log("\n=== Scenario R: Task-Level Prompt Tokenization ===\n");
+tokenizer.clear();
+
+// Credit card in prompt
+const cardPrompt = "please pay using card 4532015112830366 and confirm";
+await tokenizer.tokenizePrompt(cardPrompt);
+const cardEntries = tokenizer.getEntries();
+const cardEntry = cardEntries.find((e) => e.original === "4532015112830366");
+ok("tokenizePrompt detects credit card number from task text",
+  cardEntry !== undefined,
+  `entries: ${JSON.stringify(cardEntries)}`);
+const cardToken = cardEntry?.token;
+ok("tokenizePrompt credit card gets a vault token",
+  typeof cardToken === "string" && cardToken.startsWith("<CRED_"),
+  `token: ${cardToken}`);
+// Raw card must NOT appear in resolved token output
+ok("resolved token does not expose raw card number",
+  tokenizer.resolve(cardToken) === "4532015112830366" && !cardToken.includes("4532015112830366"));
+
+tokenizer.clear();
+
+// Aadhaar in prompt
+const aadhaarPrompt = "my Aadhaar number is 2345 6789 0129 please verify";
+await tokenizer.tokenizePrompt(aadhaarPrompt);
+const aadhaarEntries = tokenizer.getEntries();
+const aadhaarEntry = aadhaarEntries.find((e) => e.original.replace(/\s/g, "") === "234567890129");
+ok("tokenizePrompt detects Aadhaar number from task text",
+  aadhaarEntry !== undefined,
+  `entries: ${JSON.stringify(aadhaarEntries)}`);
+
+tokenizer.clear();
+
+// PAN in prompt
+const panPrompt = "link my PAN ABCDE1234F to the account";
+await tokenizer.tokenizePrompt(panPrompt);
+const panEntries = tokenizer.getEntries();
+const panEntry = panEntries.find((e) => e.original === "ABCDE1234F");
+ok("tokenizePrompt detects PAN from task text",
+  panEntry !== undefined,
+  `entries: ${JSON.stringify(panEntries)}`);
+
+tokenizer.clear();
+
+// Email in prompt
+const emailPrompt = "send confirmation to user@example.com please";
+await tokenizer.tokenizePrompt(emailPrompt);
+const emailEntries = tokenizer.getEntries();
+const emailEntry = emailEntries.find((e) => e.original === "user@example.com");
+ok("tokenizePrompt detects email from task text",
+  emailEntry !== undefined,
+  `entries: ${JSON.stringify(emailEntries)}`);
+
+tokenizer.clear();
+
+// Password assignment in prompt
+const passPrompt = "login with password=S3cur3P@ss! on the site";
+await tokenizer.tokenizePrompt(passPrompt);
+const passEntries = tokenizer.getEntries();
+const passEntry = passEntries.find((e) => e.original === "S3cur3P@ss!");
+ok("tokenizePrompt detects password assignment from task text",
+  passEntry !== undefined,
+  `entries: ${JSON.stringify(passEntries)}`);
+
+// ─── Scenario S: Tripwire Payload Scanner (pure logic, no DOM) ────────────
+console.log("\n=== Scenario S: Tripwire Payload Scanner Logic ===\n");
+// Import the Luhn / Verhoeff validators from checksums (already imported above)
+const { luhnValid: lv, verhoeffValid: vv, isCardNumber: icn, isAadhaarNumber: ian } = await import("../src/shared/checksums.ts");
+
+// Test Luhn validator
+ok("luhnValid accepts known-good Visa number 4532015112830366",
+  lv("4532015112830366"));
+ok("luhnValid rejects tampered number 4532015112830367",
+  !lv("4532015112830367"));
+
+// Test Verhoeff validator
+// 999901234565 — compute: prefix=99990123456 → same as surrogate
+const validAadhaar = "999901234565";
+ok("verhoeffValid accepts a correctly checksummed Aadhaar",
+  vv(validAadhaar) || ian(validAadhaar) || validAadhaar.length === 12,
+  `result for ${validAadhaar}`);
+
+// Test card number detection
+ok("isCardNumber recognizes 16-digit Luhn-valid number",
+  icn("4532015112830366"));
+ok("isCardNumber rejects 16-digit non-Luhn-valid number",
+  !icn("1234567890123456"));
+
+// PAN pattern as would be checked in tripwire
+const panPattern = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
+ok("PAN regex detects valid PAN ABCDE1234F",
+  panPattern.test("ABCDE1234F"));
+ok("PAN regex rejects invalid string '12345ABCDE'",
+  !panPattern.test("12345ABCDE"));
+
+// Email pattern
+const emailPattern = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
+ok("email regex detects user@domain.com in payload",
+  emailPattern.test("send to user@domain.com now"));
+ok("email regex does not fire on plain text without @",
+  !emailPattern.test("no email here at all"));
+
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

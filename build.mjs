@@ -94,7 +94,10 @@ const builds = [
   {
     ...shared,
     format: "iife",
-    entryPoints: { content: "src/content/content.ts" },
+    entryPoints: {
+      content: "src/content/content.ts",
+      tripwire: "src/content/tripwire.ts",
+    },
   },
 ];
 

@@ -11,7 +11,7 @@ import { runTask } from "./agent";
 import { saveSession, getSessions, deleteSession, clearHistory } from "./history";
 import { recordExperience, getMemoryStats, getExperiencesForDomain } from "./experience-memory";
 import { reflectOnRun } from "./reflection";
-import { getLedgerSummary } from "./privacy-ledger";
+import { getLedgerSummary, recordRedaction } from "./privacy-ledger";
 import { applyReflectionResults, getLearnedRules, getRulesSummary } from "./learned-rules";
 import type { RunExperience } from "./experience-memory";
 
@@ -484,6 +484,24 @@ async function start(task: string, tabId: number): Promise<void> {
 
 chrome.runtime.onMessage.addListener(
   (command: PanelCommand, _sender, sendResponse: (r: unknown) => void) => {
+    // ─── Active Tripwire Egress Alert from MAIN world ───
+    if ((command as any).type === "TRIPWIRE_ALERT") {
+      const detail = (command as any).detail;
+      if (detail) {
+        recordRedaction(1, `tripwire_${detail.piiType || "egress"}`).catch(() => {});
+        emit({
+          kind: "entry",
+          entry: {
+            id: `tripwire-${Date.now()}`,
+            role: "system",
+            text: `🚨 [PRY Tripwire Intercept] Intercepted unauthorized ${String(detail.piiType).toUpperCase()} in ${detail.method} call to: ${detail.url} (Masked: ${detail.sample})`,
+          },
+        });
+      }
+      sendResponse({ ok: true });
+      return false;
+    }
+
     switch (command.kind) {
       case "run":
         void start(command.task, command.tabId);

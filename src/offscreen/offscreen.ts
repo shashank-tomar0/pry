@@ -17,6 +17,7 @@
 
 import type { DetectedPII } from "../background/pii-detector";
 import { verifyRegions, emptyVerification, detectPIIInText, layoutRegionCrops } from "../background/reocr-verification";
+import { getSyntheticSurrogate } from "../background/surrogates";
 import { ocrDataUrl } from "./ocr";
 import type { VerificationResult } from "../shared/types";
 
@@ -366,15 +367,22 @@ async function processScreenshot(
       // build, so re-OCR verification can always confirm the redaction.
       boxBlurRegion(ctx, rx, ry, rw, rh, 6 * scale);
     } else {
-      ctx.fillStyle = "#000000";
+      // Synthetic Semantic Surrogate Inpainting:
+      // Overwrite the real PII pixels completely with a clean field + synthetic surrogate data.
+      // This wipes real PII from the pixel buffer while giving downstream VLMs realistic visual structure.
+      ctx.fillStyle = "#ffffff";
       ctx.fillRect(rx, ry, rw, rh);
-      // Add a small label showing what was redacted.
-      ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
-      ctx.font = `bold ${Math.max(9, Math.round(Math.min(rh * 0.3, 12)))}px system-ui, sans-serif`;
+      ctx.strokeStyle = "#6366f1";
+      ctx.lineWidth = Math.max(1, Math.round(scale));
+      ctx.strokeRect(rx, ry, rw, rh);
+
+      const surrogateText = getSyntheticSurrogate(region.kind || region.label);
+      ctx.fillStyle = "#0f172a";
+      ctx.font = `600 ${Math.max(9, Math.round(Math.min(rh * 0.45, 12 * scale)))}px system-ui, -apple-system, sans-serif`;
       ctx.textBaseline = "middle";
-      ctx.textAlign = "center";
-      const label = region.kind === "input_field" ? "🔒 Input" : `🔒 ${region.label}`;
-      ctx.fillText(label, rx + rw / 2, ry + rh / 2);
+      ctx.textAlign = "left";
+      const pad = 4 * scale;
+      ctx.fillText(`🔒 ${surrogateText}`, rx + pad, ry + rh / 2, Math.max(10, rw - pad * 2));
     }
 
     allDetections.push({

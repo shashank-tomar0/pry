@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+.rocketride/
+
+# Test artifacts
+scripts/.verify-out.mjs
+eng.traineddata
+.ocr-cache/

@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PRY Settings</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Fraunces:ital,opsz,wght@0,9..40,400;0,9..40,600;1,9..40,400&family=Spline+Sans+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <style>
+      :root {
+        --color-paper: #f5f2e9;
+        --color-paper-2: #ece7da;
+        --color-paper-3: #ded7c5;
+        --color-ink: #28231d;
+        --color-ink-2: #3e3831;
+        --color-ink-mute: #6b6256;
+        --color-rule: #4a4338;
+        --color-hairline: #d2cbba;
+        --color-accent: #e23829;
+        --color-teal: #00888c;
+        --font-display: "Big Shoulders Display", sans-serif;
+        --font-body: "Fraunces", Georgia, serif;
+        --font-mono: "Spline Sans Mono", monospace;
+      }
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        font-family: var(--font-body);
+        font-size: 13px;
+        background: var(--color-paper);
+        color: var(--color-ink-2);
+      }
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image: radial-gradient(rgba(40,35,29,0.05) 0.8px, transparent 0.9px);
+        background-size: 5px 5px;
+      }
+
+      /* ─── Header ─────────────────────────────────────── */
+      .header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 20px;
+        border-bottom: 2px solid var(--color-ink);
+        background: var(--color-paper);
+      }
+      .header h1 {
+        font-family: var(--font-display);
+        font-size: 20px;
+        font-weight: 900;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--color-ink);
+      }
+      .close-btn {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        background: var(--color-paper-2);
+        color: var(--color-ink);
+        border: 2px solid var(--color-ink);
+        padding: 4px 12px;
+        cursor: pointer;
+        box-shadow: 2px 2px 0px var(--color-ink);
+        transition: all 0.1s ease;
+      }
+      .close-btn:hover {
+        background: var(--color-ink);
+        color: var(--color-paper);
+        transform: translate(-1px, -1px);
+        box-shadow: 3px 3px 0px var(--color-ink);
+      }
+
+      /* ─── Section ────────────────────────────────────── */
+      .section {
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--color-hairline);
+      }
+      .section-title {
+        font-family: var(--font-mono);
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--color-ink-mute);
+      }
+      .section-subtitle {
+        font-family: var(--font-body);
+        font-size: 10px;
+        color: var(--color-ink-mute);
+        margin-top: 2px;
+      }
+
+      /* ─── Provider List ──────────────────────────────── */
+      .provider-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0;
+        border: 2px solid var(--color-ink);
+        box-shadow: 3px 3px 0px var(--color-ink);
+      }
+      .provider-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--color-ink);
+        cursor: pointer;
+        transition: all 0.1s ease;
+        background: var(--color-paper);
+      }
+      .provider-item:last-child { border-bottom: none; }
+      .provider-item:hover { background: var(--color-paper-2); }
+      .provider-item.active { background: var(--color-paper-2); }
+
+      .provider-radio {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        border: 2px solid var(--color-ink);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+      }
+      .provider-item.active .provider-radio { border-color: var(--color-accent); }
+      .provider-item.active .provider-radio::after {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--color-accent);
+      }
+
+      .provider-info { flex: 1; }
+      .provider-name {
+        font-family: var(--font-body);
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--color-ink);
+      }
+      .provider-model {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        color: var(--color-ink-mute);
+        font-style: italic;
+      }
+
+      .provider-badge {
+        font-family: var(--font-mono);
+        font-size: 8px;
+        font-weight: 600;
+        padding: 3px 8px;
+        border: 2px solid var(--color-ink);
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+      .provider-badge.enabled {
+        background: var(--color-ink);
+        color: var(--color-paper);
+      }
+      .provider-badge.disabled {
+        background: var(--color-paper-2);
+        color: var(--color-ink-mute);
+      }
+
+      /* ─── Active Planner ─────────────────────────────── */
+      .active-planner {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 14px;
+        border: 2px solid var(--color-ink);
+        box-shadow: 3px 3px 0px var(--color-ink);
+        background: var(--color-paper);
+        margin-bottom: 12px;
+      }
+      .active-planner .label {
+        font-family: var(--font-mono);
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--color-ink-mute);
+      }
+      .active-planner .model {
+        font-family: var(--font-body);
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--color-ink);
+      }
+      .active-badge {
+        font-family: var(--font-mono);
+        font-size: 9px;
+        font-weight: 600;
+        background: var(--color-teal);
+        color: var(--color-paper);
+        padding: 3px 10px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+
+      /* ─── Form Fields ────────────────────────────────── */
+      .field-group { margin-bottom: 10px; }
+      .field-label {
+        font-family: var(--font-mono);
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--color-ink-mute);
+        margin-bottom: 4px;
+        display: block;
+      }
+      .field-input {
+        width: 100%;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        padding: 8px 10px;
+        border: 2px solid var(--color-ink);
+        background: var(--color-paper-2);
+        color: var(--color-ink);
+        outline: none;
+        box-shadow: inset 1px 1px 2px rgba(0,0,0,0.1);
+        transition: all 0.15s ease;
+      }
+      .field-input:focus {
+        border-color: var(--color-accent);
+        box-shadow: 0 0 0 2px var(--color-accent);
+      }
+      .field-input::placeholder { color: var(--color-ink-mute); font-style: italic; }
+
+      .field-row {
+        display: flex;
+        gap: 8px;
+      }
+      .field-row .field-group { flex: 1; }
+
+      /* ─── Buttons ────────────────────────────────────── */
+      .btn {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        padding: 8px 16px;
+        border: 2px solid var(--color-ink);
+        cursor: pointer;
+        transition: all 0.1s ease;
+      }
+      .btn-primary {
+        background: var(--color-accent);
+        color: var(--color-paper);
+        box-shadow: 2px 2px 0px var(--color-ink);
+      }
+      .btn-primary:hover {
+        background: var(--color-ink);
+        color: var(--color-paper);
+        transform: translate(-1px, -1px);
+        box-shadow: 3px 3px 0px var(--color-ink);
+      }
+      .btn-secondary {
+        background: var(--color-paper-2);
+        color: var(--color-ink);
+        box-shadow: 2px 2px 0px var(--color-ink);
+      }
+      .btn-secondary:hover {
+        background: var(--color-ink);
+        color: var(--color-paper);
+        transform: translate(-1px, -1px);
+        box-shadow: 3px 3px 0px var(--color-ink);
+      }
+      .btn:disabled { opacity: 0.5; cursor: default; transform: none !important; }
+
+      /* ─── Toggle ─────────────────────────────────────── */
+      .toggle-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 0;
+        border-bottom: 1px solid var(--color-hairline);
+      }
+      .toggle-row:last-child { border-bottom: none; }
+      .toggle-label {
+        font-family: var(--font-body);
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--color-ink);
+      }
+      .toggle-desc {
+        font-family: var(--font-mono);
+        font-size: 9px;
+        color: var(--color-ink-mute);
+      }
+      .toggle {
+        position: relative;
+        width: 36px;
+        height: 20px;
+        appearance: none;
+        background: var(--color-paper-3);
+        border: 2px solid var(--color-ink);
+        border-radius: 0;
+        cursor: pointer;
+        transition: background 0.2s;
+        flex-shrink: 0;
+      }
+      .toggle:checked { background: var(--color-teal); border-color: var(--color-teal); }
+      .toggle::after {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 12px;
+        height: 12px;
+        background: var(--color-paper);
+        border: 1px solid var(--color-ink);
+        transition: transform 0.2s;
+      }
+      .toggle:checked::after { transform: translateX(16px); background: var(--color-paper); }
+
+      /* ─── Status ─────────────────────────────────────── */
+      .status-msg {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        font-weight: 600;
+        padding: 6px 0;
+        letter-spacing: 0.04em;
+      }
+      .status-msg.ok { color: var(--color-teal); }
+      .status-msg.bad { color: var(--color-accent); }
+
+      /* ─── Privacy Section ────────────────────────────── */
+      .privacy-grid {
+        border: 2px solid var(--color-ink);
+        box-shadow: 3px 3px 0px var(--color-ink);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <h1>AI Provider Setup</h1>
+      <button class="close-btn" id="close">Close ✕</button>
+    </div>
+
+    <div class="section">
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+        <div>
+          <div class="section-title">AI Providers</div>
+          <div class="section-subtitle">Configure LLM planners for browser automation.</div>
+        </div>
+        <button class="btn btn-secondary" id="refresh-models">Test Providers</button>
+        <button class="btn btn-secondary" id="test-ollama" style="display: none;">Test Ollama</button>
+      </div>
+      <div id="ollama-test-result" class="status-msg" style="display: none;"></div>
+
+      <div class="active-planner">
+        <div>
+          <div class="label">Active Planner</div>
+          <div class="model" id="active-model-display">—</div>
+        </div>
+        <div class="active-badge" id="active-provider-badge">—</div>
+      </div>
+
+      <div class="provider-list" id="provider-list"></div>
+      <div id="model-status" class="status-msg"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">API Key</div>
+      <div class="field-group" style="margin-top: 8px;">
+        <input type="password" class="field-input" id="apiKey" placeholder="sk-..." />
+      </div>
+      <div id="provider-hint" style="font-family: var(--font-mono); font-size: 9px; color: var(--color-ink-mute); margin-top: 4px;"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Model</div>
+      <div class="field-group" style="margin-top: 8px;">
+        <input type="text" class="field-input" id="model" list="model-list" placeholder="claude-opus-5" />
+        <datalist id="model-list"></datalist>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Agent Config</div>
+      <div class="field-row" style="margin-top: 8px;">
+        <div class="field-group">
+          <label class="field-label">Max Steps</label>
+          <input type="number" class="field-input" id="maxSteps" value="40" min="5" max="200" />
+        </div>
+        <div class="field-group">
+          <label class="field-label">Confirm Risky</label>
+          <div style="padding-top: 6px;">
+            <input type="checkbox" class="toggle" id="confirmRisky" checked />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Privacy Pipeline</div>
+      <div class="privacy-grid" style="margin-top: 8px;">
+        <div class="toggle-row">
+          <div>
+            <div class="toggle-label">Blur Faces</div>
+            <div class="toggle-desc">Detect and blur faces in screenshots</div>
+          </div>
+          <input type="checkbox" class="toggle" id="blurFaces" checked />
+        </div>
+        <div class="toggle-row">
+          <div>
+            <div class="toggle-label">Mask Credentials</div>
+            <div class="toggle-desc">Black out password and credit card fields</div>
+          </div>
+          <input type="checkbox" class="toggle" id="maskCredentials" checked />
+        </div>
+        <div class="toggle-row">
+          <div>
+            <div class="toggle-label">Tokenize PII</div>
+            <div class="toggle-desc">Replace sensitive values with opaque tokens</div>
+          </div>
+          <input type="checkbox" class="toggle" id="tokenizePII" checked />
+        </div>
+        <div class="toggle-row">
+          <div>
+            <div class="toggle-label">Show Redaction Labels</div>
+            <div class="toggle-desc">Display labels over redacted regions (demo mode)</div>
+          </div>
+          <input type="checkbox" class="toggle" id="showRedactionLabels" />
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">VLM Vision (optional)</div>
+      <div class="toggle-row" style="margin-top: 8px;">
+        <div>
+          <div class="toggle-label">Enable Visual Observation</div>
+          <div class="toggle-desc">After each page change, a vision model describes the REDACTED screenshot so the planner can see the screen. Only redacted pixels leave the browser; vision bytes count toward the egress badge.</div>
+        </div>
+        <input type="checkbox" class="toggle" id="visionEnabled" />
+      </div>
+      <div class="field-group" style="margin-top: 8px;">
+        <label class="field-label">Vision Model (uses the active provider's key)</label>
+        <input type="text" class="field-input" id="visionModel" list="vision-model-list" placeholder="gpt-4o-mini / llama-3.2-11b-vision-preview / …" />
+        <datalist id="vision-model-list">
+          <option value="gpt-4o-mini"></option>
+          <option value="llama-3.2-11b-vision-preview"></option>
+          <option value="meta/llama-3.2-11b-vision-instruct"></option>
+          <option value="llama3.2-vision"></option>
+          <option value="claude-sonnet-4-5"></option>
+        </datalist>
+        <div style="font-family: var(--font-mono); font-size: 9px; color: var(--color-ink-mute); margin-top: 4px;">
+          Leave blank to use the provider's default vision model.
+        </div>
+      </div>
+    </div>
+
+    <div class="section" style="border-bottom: none;">
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <button class="btn btn-primary" id="save">Save Configuration</button>
+        <span class="status-msg" id="saved"></span>
+      </div>
+    </div>
+
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

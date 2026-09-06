@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PRY Agent</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- ─── Top Bar ─────────────────────────────────────────────────── -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="brand-mark">V</span>
+        <span class="brand-name">PRY</span>
+        <span class="egress-badge" id="egress-badge">EGRESS —</span>
+      </div>
+      <div class="topbar-right">
+        <button class="icon-btn" id="btn-history" title="Session history">☰</button>
+        <button class="icon-btn" id="btn-learning" title="Self-improvement dashboard">🧠</button>
+        <button class="icon-btn" id="btn-perception" title="Privacy audit">◉</button>
+        <button class="icon-btn" id="btn-settings" title="Settings">⚙</button>
+      </div>
+    </header>
+
+    <!-- ─── Masthead ────────────────────────────────────────────────── -->
+    <div class="masthead">
+      <span>FREE BROADSHEET<span class="dot-sep">·</span>EDITION 04</span>
+      <span id="perception-counter">PERCEPTION N° 01</span>
+    </div>
+
+    <h1 class="headline">
+      <span class="headline-private">PRIVATE</span> AGENT
+    </h1>
+    <p class="subhead">PII detection, tokenization &amp; redaction run 100% inside your browser. Optional VLM vision when enabled.</p>
+
+    <hr class="rule" />
+
+    <!-- ─── Context Presets ─────────────────────────────────────────── -->
+    <div class="section-header">
+      <span>CONTEXT PRESETS</span>
+      <div class="preset-btns">
+        <button class="preset-btn" data-preset="aadhaar"><span>+ AADHAAR</span></button>
+        <button class="preset-btn" data-preset="pan"><span>+ PAN</span></button>
+        <button class="preset-btn" data-preset="contact"><span>+ CONTACT</span></button>
+      </div>
+    </div>
+
+    <!-- ─── Task Input ──────────────────────────────────────────────── -->
+    <div class="input-box">
+      <textarea
+        id="task-input"
+        rows="2"
+        placeholder="Instruct agent (e.g. fill form, scan PII)..."
+      ></textarea>
+      <button id="run-btn" class="run-arrow" title="Run task">→</button>
+      <button id="stop-btn" class="run-arrow stop hidden" title="Stop task">■</button>
+    </div>
+
+    <!-- ─── Quick Actions ───────────────────────────────────────────── -->
+    <div class="section-header">
+      <span>QUICK ACTIONS</span>
+    </div>
+    <div class="quick-grid">
+      <button class="quick-btn" data-action="fill-form"><span>✎ FILL FORM</span></button>
+      <button class="quick-btn" data-action="extract-data"><span>📊 EXTRACT DATA</span></button>
+      <button class="quick-btn" data-action="scan-pii"><span>◎ SCAN PII</span></button>
+      <button class="quick-btn" data-action="click-target"><span>⊘ CLICK TARGET</span></button>
+    </div>
+
+    <hr class="rule-thin" />
+
+    <!-- ─── Transcript ──────────────────────────────────────────────── -->
+    <div class="transcript-area" id="transcript">
+      <div class="empty-state" id="empty">
+        <div class="empty-icon">◉</div>
+        <p>AGENT STANDING BY</p>
+        <p class="empty-sub">Give a task or use a quick action above.</p>
+      </div>
+    </div>
+
+    <!-- ─── Status Bar ──────────────────────────────────────────────── -->
+    <div class="status-bar">
+      <span class="status-dot" id="status-dot"></span>
+      <span id="status-text">IDLE</span>
+      <div class="status-bar-right">
+        <button id="new-task-btn" class="link-btn">NEW</button>
+      </div>
+    </div>
+
+    <!-- ─── Confirm Dialog ──────────────────────────────────────────── -->
+    <div id="confirm" class="confirm-bar hidden">
+      <span id="confirm-text"></span>
+      <div class="confirm-actions">
+        <button id="confirm-no" class="confirm-btn">DECLINE</button>
+        <button id="confirm-yes" class="confirm-btn confirm-allow">ALLOW</button>
+      </div>
+    </div>
+
+    <!-- ─── History Panel ──────────────────────────────────────────── -->
+    <div id="history-panel" class="history-panel hidden">
+      <div class="audit-header">
+        <span class="audit-title">☰ SESSION HISTORY</span>
+        <button id="history-close" class="link-btn">CLOSE ✕</button>
+      </div>
+      <div id="history-list" class="history-list">
+        <div class="empty-state" style="padding: 20px;">
+          <p class="empty-sub">No sessions yet. Complete a task to see history here.</p>
+        </div>
+      </div>
+      <div class="history-footer">
+        <button id="history-clear" class="link-btn" style="color: var(--color-accent);">CLEAR ALL</button>
+      </div>
+    </div>
+
+    <!-- ─── Learning Dashboard ───────────────────────────────────────── -->
+    <div id="learning-dashboard" class="learning-dashboard hidden">
+      <div class="audit-header">
+        <span class="audit-title">🧠 SELF-IMPROVEMENT</span>
+        <span style="display: flex; gap: 8px;">
+          <button id="learning-reset" class="link-btn" style="color: var(--color-accent);">RESET</button>
+          <button id="learning-close" class="link-btn">CLOSE ×</button>
+        </span>
+      </div>
+      <div id="learning-stats" class="learning-stats"></div>
+      <div id="learning-rules" class="learning-rules"></div>
+      <div id="learning-reflection" class="learning-reflection"></div>
+      <div id="ledger-section" class="ledger-section"></div>
+    </div>
+
+    <!-- ─── Privacy Audit Panel ─────────────────────────────────────── -->
+    <div id="privacy-audit" class="privacy-audit hidden">
+      <div class="audit-header">
+        <span class="audit-title">🔒 PRIVACY AUDIT</span>
+        <button id="audit-close" class="link-btn">CLOSE ×</button>
+      </div>
+      <div id="audit-summary" class="audit-summary"></div>
+      <div id="audit-screenshots" class="audit-screenshots"></div>
+      <div id="audit-detections" class="audit-detections"></div>
+      <div id="audit-tokens" class="audit-tokens"></div>
+    </div>
+
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>

@@ -67,8 +67,12 @@
     return c === 0;
   }
 
-  const PAN_REGEX = /\b[A-Z]{5}[0-9]{4}[A-Z]\b/;
   const EMAIL_REGEX = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/;
+
+  // Numbers must NOT be embedded inside an alphanumeric token (hex hashes,
+  // session IDs, SAPISID strings) — only standalone PII-shaped values count.
+  const AADHAAR_REGEX = /(?<![0-9A-Za-z])\d{4}[ -]?\d{4}[ -]?\d{4}(?![0-9A-Za-z])/g;
+  const PAN_REGEX = /(?<![0-9A-Za-z])[A-Z]{5}[0-9]{4}[A-Z](?![0-9A-Za-z])/g;
 
   interface TripwireScanResult {
     found: boolean;
@@ -76,22 +80,46 @@
     sample?: string;
   }
 
+  /**
+   * Card-shaped numbers must match a real card network's BIN range on top of
+   * Luhn. Random 13-19 digit request/order IDs pass Luhn ~10% of the time;
+   * requiring a network prefix (Visa 4, Mastercard 51-55/2221-2720, Amex
+   * 34/37, Discover 6011/65/644-649, UnionPay 62, Maestro/RuPay 50/56-69/81-82)
+   * eliminates those false positives while keeping genuine cards.
+   */
+  function cardShapePasses(clean: string): boolean {
+    const len = clean.length;
+    if (len < 13 || len > 19) return false;
+    const first = clean[0];
+    if (first === "4") return len === 13 || len === 16 || len === 19; // Visa
+    if (first === "5") {
+      return len === 16 && /^(5[1-5]|2(2[2-9]|[3-6]\d|7[01]|720))/.test(clean); // Mastercard
+    }
+    if (first === "3") {
+      return (len === 15 && /^3[47]/.test(clean)) || (len >= 14 && /^(30[0-5]|36|38|39)/.test(clean)); // Amex / Diners
+    }
+    if (first === "6") {
+      return len >= 16 && /^(6011|65|64[4-9]|62|60|81|82)/.test(clean); // Discover / UnionPay / Maestro / RuPay
+    }
+    return false;
+  }
+
   function scanPayloadText(text: string): TripwireScanResult {
     if (!text || typeof text !== "string") return { found: false };
 
-    // 1. Credit card check
-    const cardMatches = text.match(/\b(?:\d[ -]*?){13,19}\b/g);
+    // 1. Credit card check (Luhn + BIN prefix + length, standalone only)
+    const cardMatches = text.match(/(?<![0-9A-Za-z])(?:\d[ -]*?){13,19}(?![0-9A-Za-z])/g);
     if (cardMatches) {
       for (const m of cardMatches) {
-        if (luhnCheck(m)) {
-          const clean = m.replace(/\D/g, "");
+        const clean = m.replace(/\D/g, "");
+        if (cardShapePasses(clean) && luhnCheck(clean)) {
           return { found: true, kind: "credit_card", sample: "•••• •••• •••• " + clean.slice(-4) };
         }
       }
     }
 
-    // 2. Aadhaar check (Verhoeff)
-    const aadhaarMatches = text.match(/\b\d{4}[ -]?\d{4}[ -]?\d{4}\b/g);
+    // 2. Aadhaar check (Verhoeff, standalone 12-digit runs only)
+    const aadhaarMatches = text.match(AADHAAR_REGEX);
     if (aadhaarMatches) {
       for (const m of aadhaarMatches) {
         if (verhoeffCheck(m)) {

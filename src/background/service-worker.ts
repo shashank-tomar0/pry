@@ -4,8 +4,10 @@ import type {
   ProcessedScreenshotResult,
   Settings,
   TranscriptEntry,
+  TripwireAlertDetail,
   VerificationResult,
 } from "../shared/types";
+import { createTripwireAggregator } from "./tripwire-aggregator";
 import { normaliseSettings } from "../shared/types";
 import { runTask } from "./agent";
 import { saveSession, getSessions, deleteSession, clearHistory } from "./history";
@@ -21,6 +23,32 @@ let transcript: TranscriptEntry[] = [];
 let running = false;
 let abort: AbortController | null = null;
 let lastExperience: RunExperience | null = null;
+
+// ─── Tripwire aggregation ─────────────────────────────────────────────────────
+// One live transcript entry instead of one per intercepted request, plus a
+// capped detail log for the radar drawer.
+const tripwireAggregator = createTripwireAggregator();
+const tripwireLog: TripwireAlertDetail[] = [];
+const TRIPWIRE_LOG_CAP = 60;
+let tripwireEntryCreated = false;
+
+function handleTripwireAlert(detail: TripwireAlertDetail): void {
+  tripwireLog.unshift(detail);
+  if (tripwireLog.length > TRIPWIRE_LOG_CAP) tripwireLog.length = TRIPWIRE_LOG_CAP;
+  recordRedaction(1, `tripwire_${detail.piiType || "egress"}`).catch(() => {});
+
+  const summary = tripwireAggregator.bump(detail);
+  if (!tripwireEntryCreated) {
+    tripwireEntryCreated = true;
+    emit({
+      kind: "entry",
+      entry: { id: "egress-watch", role: "egress", text: summary },
+    });
+  } else {
+    emit({ kind: "patch", id: "egress-watch", text: summary });
+  }
+  emit({ kind: "tripwire-update", alert: detail });
+}
 
 const pendingConfirms = new Map<string, (approved: boolean) => void>();
 
@@ -488,14 +516,12 @@ chrome.runtime.onMessage.addListener(
     if ((command as any).type === "TRIPWIRE_ALERT") {
       const detail = (command as any).detail;
       if (detail) {
-        recordRedaction(1, `tripwire_${detail.piiType || "egress"}`).catch(() => {});
-        emit({
-          kind: "entry",
-          entry: {
-            id: `tripwire-${Date.now()}`,
-            role: "system",
-            text: `🚨 [PRY Tripwire Intercept] Intercepted unauthorized ${String(detail.piiType).toUpperCase()} in ${detail.method} call to: ${detail.url} (Masked: ${detail.sample})`,
-          },
+        handleTripwireAlert({
+          url: String(detail.url ?? ""),
+          method: String(detail.method ?? "REQUEST"),
+          piiType: String(detail.piiType ?? "pii"),
+          sample: String(detail.sample ?? ""),
+          timestamp: Number(detail.timestamp) || Date.now(),
         });
       }
       sendResponse({ ok: true });
@@ -525,6 +551,9 @@ chrome.runtime.onMessage.addListener(
         abort?.abort();
         transcript = [];
         running = false;
+        tripwireAggregator.reset();
+        tripwireLog.length = 0;
+        tripwireEntryCreated = false;
         sendResponse({ ok: true });
         return false;
 
@@ -609,6 +638,13 @@ chrome.runtime.onMessage.addListener(
           sendResponse({ ledgerSummary });
         })();
         return true;
+
+      case "get-tripwire-log":
+        sendResponse({
+          alerts: tripwireLog,
+          summary: tripwireAggregator.summary(),
+        });
+        return false;
 
       default:
         return false;

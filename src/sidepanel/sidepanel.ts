@@ -1,4 +1,4 @@
-import type { AgentEvent, PanelCommand, TranscriptEntry } from "../shared/types";
+import type { AgentEvent, PanelCommand, TranscriptEntry, TripwireAlertDetail } from "../shared/types";
 import { accuracyMetrics } from "../shared/metrics";
 
 // ─── DOM References ────────────────────────────────────────────────────────
@@ -157,6 +157,7 @@ function setActivePanel(panelId: PanelId | null): void {
       break;
     case "tripwire-panel":
       tripwirePanel?.classList.remove("hidden");
+      void refreshTripwireLog();
       break;
     case "history-panel":
       historyPanel.classList.remove("hidden");
@@ -245,6 +246,17 @@ function render(entry: TranscriptEntry): void {
           <div class="user-text"></div>
         </div>
       `;
+    } else if (entry.role === "egress") {
+      node.innerHTML = `
+        <div class="egress-row">
+          <span class="egress-glyph">🛡️</span>
+          <div class="egress-body"></div>
+          <button class="egress-inspect" type="button" title="Open the live egress radar">RADAR →</button>
+        </div>
+      `;
+      node.querySelector(".egress-inspect")?.addEventListener("click", () => {
+        setActivePanel("tripwire-panel");
+      });
     }
     nodes.set(entry.id, node);
     transcriptEl.appendChild(node);
@@ -264,6 +276,9 @@ function render(entry: TranscriptEntry): void {
   } else if (entry.role === "user") {
     const userTextEl = node.querySelector(".user-text");
     if (userTextEl) userTextEl.textContent = entry.text;
+  } else if (entry.role === "egress") {
+    const body = node.querySelector(".egress-body");
+    if (body) body.textContent = entry.text;
   } else {
     node.textContent = entry.text;
   }
@@ -460,6 +475,10 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
           rawTexts.set(event.id, current);
           const detail = node.querySelector(".detail");
           if (detail) detail.textContent = current;
+        } else if (node.classList.contains("egress")) {
+          rawTexts.set(event.id, event.text ?? "");
+          const body = node.querySelector(".egress-body");
+          if (body) body.textContent = event.text ?? "";
         } else {
           node.textContent = event.text;
         }
@@ -489,6 +508,14 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
 
     case "learning-update":
       renderLearningDashboard(event.stats);
+      break;
+
+    case "tripwire-update":
+      // Keep the radar drawer live when it is open; otherwise the next open
+      // re-fetches the full log anyway.
+      if (!tripwirePanel?.classList.contains("hidden")) {
+        void refreshTripwireLog();
+      }
       break;
   }
 });
@@ -913,6 +940,56 @@ $("history-clear")?.addEventListener("click", () => {
 // Perception view (toggle audit)
 $("btn-perception")?.addEventListener("click", () => setActivePanel("privacy-audit"));
 $("audit-close")?.addEventListener("click", () => setActivePanel(null));
+
+// ─── Tripwire Radar Log ──────────────────────────────────────────────────────
+
+const tripwireLogEl = $("tripwire-log");
+const tripwireSummaryEl = $("tripwire-summary");
+
+function renderTripwireLog(alerts: TripwireAlertDetail[], summary: string): void {
+  if (tripwireSummaryEl) tripwireSummaryEl.textContent = summary;
+  if (alerts.length === 0) {
+    tripwireLogEl.innerHTML = `
+      <div class="empty-state" style="padding: 14px;">
+        <p class="empty-sub">No third-party exfiltration detected. Outbound wire clean.</p>
+      </div>
+    `;
+    return;
+  }
+  tripwireLogEl.innerHTML = "";
+  for (const alert of alerts) {
+    const row = document.createElement("div");
+    row.className = "tripwire-log-entry";
+    const kind = escapeHtml((alert.piiType || "PII").toUpperCase());
+    let host = "";
+    try {
+      host = new URL(alert.url).hostname.replace(/^www\./, "");
+    } catch {
+      host = alert.url.slice(0, 40);
+    }
+    const time = new Date(alert.timestamp).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    row.innerHTML = `
+      <span class="tl-kind">${kind}</span>
+      <span class="tl-method">${escapeHtml(alert.method)}</span>
+      <span class="tl-host" title="${escapeAttr(alert.url)}">${escapeHtml(host)}</span>
+      <span class="tl-sample">${escapeHtml(alert.sample)}</span>
+      <span class="tl-time">${time}</span>
+    `;
+    tripwireLogEl.appendChild(row);
+  }
+}
+
+async function refreshTripwireLog(): Promise<void> {
+  const response = (await send({ kind: "get-tripwire-log" })) as
+    | { alerts?: TripwireAlertDetail[]; summary?: string }
+    | undefined;
+  if (!response) return;
+  renderTripwireLog(response.alerts ?? [], response.summary ?? "");
+}
 
 // Tripwire Radar view
 $("btn-radar")?.addEventListener("click", () => setActivePanel("tripwire-panel"));

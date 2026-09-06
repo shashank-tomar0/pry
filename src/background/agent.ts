@@ -832,6 +832,22 @@ export async function runTask(
         () => turnAbort.abort(),
       );
 
+    // ─── AGENT EGRESS GUARD ───
+    // Before any message payload leaves for an external LLM endpoint,
+    // verify that zero raw secrets from the vault are escaping in the prompt.
+    for (const msg of messages) {
+      if (typeof (msg as any).content === "string") {
+        (msg as any).content = tokenizer.redactValues((msg as any).content);
+      }
+      if (msg.role === "tool") {
+        for (const res of msg.results) {
+          if (typeof res.content === "string") {
+            res.content = tokenizer.redactValues(res.content);
+          }
+        }
+      }
+    }
+
     let turn;
     try {
       turn = await runPlannerTurn(new AbortController());

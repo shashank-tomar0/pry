@@ -72,3 +72,17 @@ chrome.runtime.onMessage.addListener(
     }
   },
 );
+
+// Forward tripwire network leak alerts from MAIN world to background service worker
+window.addEventListener("__PRY_TRIPWIRE_ALERT__", (event: Event) => {
+  const customEvent = event as CustomEvent;
+  if (customEvent.detail) {
+    chrome.runtime.sendMessage({
+      type: "TRIPWIRE_ALERT",
+      detail: customEvent.detail,
+    }).catch(() => {
+      // Background worker may be sleeping
+    });
+  }
+});
+

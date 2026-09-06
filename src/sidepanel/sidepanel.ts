@@ -16,11 +16,15 @@ const statusText = $("status-text");
 const confirmEl = $("confirm");
 const confirmText = $("confirm-text");
 const privacyAuditEl = $("privacy-audit");
+const historyPanel = $("history-panel");
+const learningDashboardEl = $("learning-dashboard");
+const tripwirePanel = $("tripwire-panel");
 const egressBadge = $("egress-badge");
 const perceptionCounter = $("perception-counter");
 
 /** Rendered entries, so patches can find their node without a re-render. */
 const nodes = new Map<string, HTMLElement>();
+const rawTexts = new Map<string, string>();
 let pendingConfirmId: string | null = null;
 let perceptionCount = 0;
 
@@ -28,6 +32,137 @@ let perceptionCount = 0;
 
 function send(command: PanelCommand): Promise<unknown> {
   return chrome.runtime.sendMessage(command).catch(() => undefined);
+}
+
+function escapeHtml(str: string): string {
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function escapeAttr(str: string): string {
+  return str.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function formatMarkdown(text: string): string {
+  if (!text) return "";
+
+  // 1. Extract and stash fenced code blocks
+  const codeBlocks: string[] = [];
+  let processed = text.replace(/```([a-zA-Z0-9_-]*)\n?([\s\S]*?)```/g, (_match, lang, code) => {
+    const placeholder = `@@CODE_BLOCK_${codeBlocks.length}@@`;
+    const escapedCode = escapeHtml(code.trim());
+    const langLabel = lang ? `<div class="code-header"><span class="code-lang">${escapeHtml(lang.toUpperCase())}</span></div>` : "";
+    codeBlocks.push(`
+      <div class="chat-code-block">
+        ${langLabel}
+        <pre><code>${escapedCode}</code></pre>
+      </div>
+    `);
+    return placeholder;
+  });
+
+  // 2. Escape regular HTML characters
+  processed = escapeHtml(processed);
+
+  // 3. Highlight PRY Vault Tokens (e.g. <CRED_1>, <ID_2>, <EMAIL_1>)
+  processed = processed.replace(/&lt;([A-Z]+_\d+)&gt;/g, '<span class="vault-token-badge">&lt;$1&gt;</span>');
+
+  // 4. Inline code: `code`
+  processed = processed.replace(/`([^`\n]+)`/g, '<code class="chat-inline-code">$1</code>');
+
+  // 5. Bold: **text** or __text__
+  processed = processed.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  processed = processed.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+
+  // 6. Italic: *text* or _text_
+  processed = processed.replace(/(^|[^*])\*([^*]+)\*(?=[^*]|$)/g, "$1<em>$2</em>");
+
+  // 7. Headers: ###, ##, #
+  processed = processed.replace(/^### (.*$)/gim, '<h5 class="chat-h3">$1</h5>');
+  processed = processed.replace(/^## (.*$)/gim, '<h4 class="chat-h2">$1</h4>');
+  processed = processed.replace(/^# (.*$)/gim, '<h3 class="chat-h1">$1</h3>');
+
+  // 8. Bullet items: - item or * item
+  processed = processed.replace(/^[*-]\s+(.*$)/gim, '<li class="chat-li">$1</li>');
+
+  // 9. Numbered items: 1. item
+  processed = processed.replace(/^\d+\.\s+(.*$)/gim, '<li class="chat-oli">$1</li>');
+
+  // 10. Wrap lists
+  processed = processed.replace(/((?:<li class="chat-li">.*?<\/li>\s*)+)/g, '<ul class="chat-ul">$1</ul>');
+  processed = processed.replace(/((?:<li class="chat-oli">.*?<\/li>\s*)+)/g, '<ol class="chat-ol">$1</ol>');
+
+  // 11. Paragraph breaks
+  const parts = processed.split(/\n{2,}/);
+  processed = parts
+    .map((part) => {
+      const trimmed = part.trim();
+      if (!trimmed) return "";
+      if (
+        trimmed.startsWith("<div") ||
+        trimmed.startsWith("<ul") ||
+        trimmed.startsWith("<ol") ||
+        trimmed.startsWith("<h3") ||
+        trimmed.startsWith("<h4") ||
+        trimmed.startsWith("<h5") ||
+        trimmed.startsWith("@@CODE_BLOCK_")
+      ) {
+        return trimmed;
+      }
+      return `<p class="chat-p">${trimmed.replace(/\n/g, "<br/>")}</p>`;
+    })
+    .filter(Boolean)
+    .join("\n");
+
+  // 12. Restore code blocks
+  for (let i = 0; i < codeBlocks.length; i++) {
+    processed = processed.replace(`@@CODE_BLOCK_${i}@@`, codeBlocks[i]);
+  }
+
+  return processed;
+}
+
+type PanelId = "privacy-audit" | "learning-dashboard" | "tripwire-panel" | "history-panel";
+
+function setActivePanel(panelId: PanelId | null): void {
+  const isCurrentlyOpen = (id: PanelId): boolean => {
+    switch (id) {
+      case "privacy-audit": return !privacyAuditEl.classList.contains("hidden");
+      case "learning-dashboard": return !learningDashboardEl.classList.contains("hidden");
+      case "tripwire-panel": return !tripwirePanel?.classList.contains("hidden");
+      case "history-panel": return !historyPanel.classList.contains("hidden");
+    }
+  };
+
+  const target = panelId && isCurrentlyOpen(panelId) ? null : panelId;
+
+  privacyAuditEl.classList.add("hidden");
+  learningDashboardEl.classList.add("hidden");
+  tripwirePanel?.classList.add("hidden");
+  historyPanel.classList.add("hidden");
+
+  $("btn-perception")?.classList.toggle("active", target === "privacy-audit");
+  $("btn-learning")?.classList.toggle("active", target === "learning-dashboard");
+  $("btn-radar")?.classList.toggle("active", target === "tripwire-panel");
+  $("btn-history")?.classList.toggle("active", target === "history-panel");
+
+  if (!target) return;
+
+  switch (target) {
+    case "privacy-audit":
+      privacyAuditEl.classList.remove("hidden");
+      break;
+    case "learning-dashboard":
+      learningDashboardEl.classList.remove("hidden");
+      void refreshLearningDashboard();
+      break;
+    case "tripwire-panel":
+      tripwirePanel?.classList.remove("hidden");
+      break;
+    case "history-panel":
+      historyPanel.classList.remove("hidden");
+      void loadHistory();
+      break;
+  }
 }
 
 function formatEgress(bytes: number): string {
@@ -77,10 +212,45 @@ function render(entry: TranscriptEntry): void {
     node.className = `entry ${entry.role}`;
     if (entry.role === "step") {
       node.innerHTML = `<span class="glyph"></span><span class="detail"></span>`;
+    } else if (entry.role === "assistant") {
+      node.innerHTML = `
+        <div class="assistant-header">
+          <div class="assistant-tag">
+            <span class="assistant-dot"></span>
+            <span class="assistant-name">PRY AGENT</span>
+          </div>
+          <button class="btn-copy-chat" type="button" title="Copy response">
+            <span class="copy-icon">📋</span>
+            <span class="copy-label">Copy</span>
+          </button>
+        </div>
+        <div class="assistant-body"></div>
+      `;
+      const copyBtn = node.querySelector<HTMLButtonElement>(".btn-copy-chat");
+      copyBtn?.addEventListener("click", () => {
+        const textToCopy = rawTexts.get(entry.id) ?? "";
+        if (navigator.clipboard) {
+          void navigator.clipboard.writeText(textToCopy);
+          const label = copyBtn.querySelector(".copy-label");
+          if (label) {
+            label.textContent = "✓ Copied";
+            setTimeout(() => { label.textContent = "Copy"; }, 1600);
+          }
+        }
+      });
+    } else if (entry.role === "user") {
+      node.innerHTML = `
+        <div class="user-bubble">
+          <div class="user-tag">YOU</div>
+          <div class="user-text"></div>
+        </div>
+      `;
     }
     nodes.set(entry.id, node);
     transcriptEl.appendChild(node);
   }
+
+  rawTexts.set(entry.id, entry.text);
 
   if (entry.role === "step") {
     const glyph = node.querySelector(".glyph");
@@ -88,6 +258,12 @@ function render(entry: TranscriptEntry): void {
     const detail = node.querySelector(".detail");
     if (detail) detail.textContent = entry.text;
     node.classList.toggle("pending", entry.pending === true);
+  } else if (entry.role === "assistant") {
+    const body = node.querySelector(".assistant-body");
+    if (body) body.innerHTML = formatMarkdown(entry.text);
+  } else if (entry.role === "user") {
+    const userTextEl = node.querySelector(".user-text");
+    if (userTextEl) userTextEl.textContent = entry.text;
   } else {
     node.textContent = entry.text;
   }
@@ -132,8 +308,6 @@ function renderPrivacyAudit(audit: {
     timestamp: number;
   };
 }): void {
-  privacyAuditEl.classList.remove("hidden");
-
   // Summary stats.
   const summaryEl = $("audit-summary");
   const uniqueTokenCount = new Set(audit.allTokens.map((t) => t.token)).size;
@@ -152,18 +326,6 @@ function renderPrivacyAudit(audit: {
     </div>
   `;
 
-  // Re-OCR verification badge — pixel-level proof the redaction worked.
-  if (audit.verification) {
-    const vEl = document.createElement("div");
-    vEl.className = audit.verification.verified
-      ? "verification-badge verified"
-      : "verification-badge warn";
-    vEl.textContent = audit.verification.verified
-      ? `✓ RE-OCR VERIFIED — ${audit.verification.regionsRedacted}/${audit.verification.regionsChecked} sensitive regions confirmed redacted in the shipped image`
-      : `⚠ ${audit.verification.summary}`;
-    summaryEl.appendChild(vEl);
-  }
-
   // Screenshots before/after.
   const screenshotsEl = $("audit-screenshots");
   if (audit.screenshots.length > 0) {
@@ -181,57 +343,51 @@ function renderPrivacyAudit(audit: {
       if (shot.redacted) {
         pair.innerHTML += `
           <div class="shot">
-            <img src="${shot.redacted}" alt="Redacted" />
-            <div class="shot-label">🔒 Redacted</div>
+            <img src="${shot.redacted}" alt="Redacted (Shipped to Model)" />
+            <div class="shot-label">Redacted</div>
           </div>`;
       }
       screenshotsEl.appendChild(pair);
     }
   } else {
-    screenshotsEl.innerHTML = "";
-  }    // Detection chips.
+    screenshotsEl.innerHTML = `<h4>Screenshots</h4><p class="empty-sub">No screenshots were sent during this task.</p>`;
+  }
+
+  // Detections list.
   const detectionsEl = $("audit-detections");
   if (audit.allDetections.length > 0) {
-    const unique = new Map<string, { kind: string; label: string; count: number }>();
-    for (const d of audit.allDetections) {
-      const existing = unique.get(d.label);
-      if (existing) existing.count++;
-      else unique.set(d.label, { kind: d.kind, label: d.label, count: 1 });
-    }
-    detectionsEl.innerHTML = `<h4>Detected PII <span class="detection-hint">— flagged anything wrong? Tell the agent and it learns not to repeat it.</span></h4><div class="detection-list"></div>`;
+    detectionsEl.innerHTML = `<h4>Detected Regions</h4><div class="detection-list"></div>`;
     const list = detectionsEl.querySelector(".detection-list")!;
-    for (const [, det] of unique) {
-      const chip = document.createElement("span");
-      chip.className = `detection-chip ${det.kind}`;
-      chip.textContent = `${KIND_EMOJI[det.kind] ?? "•"} ${det.label}${det.count > 1 ? ` ×${det.count}` : ""}`;
-      // User ground truth: report a detection that was actually wrong. The
-      // service worker flips the outcome on the latest run and reflects a rule.
+    for (const d of audit.allDetections) {
+      const chip = document.createElement("div");
+      chip.className = "detection-chip";
+      const emoji = KIND_EMOJI[d.kind] ?? "📌";
+      const label = d.label || d.kind;
+      chip.innerHTML = `
+        <span class="kind">${emoji} ${label}</span>
+        <span class="conf">${Math.round(d.confidence * 100)}%</span>
+      `;
       const fpBtn = document.createElement("button");
       fpBtn.type = "button";
       fpBtn.className = "fp-btn";
       fpBtn.textContent = "✕ not PII";
-      fpBtn.dataset.kind = det.kind;
-      fpBtn.dataset.label = det.label;
+      fpBtn.dataset.kind = d.kind;
+      fpBtn.dataset.label = label;
       fpBtn.addEventListener("click", () => void reportFalsePositive(fpBtn));
       chip.appendChild(fpBtn);
       list.appendChild(chip);
     }
   } else {
-    detectionsEl.innerHTML = "";
+    detectionsEl.innerHTML = `<h4>Detected Regions</h4><p class="empty-sub">No sensitive regions detected.</p>`;
   }
 
-  // Token vault.
+  // Tokens list.
   const tokensEl = $("audit-tokens");
   if (audit.allTokens.length > 0) {
-    // Dedupe tokens (they can repeat across screenshot entries).
-    const seen = new Map<string, { token: string; kind: string; sample?: string }>();
-    for (const tok of audit.allTokens) {
-      if (!seen.has(tok.token)) seen.set(tok.token, tok);
-    }
-    tokensEl.innerHTML = `<h4>Token Vault (values never leave the browser)</h4><div class="token-list"></div>`;
+    tokensEl.innerHTML = `<h4>Token Vault</h4><div class="token-list"></div>`;
     const list = tokensEl.querySelector(".token-list")!;
-    for (const tok of seen.values()) {
-      const chip = document.createElement("span");
+    for (const tok of audit.allTokens as Array<{ token: string; kind: string; sample?: string }>) {
+      const chip = document.createElement("div");
       chip.className = "token-chip";
       const kind = tok.kind === "pii_text" ? "PII text" : tok.kind === "id_number" ? "ID number" : tok.kind === "api_key" ? "API key" : tok.kind;
       chip.textContent = tok.sample
@@ -244,7 +400,42 @@ function renderPrivacyAudit(audit: {
     tokensEl.innerHTML = `<h4>Token Vault</h4><p class="empty-sub">No values needed tokenizing on this page.</p>`;
   }
 
-  privacyAuditEl.scrollIntoView({ behavior: "smooth" });
+  // Render non-intrusive interactive verification chip in transcript
+  appendAuditVerificationChip(audit);
+}
+
+function appendAuditVerificationChip(audit: {
+  totalRedacted: number;
+  totalScreenshots: number;
+  totalPIIDetections: number;
+  allTokens: Array<{ token: string; kind: string }>;
+  verification?: { verified: boolean; summary: string };
+}): void {
+  const chip = document.createElement("div");
+  chip.className = "entry audit-chip";
+  const verifiedBadge = audit.verification?.verified
+    ? `<span class="chip-status ok">✓ ZERO-LEAK VERIFIED</span>`
+    : `<span class="chip-status warn">🔒 PRIVACY AUDIT</span>`;
+  const tokenCount = new Set(audit.allTokens.map((t) => t.token)).size;
+
+  chip.innerHTML = `
+    <div class="audit-chip-left">
+      <div class="audit-chip-badge">${verifiedBadge}</div>
+      <div class="audit-chip-stats">
+        <span>🛡️ <strong>${audit.totalRedacted}</strong> Redacted</span>
+        <span>🔑 <strong>${tokenCount}</strong> Vault Tokens</span>
+        <span>📸 <strong>${audit.totalScreenshots}</strong> Frames</span>
+      </div>
+    </div>
+    <button class="audit-chip-inspect-btn" type="button">INSPECT PROOF →</button>
+  `;
+
+  chip.querySelector(".audit-chip-inspect-btn")?.addEventListener("click", () => {
+    setActivePanel("privacy-audit");
+  });
+
+  transcriptEl.appendChild(chip);
+  if (atBottom()) transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
 // ─── Event Listener ────────────────────────────────────────────────────────
@@ -260,10 +451,15 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
       if (!node) break;
       if (event.text !== undefined) {
         if (node.classList.contains("assistant")) {
-          node.textContent = (node.textContent ?? "") + event.text;
+          const current = (rawTexts.get(event.id) ?? "") + event.text;
+          rawTexts.set(event.id, current);
+          const body = node.querySelector(".assistant-body");
+          if (body) body.innerHTML = formatMarkdown(current);
         } else if (node.classList.contains("step")) {
+          const current = (rawTexts.get(event.id) ?? "") + event.text;
+          rawTexts.set(event.id, current);
           const detail = node.querySelector(".detail");
-          if (detail) detail.textContent = event.text;
+          if (detail) detail.textContent = current;
         } else {
           node.textContent = event.text;
         }
@@ -299,8 +495,6 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
 
 // ─── Learning Dashboard ───────────────────────────────────────────────────
 
-const learningDashboardEl = $("learning-dashboard");
-
 function renderLearningDashboard(stats: {
   totalRuns: number;
   successRate: number;
@@ -328,7 +522,6 @@ function renderLearningDashboard(stats: {
   };
   lastReflection: string;
 }): void {
-  learningDashboardEl.classList.remove("hidden");
 
   // Stats grid — precision/recall derived from measured outcomes, never asserted.
   const statsEl = $("learning-stats");
@@ -464,8 +657,6 @@ function renderLearningDashboard(stats: {
 
   // Privacy ledger.
   loadLedger();
-
-  learningDashboardEl.scrollIntoView({ behavior: "smooth" });
 }
 
 // ─── Privacy Ledger Display ────────────────────────────────────────────────
@@ -585,16 +776,9 @@ async function reportFalsePositive(btn: HTMLButtonElement): Promise<void> {
   }
 }
 
-$("btn-learning").addEventListener("click", async () => {
-  learningDashboardEl.classList.toggle("hidden");
-  if (!learningDashboardEl.classList.contains("hidden")) {
-    await refreshLearningDashboard();
-  }
-});
+$("btn-learning")?.addEventListener("click", () => setActivePanel("learning-dashboard"));
 
-$("learning-close").addEventListener("click", () => {
-  learningDashboardEl.classList.add("hidden");
-});
+$("learning-close")?.addEventListener("click", () => setActivePanel(null));
 
 // Reset learning memory (experiences + rules + ledger) — useful when a buggy
 // run polluted the memory with garbage rules, so the demo starts clean.
@@ -616,30 +800,39 @@ async function submit(task?: string): Promise<void> {
 
   taskInput.value = "";
   taskInput.style.height = "auto";
-  privacyAuditEl.classList.add("hidden");
+  setActivePanel(null);
   updatePerceptionCount();
   await send({ kind: "run", task: text, tabId: tab.id });
 }
 
 // Run button / Enter
 runBtn.addEventListener("click", () => void submit());
-taskInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
-    event.preventDefault();
+taskInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
     void submit();
   }
 });
 
-// Stop
-stopBtn.addEventListener("click", () => void send({ kind: "stop" }));
+// Auto-grow textarea
+taskInput.addEventListener("input", () => {
+  taskInput.style.height = "auto";
+  taskInput.style.height = `${Math.min(taskInput.scrollHeight, 120)}px`;
+});
+
+// Stop button
+stopBtn.addEventListener("click", () => {
+  void send({ kind: "stop" });
+});
 
 // New task
 $("new-task-btn").addEventListener("click", () => {
   void send({ kind: "reset" });
   nodes.clear();
+  rawTexts.clear();
   transcriptEl.querySelectorAll(".entry").forEach((n) => n.remove());
   emptyEl.classList.remove("hidden");
-  privacyAuditEl.classList.add("hidden");
+  setActivePanel(null);
   setRunning(false);
   perceptionCount = 0;
   if (egressBadge) egressBadge.textContent = "EGRESS —";
@@ -651,7 +844,6 @@ $("btn-settings").addEventListener("click", () => chrome.runtime.openOptionsPage
 
 // ─── History Panel ──────────────────────────────────────────────────────
 
-const historyPanel = $("history-panel");
 const historyList = $("history-list");
 
 async function loadHistory(): Promise<void> {
@@ -709,32 +901,28 @@ async function loadHistory(): Promise<void> {
   }
 }
 
-function escapeHtml(str: string): string {
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-function escapeAttr(str: string): string {
-  return str.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-}
+$("btn-history")?.addEventListener("click", () => setActivePanel("history-panel"));
 
-$("btn-history").addEventListener("click", () => {
-  historyPanel.classList.toggle("hidden");
-  if (!historyPanel.classList.contains("hidden")) {
-    void loadHistory();
-  }
-});
+$("history-close")?.addEventListener("click", () => setActivePanel(null));
 
-$("history-close").addEventListener("click", () => {
-  historyPanel.classList.add("hidden");
-});
-
-$("history-clear").addEventListener("click", () => {
+$("history-clear")?.addEventListener("click", () => {
   void send({ kind: "delete-history", clearAll: true });
   historyList.innerHTML = `<div class="empty-state" style="padding: 20px;"><p class="empty-sub">No sessions yet. Complete a task to see history here.</p></div>`;
 });
 
 // Perception view (toggle audit)
-$("btn-perception").addEventListener("click", () => {
-  privacyAuditEl.classList.toggle("hidden");
+$("btn-perception")?.addEventListener("click", () => setActivePanel("privacy-audit"));
+$("audit-close")?.addEventListener("click", () => setActivePanel(null));
+
+// Tripwire Radar view
+$("btn-radar")?.addEventListener("click", () => setActivePanel("tripwire-panel"));
+$("tripwire-close")?.addEventListener("click", () => setActivePanel(null));
+
+// Global Escape key listener to close active drawer
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    setActivePanel(null);
+  }
 });
 
 // ─── Quick Actions ─────────────────────────────────────────────────────────

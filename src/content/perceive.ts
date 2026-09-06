@@ -130,6 +130,46 @@ function layoutLabel(el: Element): string {
     if (t.length <= 60) return t;
     parent = parent.parentElement;
   }
+
+  // 2D Spatial Proximity Perception:
+  // When DOM tree hierarchy fails (e.g. flex/grid columns or material designs where
+  // label and input reside in separate subtree branches), query visible text nodes
+  // geometrically located within 120px to the left or above the input element.
+  try {
+    const targetRect = el.getBoundingClientRect();
+    if (targetRect.width > 0 && targetRect.height > 0) {
+      const candidates = document.querySelectorAll("label, span, p, div, th, dt");
+      let bestDist = 120;
+      let bestText = "";
+      for (let i = 0; i < candidates.length; i++) {
+        const cand = candidates[i];
+        if (cand === el || cand.contains(el)) continue;
+        const text = clean((cand as HTMLElement).innerText ?? "");
+        if (!text || text.length > 45 || text.length < 2) continue;
+
+        const cr = cand.getBoundingClientRect();
+        if (cr.width === 0 || cr.height === 0) continue;
+
+        // Label to the left (same vertical line) or label immediately above
+        const isLeft = cr.right <= targetRect.left && cr.bottom >= targetRect.top - 10 && cr.top <= targetRect.bottom + 10;
+        const isAbove = cr.bottom <= targetRect.top && cr.right >= targetRect.left - 20 && cr.left <= targetRect.right + 20;
+
+        if (isLeft || isAbove) {
+          const dx = isLeft ? targetRect.left - cr.right : Math.abs(targetRect.left - cr.left);
+          const dy = isAbove ? targetRect.top - cr.bottom : Math.abs(targetRect.top - cr.top);
+          const dist = Math.hypot(dx, dy);
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestText = text;
+          }
+        }
+      }
+      if (bestText) return bestText;
+    }
+  } catch {
+    // Spatial lookup degrades gracefully
+  }
+
   return "";
 }
 

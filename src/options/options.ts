@@ -120,7 +120,10 @@ function renderAll(): void {
 
 function renderModelOptions(): void {
   const provider = PROVIDERS[settings.provider];
-  const options = fetched.get(settings.provider) ?? provider.suggested;
+  // A fetched-but-empty list must fall back to the bundled suggestions:
+  // `[] ?? suggested` would render NO models (an empty array is truthy).
+  const fetchedList = fetched.get(settings.provider);
+  const options = fetchedList && fetchedList.length > 0 ? fetchedList : provider.suggested;
   modelList.innerHTML = "";
   for (const id of options) {
     const option = document.createElement("option");
@@ -152,6 +155,9 @@ refreshBtn.addEventListener("click", async () => {
 
   try {
     const models = await listModels(provider, apiKeyEl.value.trim());
+    if (models.length === 0) {
+      throw new Error("Provider returned no chat models — showing bundled suggestions.");
+    }
     fetched.set(provider, models);
     renderModelOptions();
     modelStatus.textContent = `${models.length} models available.`;

@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>PRY Offscreen</title>
+</head>
+<body>
+  <!--
+    Offscreen document for WebGPU inference and PII detection.
+    This document has no visible UI — it exists solely to provide a DOM
+    environment for ONNX Runtime Web and TensorFlow.js, which cannot run
+    in a service worker.
+  -->
+  <script type="module" src="offscreen/offscreen.js"></script>
+</body>
+</html>

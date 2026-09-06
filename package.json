@@ -1,0 +1,25 @@
+{
+  "name": "pry-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "PRY — a privacy-preserving vision agent for Chrome and Firefox",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "node build.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "verify": "esbuild scripts/verify-pipeline.mjs --bundle --platform=node --format=esm --outfile=scripts/.verify-out.mjs && node scripts/.verify-out.mjs && node scripts/ocr-test.mjs"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "esbuild": "^0.24.0",
+    "jimp": "^0.22.12",
+    "typescript": "^5.6.3"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.120.0",
+    "@tesseract.js-data/eng": "^1.0.0",
+    "openai": "^7.5.0",
+    "tesseract.js": "^7.0.0"
+  }
+}

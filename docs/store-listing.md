@@ -43,15 +43,24 @@ any screenshot or page text reaches an AI model.
 > OpenRouter, Groq, NVIDIA NIM, or fully local Ollama. With Ollama, zero bytes
 > leave your machine (the toolbar badge shows honest egress: "0 KB").
 
-**Screenshots to capture (1280×800 or 640×400):**
-1. Side panel with a task running (EGRESS WATCH strip + agent card visible).
-2. Privacy audit drawer — before/after redaction screenshot pair.
-3. Radar drawer — intercepted-leak log.
-4. Self-improvement dashboard with learned rules + ledger.
-5. Options page — provider + API key selection.
+**Screenshots (1280×800) — GENERATED, ready to upload:**
+Generated mockups matching the real panel design live in `assets/store/`
+(`node scripts/gen-store-assets.mjs` regenerates them):
 
-**Promo tile (440×280):** the icon master (`assets/icon-master.png`) on the paper
-background with the PRY wordmark.
+1. `screenshot-1-in-action.png` — agent filling a payment form; card/Aadhaar
+   fields shown redacted to `<CRED_1>`/`<ID_3>`; EGRESS badge + ZERO-LEAK footer.
+2. `screenshot-2-dashboard.png` — self-improvement dashboard: learned rules,
+   lessons, replay library, ledger stats.
+3. `screenshot-3-options.png` — provider selection: Anthropic, OpenAI, Groq,
+   NVIDIA NIM, local Ollama (0 KB egress).
+4. `screenshot-4-audit.png` — privacy audit: raw capture vs. redacted shipped
+   image, re-OCR verification.
+
+For maximum conversion, replace these with real captures before or shortly
+after launch (recipe in `docs/launch-kit.md` §A6).
+
+**Promo tiles (generated):** `assets/store/tile-440x280.png` (small tile) and
+`assets/store/marquee-1400x560.png` (marquee).
 
 ---
 
@@ -96,11 +105,15 @@ background with the PRY wordmark.
 
 ## Pre-submission checklist
 
-1. `npm run verify` passes (190 assertions) and `npm run build` is clean.
-2. `dist/` loaded unpacked: toolbar icon (logo), side panel opens, a real task
+1. `npm run verify` passes (223 assertions) and `npm run build` is clean.
+2. `publish/pry-agent-1.0.0.zip` contains the full `dist/` contents (see
+   `docs/launch-kit.md` §A2 for the packaging recipe).
+3. `dist/` loaded unpacked: toolbar icon (logo), side panel opens, a real task
    runs end-to-end.
-3. `icons/` contains the brand icon at 16/32/48/128 — all replaced, none left
+4. `icons/` contains the brand icon at 16/32/48/128 — all replaced, none left
    from previous branding.
-4. No console errors in the service worker or side panel during a task.
-5. README clone URL + provider list + testing description updated (done).
-6. Version number bumped in `src/manifest.json` for each new upload.
+5. No console errors in the service worker or side panel during a task.
+6. README clone URL + provider list + testing description updated (done).
+7. Privacy policy from `docs/PRIVACY_POLICY.md` hosted at a public URL and
+   pasted into the listing (required — this extension handles PII).
+8. Version number bumped in `src/manifest.json` for each new upload.

@@ -18,11 +18,29 @@ justifications) and `docs/PRIVACY_POLICY.md` (hosted privacy policy).
    signal for reviewers and users. Add the store-listing and launch-kit docs to
    the README if you want.
 3. **Privacy policy URL** — the CWS form requires one (PRY handles PII, so this
-   is mandatory). Host `docs/PRIVACY_POLICY.md` at a stable public URL:
-   - **Easiest:** enable GitHub Pages on the repo, then
-     `https://<user>.github.io/<repo>/PRIVACY_POLICY.md` (works, renders nicely).
-   - **Simplest raw:** `https://raw.githubusercontent.com/<user>/<repo>/main/docs/PRIVACY_POLICY.md`.
+   is mandatory). The landing page ships a themed `landing/privacy.html`:
+   - **After the landing page is live:** `https://pry.shashanktomar.dev/privacy.html`
+     (the CNAME in `landing/` routes the subdomain; see §A0 below).
+   - **Before that:** `https://shashank-tomar0.github.io/pry/privacy.html` once
+     Pages is enabled, or the raw markdown
+     `https://raw.githubusercontent.com/shashank-tomar0/pry/main/docs/PRIVACY_POLICY.md`.
    - Paste the chosen URL into the listing form.
+
+### A0. Deploy the landing page (pry.shashanktomar.dev)
+
+The rebranded PRY landing page lives in `landing/` (`index.html`, `privacy.html`,
+`pry-agent-1.0.0-chrome.zip`, `CNAME`) and deploys to GitHub Pages via the
+`.github/workflows/deploy-landing.yml` action on every push to `main`. The
+`CNAME` file pins the site to `pry.shashanktomar.dev`. To go live:
+
+1. Push `main` to GitHub. The action deploys `landing/` to Pages (enable
+   Settings → Pages → Source → **GitHub Actions** the first time).
+2. At your DNS provider, add a `CNAME` record: `pry` →
+   `shashank-tomar0.github.io`.
+3. GitHub auto-provisions TLS for `pry.shashanktomar.dev` (a few minutes).
+
+Until the domain record propagates, the site is also reachable at
+`https://shashank-tomar0.github.io/pry/`.
 
 ### A2. Build the upload package
 
@@ -51,6 +69,7 @@ Create `publish/pry-agent-1.0.0.zip` containing exactly: `manifest.json`,
 | Small promo tile | `assets/store/tile-440x280.png` |
 | Marquee tile | `assets/store/marquee-1400x560.png` |
 | Privacy policy URL | from A1.3 |
+| Website | `https://pry.shashanktomar.dev` (landing page; fallback: repo) |
 | Distribution | Public |
 | Regions | All (or start with India + English-speaking markets) |
 

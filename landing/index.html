@@ -2040,7 +2040,7 @@
       }
 
       .hero-proto-center {
-        margin-top: -18vh;
+        margin-top: 0;
       }
 
       .hero-proto-center h1 {
@@ -4707,6 +4707,10 @@
     }
 
     @media (max-width: 700px) {
+      .hero-proto-center {
+        transform: translateY(calc(-20px + var(--copy-shift)));
+      }
+
       .nav-links .nav-cta {
         display: inline-flex;
       }
@@ -4796,6 +4800,49 @@
       }
     }
 
+    .footer-links {
+      display: flex;
+      align-items: center;
+      gap: 26px;
+      font: 500 11px/1 var(--mono);
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    @media (max-width: 700px) {
+      .nav-links {
+        gap: 10px;
+        font-size: 11px;
+      }
+
+      .nav-links .nav-cta {
+        padding: 6px 6px 6px 9px;
+      }
+    }
+
+    @media (max-width: 430px) {
+      .nav-links .nav-cta[href*="github"] {
+        display: none;
+      }
+    }
+
+    .footer-links a {
+      color: var(--deep);
+      opacity: 0.85;
+    }
+
+    .footer-links a:hover {
+      opacity: 1;
+      text-decoration: underline;
+    }
+
+    @media (max-width: 700px) {
+      .footer-links {
+        gap: 16px;
+        font-size: 9px;
+      }
+    }
+
     @media (prefers-reduced-motion: reduce) {
       .tide-scroll {
         height: auto;
@@ -4821,6 +4868,9 @@
     <div class="nav-links">
       <a class="nav-cta" href="https://github.com/shashank-tomar0/pry" target="_blank" rel="noopener">
         <span>github</span><b>↗</b>
+      </a>
+      <a class="nav-cta" href="privacy.html">
+        <span>privacy</span><b>↗</b>
       </a>
       <a class="nav-cta" href="pry-agent-1.0.0.zip" download="pry-agent-1.0.0.zip" style="background:#e23829; border-color:#e23829; color:#fff;">
         <span>download zip</span><b>↓</b>
@@ -5245,7 +5295,10 @@ npm install && npm run build</pre>
             <path d="M3 24C9 24 9 5 16 5s6 19 12 19S35 5 42 5s6 19 7 19" />
             <circle class="b" cx="49" cy="24" r="3.2" />
           </svg><span>PRY — SIH 2026</span></a>
-        <a href="privacy.html" style="font:500 11px/1 var(--mono);letter-spacing:.14em;color:var(--deep);opacity:.75;margin-left:28px;">privacy policy ↗</a>
+        <div class="footer-links">
+          <a href="privacy.html">privacy policy ↗</a>
+          <a href="https://shashanktomar.dev" target="_blank" rel="noopener">by Shashank Tomar · shashanktomar.dev ↗</a>
+        </div>
       </footer>
     </section>
   </div>

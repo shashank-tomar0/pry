@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap');
+    .display { font-family: 'Syne', sans-serif; }
+    .sans { font-family: 'DM Sans', sans-serif; }
+    .mono { font-family: 'IBM Plex Mono', monospace; }
+  </style>
+
+  <defs>
+    <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="1.2" cy="1.2" r="1.2" fill="#e0d3c8"/>
+    </pattern>
+  </defs>
+
+  <rect width="1600" height="900" fill="#f3ebe5"/>
+  <rect width="1600" height="900" fill="url(#dots)"/>
+
+  <!-- header -->
+  <g transform="translate(100, 70)">
+    <text class="mono" font-size="22" letter-spacing="8" fill="#1537ad" font-weight="500">THE PRY PRIVACY PIPELINE</text>
+    <text x="0" y="74" class="display" font-size="62" font-weight="700" fill="#15162b" letter-spacing="-1">Five stages. Zero egress.</text>
+    <text x="0" y="118" class="sans" font-size="26" fill="#4a4b63">Every snapshot passes all five stages on-device, before anything reaches a model.</text>
+  </g>
+
+  <!-- stage boxes -->
+  <g transform="translate(100, 290)">
+    <!-- arrow head def -->
+    <defs>
+      <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+        <path d="M0 0 L8 3 L0 6 Z" fill="#f36b57"/>
+      </marker>
+    </defs>
+
+    <!-- 1 DETECT -->
+    <g>
+      <rect x="0" y="0" width="250" height="230" rx="14" fill="#0b1d63"/>
+      <text x="24" y="44" class="mono" font-size="20" fill="#94bfda">01</text>
+      <text x="24" y="96" class="display" font-size="34" font-weight="700" fill="#ffffff">DETECT</text>
+      <text x="24" y="138" class="sans" font-size="19" fill="#cbd4ff">Aadhaar, PAN, cards,</text>
+      <text x="24" y="168" class="sans" font-size="19" fill="#cbd4ff">emails, phones,</text>
+      <text x="24" y="198" class="sans" font-size="19" fill="#cbd4ff">passwords, API keys</text>
+    </g>
+    <line x1="258" y1="115" x2="288" y2="115" stroke="#f36b57" stroke-width="4" marker-end="url(#arrow)"/>
+
+    <!-- 2 TOKENIZE -->
+    <g transform="translate(296, 0)">
+      <rect x="0" y="0" width="250" height="230" rx="14" fill="#1537ad"/>
+      <text x="24" y="44" class="mono" font-size="20" fill="#94bfda">02</text>
+      <text x="24" y="96" class="display" font-size="34" font-weight="700" fill="#ffffff">TOKENIZE</text>
+      <text x="24" y="138" class="sans" font-size="19" fill="#cbd4ff">Values become vault</text>
+      <text x="24" y="168" class="sans" font-size="19" fill="#cbd4ff">tokens — &lt;CRED_1&gt;,</text>
+      <text x="24" y="198" class="sans" font-size="19" fill="#cbd4ff">&lt;ID_3&gt; — in memory only</text>
+    </g>
+    <line x1="554" y1="115" x2="584" y2="115" stroke="#f36b57" stroke-width="4" marker-end="url(#arrow)"/>
+
+    <!-- 3 REDACT -->
+    <g transform="translate(592, 0)">
+      <rect x="0" y="0" width="250" height="230" rx="14" fill="#1537ad"/>
+      <text x="24" y="44" class="mono" font-size="20" fill="#94bfda">03</text>
+      <text x="24" y="96" class="display" font-size="34" font-weight="700" fill="#ffffff">REDACT</text>
+      <text x="24" y="138" class="sans" font-size="19" fill="#cbd4ff">Screenshot pixels</text>
+      <text x="24" y="168" class="sans" font-size="19" fill="#cbd4ff">masked or blurred —</text>
+      <text x="24" y="198" class="sans" font-size="19" fill="#cbd4ff">faces included</text>
+    </g>
+    <line x1="850" y1="115" x2="880" y2="115" stroke="#f36b57" stroke-width="4" marker-end="url(#arrow)"/>
+
+    <!-- 4 RE-OCR -->
+    <g transform="translate(888, 0)">
+      <rect x="0" y="0" width="250" height="230" rx="14" fill="#176a5e"/>
+      <text x="24" y="44" class="mono" font-size="20" fill="#a9d8c4">04</text>
+      <text x="24" y="96" class="display" font-size="34" font-weight="700" fill="#ffffff">RE-OCR</text>
+      <text x="24" y="138" class="sans" font-size="19" fill="#d2efe2">The exact shipped JPEG</text>
+      <text x="24" y="168" class="sans" font-size="19" fill="#d2efe2">is re-read locally to</text>
+      <text x="24" y="198" class="sans" font-size="19" fill="#d2efe2">prove zero PII remains</text>
+    </g>
+    <line x1="1146" y1="115" x2="1176" y2="115" stroke="#f36b57" stroke-width="4" marker-end="url(#arrow)"/>
+
+    <!-- 5 EGRESS WATCH -->
+    <g transform="translate(1184, 0)">
+      <rect x="0" y="0" width="284" height="230" rx="14" fill="#f36b57"/>
+      <text x="24" y="44" class="mono" font-size="20" fill="#ffe3dc">05</text>
+      <text x="24" y="98" class="display" font-size="26" font-weight="700" fill="#ffffff">EGRESS WATCH</text>
+      <text x="24" y="138" class="sans" font-size="19" fill="#ffffff">Live byte counter on</text>
+      <text x="24" y="168" class="sans" font-size="19" fill="#ffffff">every task — honest,</text>
+      <text x="24" y="198" class="sans" font-size="19" fill="#ffffff">never hidden</text>
+    </g>
+  </g>
+
+  <!-- footer strip -->
+  <g transform="translate(100, 620)">
+    <rect x="0" y="0" width="1400" height="88" rx="10" fill="#15162b"/>
+    <text x="34" y="40" class="mono" font-size="22" letter-spacing="4" fill="#a9abd8">100% ON-DEVICE</text>
+    <text x="330" y="40" class="mono" font-size="22" letter-spacing="4" fill="#a9abd8">CHECKSUM-GATED</text>
+    <text x="700" y="40" class="mono" font-size="22" letter-spacing="4" fill="#a9abd8">RE-OCR VERIFIED</text>
+    <text x="1050" y="40" class="mono" font-size="22" letter-spacing="4" fill="#d9b34e">OLLAMA = 0 KB EGRESS</text>
+    <text x="34" y="72" class="mono" font-size="16" letter-spacing="2" fill="#6a6b85">PRY — PRIVATE BROWSER AGENT · FREE ON THE CHROME WEB STORE · pry.shashanktomar.dev</text>
+  </g>
+</svg>

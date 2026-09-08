@@ -115,5 +115,7 @@ after launch (recipe in `docs/launch-kit.md` §A6).
 5. No console errors in the service worker or side panel during a task.
 6. README clone URL + provider list + testing description updated (done).
 7. Privacy policy from `docs/PRIVACY_POLICY.md` hosted at a public URL and
-   pasted into the listing (required — this extension handles PII).
+   pasted into the listing (required — this extension handles PII). Live URLs:
+   `https://pry.shashanktomar.dev/privacy.html` (once DNS points) or
+   `https://shashank-tomar0.github.io/pry/privacy.html` (live now).
 8. Version number bumped in `src/manifest.json` for each new upload.

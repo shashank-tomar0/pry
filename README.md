@@ -289,7 +289,7 @@ src/
 ```bash
 # Clone the repository
 git clone https://github.com/shashank-tomar0/pry.git
-cd super-agent
+cd pry
 
 # Install dependencies
 npm install

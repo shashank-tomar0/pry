@@ -183,7 +183,7 @@ re-render to exactly 1280×800 with any image tool.
 > Web Store: [LINK]
 >
 > If you care about privacy + agentic AI, give it a spin and tell me what breaks.
-> Feedback drives the roadmap. 🔒
+> Feedback drives the roadmap.
 
 **LinkedIn tactics:**
 - Post at Tue–Thu, 8–10 AM your audience's timezone.

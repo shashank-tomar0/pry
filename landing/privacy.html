@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PRY — Privacy Policy</title>
+  <meta name="description" content="PRY Agent privacy policy — how the extension handles your data." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Instrument+Serif:ital@0;1&amp;family=Syne:wght@400;500;600&amp;display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --blue: #1537ad;
+      --deep: #0b1d63;
+      --paper: #f3ebe5;
+      --ink: #15162b;
+      --pink: #e2a0b8;
+      --coral: #f36b57;
+      --gold: #d9b34e;
+      --green: #176a5e;
+      --lilac: #a9abd8;
+      --sky: #94bfda;
+      --sans: "DM Sans", sans-serif;
+      --display: "Syne", sans-serif;
+      --mono: "IBM Plex Mono", monospace;
+      --edge: clamp(20px, 5vw, 84px);
+      --max: 900px;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; background: var(--blue); }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--sans);
+      -webkit-font-smoothing: antialiased;
+      line-height: 1.65;
+    }
+    body:after {
+      content: "";
+      position: fixed;
+      z-index: 99;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.07;
+      mix-blend-mode: multiply;
+      background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence baseFrequency='.7' numOctaves='5' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    }
+    a { color: inherit; text-decoration: none; }
+    .page { width: min(100%, var(--max)); margin: auto; padding: 0 var(--edge); }
+    .top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 28px 0 8px;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; font-family: var(--display); font-weight: 800; letter-spacing: 0.04em; font-size: 20px; }
+    .mark { width: 40px; height: 23px; }
+    .mark .a { fill: var(--coral); }
+    .mark .b { fill: var(--green); }
+    .mark path { stroke: var(--ink); stroke-width: 1.6; fill: none; }
+    .back { font: 500 11px/1 var(--mono); letter-spacing: 0.14em; color: var(--deep); opacity: 0.8; }
+    .back:hover { opacity: 1; }
+    header.lede { padding: 48px 0 24px; border-bottom: 1px solid rgba(21, 55, 173, 0.18); }
+    .kicker { font: 500 10px/1.4 var(--mono); letter-spacing: 0.14em; color: var(--coral); margin: 0 0 18px; }
+    h1 { font-family: var(--display); font-size: clamp(30px, 5vw, 52px); line-height: 1.05; margin: 0 0 16px; font-weight: 600; }
+    .lede p { font-family: var(--display); font-size: clamp(15px, 2vw, 18px); line-height: 1.5; color: var(--deep); margin: 0; }
+    main { padding: 40px 0 80px; }
+    section { margin: 0 0 44px; }
+    h2 {
+      font-family: var(--display);
+      font-size: 21px;
+      font-weight: 600;
+      margin: 0 0 12px;
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+    }
+    h2 .no { font: 500 11px/1 var(--mono); color: var(--coral); letter-spacing: 0.1em; }
+    p { margin: 0 0 14px; }
+    ul { margin: 0 0 14px; padding-left: 22px; }
+    li { margin: 0 0 8px; }
+    strong { font-weight: 600; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0 20px;
+      font-size: 14px;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(21, 55, 173, 0.16);
+      vertical-align: top;
+    }
+    th { font: 500 10px/1.4 var(--mono); letter-spacing: 0.12em; color: var(--deep); text-transform: uppercase; }
+    code { font-family: var(--mono); font-size: 0.9em; background: rgba(21, 55, 173, 0.08); padding: 1px 6px; border-radius: 4px; }
+    .note {
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.6;
+      color: var(--deep);
+      background: rgba(217, 179, 78, 0.16);
+      border-left: 3px solid var(--gold);
+      padding: 12px 16px;
+      margin: 20px 0 0;
+    }
+    .effective { font: 500 11px/1.4 var(--mono); letter-spacing: 0.12em; color: var(--green); }
+    footer { border-top: 1px solid rgba(21, 55, 173, 0.18); padding: 28px 0 48px; font: 500 11px/1.6 var(--mono); letter-spacing: 0.1em; color: var(--deep); opacity: 0.75; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="top">
+      <a class="brand" href="index.html">
+        <svg class="mark" viewBox="0 0 52 30" aria-hidden="true">
+          <circle class="a" cx="3" cy="24" r="3.2" />
+          <path d="M3 24C9 24 9 5 16 5s6 19 12 19S35 5 42 5s6 19 7 19" />
+          <circle class="b" cx="49" cy="24" r="3.2" />
+        </svg>
+        <span>PRY</span>
+      </a>
+      <a class="back" href="index.html">← back to home</a>
+    </div>
+
+    <header class="lede">
+      <p class="kicker">PRY AGENT · PRIVACY POLICY</p>
+      <h1>Privacy, protected.</h1>
+      <p>PRY performs the tasks you describe while detecting, tokenizing, and redacting personally identifiable information on your device — before anything reaches an AI model.</p>
+      <p class="effective">EFFECTIVE DATE · SEPTEMBER 8, 2026</p>
+    </header>
+
+    <main>
+      <section>
+        <h2><span class="no">00</span> The short version</h2>
+        <p>PRY does not sell, rent, share, or advertise your data. It has no analytics, no tracking, no third-party SDKs, and no remote code. Everything that can stay on your machine stays on your machine. The only data that ever leaves your device is the task you typed and a PII-redacted page description — sent only to an LLM provider <strong>you</strong> choose, only while a task is running, and only over HTTPS.</p>
+      </section>
+
+      <section>
+        <h2><span class="no">01</span> Data processed on your device (never leaves it)</h2>
+        <ul>
+          <li><strong>Page content the agent reads.</strong> PRY reads the DOM of the active tab only while executing a task you submitted — never in the background, never on <code>chrome://</code>, <code>edge://</code>, or Web Store pages, and never without your task for that page.</li>
+          <li><strong>Screenshots.</strong> When visual perception is enabled, PRY captures the visible tab, detects sensitive regions (credential fields, faces, ID-like text), and redacts them — blurred, masked, or replaced with synthetic surrogates — all in an offscreen document on your machine. The redacted image is then re-OCR'd locally (bundled Tesseract) to verify no PII remains readable in the pixels. <strong>Raw screenshots are never sent to any server.</strong></li>
+          <li><strong>PII detection results.</strong> Detected values (card numbers, Aadhaar, PAN, emails, phone numbers, API keys, etc.) are replaced with opaque vault tokens (<code>&lt;CRED_1&gt;</code>, <code>&lt;ID_2&gt;</code>) held in memory. Raw values exist only in your browser's memory and are resolved at the last moment, inside your browser, when an action needs them.</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2><span class="no">02</span> Data stored locally on your device</h2>
+        <p>Stored in <code>chrome.storage.local</code> (your own disk, not cloud-synced):</p>
+        <ul>
+          <li><strong>Settings and API keys</strong> for LLM providers you configure. Keys are stored unencrypted at rest on your own disk — the standard for Chrome extensions — and are used only to call the provider you selected.</li>
+          <li><strong>Session history, learned rules, and the privacy ledger</strong> from past runs. Tasks stored in experience memory are <strong>tokenized</strong> before saving — raw PII values are never written to disk.</li>
+        </ul>
+        <p>You can clear all stored data at any time from the extension's options page, from <code>chrome://extensions</code> (Details → Clear storage), or by uninstalling the extension.</p>
+      </section>
+
+      <section>
+        <h2><span class="no">03</span> Data that leaves your device</h2>
+        <table>
+          <thead>
+            <tr><th>What</th><th>Where it goes</th><th>When</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Your <strong>task text</strong> and a <strong>PII-redacted page description</strong> (tokens, never raw values)</td>
+              <td>The LLM provider <strong>you selected</strong> in settings</td>
+              <td>While a task is running</td>
+            </tr>
+            <tr>
+              <td>A <strong>redacted screenshot</strong> (optional VLM vision)</td>
+              <td>The same LLM provider <strong>you selected</strong>, if you enabled vision</td>
+              <td>While a task is running</td>
+            </tr>
+            <tr>
+              <td>Nothing, if you use a local provider (e.g. <strong>Ollama</strong>)</td>
+              <td>—</td>
+              <td>Zero bytes leave your device</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>Everything is sent over <strong>HTTPS</strong>. The toolbar badge shows an honest live count of egress bytes ("0 KB" when nothing leaves).</p>
+      </section>
+
+      <section>
+        <h2><span class="no">04</span> Third-party LLM providers</h2>
+        <p>PRY works with providers you bring: Anthropic, OpenAI, OpenRouter, Groq, NVIDIA NIM, and local Ollama. The extension itself is not an LLM vendor and does not operate or control any provider API. If you configure a provider, the tokenized task data in section 03 is sent to that provider under <strong>their</strong> terms and privacy policy. If you do not configure any provider, or use only Ollama, no data is sent anywhere.</p>
+      </section>
+
+      <section>
+        <h2><span class="no">05</span> What PRY does NOT do</h2>
+        <ul>
+          <li>No collection, sale, or sharing of personal information</li>
+          <li>No analytics, telemetry, or crash reporting</li>
+          <li>No advertising or tracking pixels</li>
+          <li>No third-party SDKs or remote code</li>
+          <li>No background scanning of your browsing</li>
+          <li>No data processing when the extension is idle</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2><span class="no">06</span> Your choices and controls</h2>
+        <ul>
+          <li><strong>Use local-only mode.</strong> Configure Ollama and no task data leaves your machine.</li>
+          <li><strong>Disable vision.</strong> Turn off screenshot perception in options.</li>
+          <li><strong>Review what was sent.</strong> The INSPECT PROOF drawer shows every redaction and the exact image shipped.</li>
+          <li><strong>Delete everything.</strong> Clear storage from the options page or uninstall.</li>
+          <li><strong>Uninstall.</strong> Removing the extension deletes its local data.</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2><span class="no">07</span> Changes to this policy</h2>
+        <p>If this policy changes, the effective date at the top of this page will be updated and the extension's store listing will note the change.</p>
+      </section>
+
+      <section>
+        <h2><span class="no">08</span> Contact</h2>
+        <p>For privacy questions or reports, open an issue on the <a href="https://github.com/shashank-tomar0/pry" style="text-decoration:underline; color:var(--blue);">project repository</a> or contact the developer at the address listed in the Chrome Web Store developer profile.</p>
+        <p class="note">This policy is published as part of the open source repository; the version on the Chrome Web Store listing is the authoritative copy.</p>
+      </section>
+    </main>
+
+    <footer>
+      PRY — SIH 2026 · <a href="index.html">← back to home</a>
+    </footer>
+  </div>
+</body>
+</html>

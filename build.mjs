@@ -31,6 +31,7 @@ await cp(
 await cp("src/manifest.json", "dist/manifest.json");
 await cp("src/sidepanel/index.html", "dist/sidepanel.html");
 await cp("src/sidepanel/styles.css", "dist/styles.css");
+await cp("src/assets/fonts", "dist/fonts", { recursive: true });
 await cp("src/options/index.html", "dist/options.html");
 await cp("src/offscreen/index.html", "dist/offscreen.html");
 await cp("icons", "dist/icons", { recursive: true });

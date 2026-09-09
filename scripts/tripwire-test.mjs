@@ -95,7 +95,9 @@ check(`fixture ${BAD_BIN_LUHN.slice(0, 4)}… passes Luhn but is not a card BIN`
 const AADHAAR = "234567890124";
 const AADHAAR_SPACED = "2345 6789 0124";
 
-const PAN = "ABCDE1234F";
+// NOTE: not PRY's PAN surrogate (ABCDE1234F) — the surrogate is allowlisted
+// as a non-leak, so this fixture must be a genuine-looking PAN.
+const PAN = "BKXPT4821M";
 const EMAIL = "alice@example.com";
 
 // ─── Drive the patched fetch ────────────────────────────────────────────────
@@ -156,6 +158,43 @@ check("sendBeacon with Aadhaar alerts aadhaar", lastAlert()?.piiType === "aadhaa
 alerts.length = 0;
 beacon.call({}, "https://track.example.com/log?nonce=" + BAD_BIN_LUHN, "ok");
 check("sendBeacon with non-BIN number does NOT alert", alerts.length === 0);
+
+// ─── PRY's own surrogates are never leaks ────────────────────────────────────
+// The redaction pipeline renders checksum-VALID surrogate values into
+// screenshots. The tripwire must not report our own demo values as egress.
+const SURR = windowStub.__PRY_SURROGATES__;
+check("surrogate generators exposed by the bundled IIFE", typeof SURR?.aadhaar === "function");
+
+const SURR_AADHAAR = SURR.aadhaar();
+const SURR_CARD = SURR.card();
+check(`surrogate Aadhaar ${SURR_AADHAAR} is Verhoeff-valid (by design)`, /^\d{4} \d{4} \d{4}$/.test(SURR_AADHAAR));
+
+alerts.length = 0;
+await hookedFetch("https://track.example.com/pixel", { method: "POST", body: JSON.stringify({ demo: SURR_AADHAAR }) });
+check("surrogate Aadhaar in a request body does NOT alert", alerts.length === 0,
+  JSON.stringify(alerts));
+
+alerts.length = 0;
+await hookedFetch("https://track.example.com/pixel", { method: "POST", body: JSON.stringify({ card: SURR_CARD }) });
+check("surrogate card in a request body does NOT alert", alerts.length === 0,
+  JSON.stringify(alerts));
+
+alerts.length = 0;
+await hookedFetch("https://track.example.com/p", { method: "POST", body: `pan=${SURR.pan()}` });
+check("surrogate PAN in a request body does NOT alert", alerts.length === 0,
+  JSON.stringify(alerts));
+
+alerts.length = 0;
+await hookedFetch("https://track.example.com/p", { method: "POST", body: `from=${SURR.email()}` });
+check("surrogate email in a request body does NOT alert", alerts.length === 0,
+  JSON.stringify(alerts));
+
+// The allowlist must be exact, not a prefix waiver: a DIFFERENT Verhoeff-valid
+// Aadhaar that shares the surrogate's first 11 digits must still alert.
+alerts.length = 0;
+const realAadhaar = "2345 6789 0124";
+await hookedFetch("https://track.example.com/pixel", { method: "POST", body: JSON.stringify({ id: realAadhaar }) });
+check("a different Verhoeff-valid Aadhaar still alerts", lastAlert()?.piiType === "aadhaar");
 
 // ─── Summarise ────────────────────────────────────────────────────────────────
 console.log(`\n${pass} tripwire assertions passed.${fail > 0 ? ` ${fail} FAILED` : ""}`);

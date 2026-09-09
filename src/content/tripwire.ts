@@ -7,9 +7,35 @@
  * to third-party trackers or external endpoints.
  */
 
+import {
+  generateVerhoeffAadhaarSurrogate,
+  generateLuhnCardSurrogate,
+  generatePanSurrogate,
+  generateEmailSurrogate,
+} from "../background/surrogates";
+
 (function initPryTripwire() {
   if ((window as any).__PRY_TRIPWIRE_INSTALLED__) return;
   (window as any).__PRY_TRIPWIRE_INSTALLED__ = true;
+
+  // ─── PRY's own surrogate values are never leaks ────────────────────────────
+  // The redaction pipeline deliberately replaces real PII in screenshots with
+  // mathematically VALID surrogates (they pass Verhoeff/Luhn so VLMs keep the
+  // layout). Those exact values can appear in requests PRY itself is involved
+  // in; flagging them reports our own redaction work as an egress leak. The
+  // generators are imported, bundled in, and exposed as a global so this
+  // allowlist shares one source of truth with the redaction pipeline.
+  (window as any).__PRY_SURROGATES__ = {
+    aadhaar: generateVerhoeffAadhaarSurrogate,
+    card: generateLuhnCardSurrogate,
+    pan: generatePanSurrogate,
+    email: generateEmailSurrogate,
+  };
+  const SURROGATES = (window as any).__PRY_SURROGATES__;
+  const SURROGATE_AADHAAR_DIGITS: string = SURROGATES.aadhaar().replace(/\D/g, "");
+  const SURROGATE_CARD_DIGITS: string = SURROGATES.card().replace(/\D/g, "");
+  const SURROGATE_PAN: string = SURROGATES.pan();
+  const SURROGATE_EMAIL: string = SURROGATES.email();
 
   // ─── Mathematical Validation Helpers ─────────────────────────────────────────
 
@@ -112,6 +138,7 @@
     if (cardMatches) {
       for (const m of cardMatches) {
         const clean = m.replace(/\D/g, "");
+        if (clean === SURROGATE_CARD_DIGITS) continue; // PRY's own demo value
         if (cardShapePasses(clean) && luhnCheck(clean)) {
           return { found: true, kind: "credit_card", sample: "•••• •••• •••• " + clean.slice(-4) };
         }
@@ -124,6 +151,7 @@
       for (const m of aadhaarMatches) {
         if (verhoeffCheck(m)) {
           const clean = m.replace(/\D/g, "");
+          if (clean === SURROGATE_AADHAAR_DIGITS) continue; // PRY's own demo value
           return { found: true, kind: "aadhaar", sample: "•••• •••• " + clean.slice(-4) };
         }
       }
@@ -132,14 +160,18 @@
     // 3. PAN check
     const panMatch = text.match(PAN_REGEX);
     if (panMatch) {
-      return { found: true, kind: "pan", sample: panMatch[0].slice(0, 2) + "•••••" + panMatch[0].slice(-2) };
+      if (panMatch[0] !== SURROGATE_PAN) {
+        return { found: true, kind: "pan", sample: panMatch[0].slice(0, 2) + "•••••" + panMatch[0].slice(-2) };
+      }
     }
 
     // 4. Email check
     const emailMatch = text.match(EMAIL_REGEX);
     if (emailMatch) {
-      const [user, domain] = emailMatch[0].split("@");
-      return { found: true, kind: "email", sample: user.slice(0, 2) + "•••@" + domain };
+      if (emailMatch[0].toLowerCase() !== SURROGATE_EMAIL?.toLowerCase()) {
+        const [user, domain] = emailMatch[0].split("@");
+        return { found: true, kind: "email", sample: user.slice(0, 2) + "•••@" + domain };
+      }
     }
 
     return { found: false };

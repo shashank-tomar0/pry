@@ -530,10 +530,21 @@ export class PIITokenizer {
  * calls — "7<CRED_1>" instead of "<CRED_1>" — which would type the digit
  * into the field ("7shashank@gmail.com"). A digit directly touching a token
  * with no whitespace is never intentional; strip it so the resolved value is
- * exactly the vault value. Characters other than digits are left untouched.
+ * exactly the vault value.
+ *
+ * Models also sometimes emit INVISIBLE characters (zero-width spaces,
+ * BOM, joiners) between the digit and the token. Those defeat a strict
+ * "digit immediately before <" match while the resolver still finds the
+ * token, so the digit silently survives into the typed value (observed in
+ * the field: Gmail received "7" + email). All zero-width/invisible
+ * characters are therefore stripped from the string outright — they are
+ * never intentional in typed text — before the digit repairs run.
+ * Characters other than digits are left untouched.
  */
 export function repairTokenConcatenation(text: string): string {
   return String(text)
+    // Invisible separators break both the repair and any strict matching.
+    .replace(/[\u200b\u200c\u200d\u2060\u2061-\u2064\ufeff]/g, "")
     // "7<CRED_1>" (digit BEFORE token, not preceded by a letter/number)
     .replace(/(?<![A-Za-z0-9])\d+<([A-Z]+_\d+)>/g, "<$1>")
     // "<CRED_1>7" (digit AFTER token, not followed by a letter/number)

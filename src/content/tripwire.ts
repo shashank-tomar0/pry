@@ -45,9 +45,13 @@ import { isAadhaarNumber, luhnValid } from "../shared/checksums";
 
   const EMAIL_REGEX = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/;
 
-  // Numbers must NOT be embedded inside an alphanumeric token (hex hashes,
-  // session IDs, SAPISID strings) — only standalone PII-shaped values count.
-  const AADHAAR_REGEX = /(?<![0-9A-Za-z])\d{4}[ -]?\d{4}[ -]?\d{4}(?![0-9A-Za-z])/g;
+  // Aadhaar: the written 4-4-4 form flags on Verhoeff alone. A RAW 12-digit
+  // run flags only when an identity key names it — unspaced 12-digit numbers
+  // are usually platform/order/telemetry IDs, and any of them passes Verhoeff
+  // ~10% of the time (observed: play.google.com beacons flagged as Aadhaar).
+  const AADHAAR_FORMATTED_REGEX = /(?<![0-9A-Za-z])\d{4}[ -]\d{4}[ -]\d{4}(?![0-9A-Za-z])/g;
+  const AADHAAR_RAW_REGEX = /(?<![0-9A-Za-z])\d{12}(?![0-9A-Za-z])/g;
+  const AADHAAR_KEY_HINT = /(?:aadhaar|aadhar|uidai|uid|national[ -]?id)\s*["':=]{0,3}\s*$/i;
   const PAN_REGEX = /(?<![0-9A-Za-z])[A-Z]{5}[0-9]{4}[A-Z](?![0-9A-Za-z])/g;
 
   interface TripwireScanResult {
@@ -95,16 +99,20 @@ import { isAadhaarNumber, luhnValid } from "../shared/checksums";
       }
     }
 
-    // 2. Aadhaar check (Verhoeff, standalone 12-digit runs only)
-    const aadhaarMatches = text.match(AADHAAR_REGEX);
-    if (aadhaarMatches) {
-      for (const m of aadhaarMatches) {
-        if (isAadhaarNumber(m)) {
-          const clean = m.replace(/\D/g, "");
-          if (clean === SURROGATE_AADHAAR_DIGITS) continue; // PRY's own demo value
-          return { found: true, kind: "aadhaar", sample: "•••• •••• " + clean.slice(-4) };
-        }
+    // 2. Aadhaar check (Verhoeff; formatted runs always, raw runs need a key)
+    const aadhaarMatches = [
+      ...text.matchAll(AADHAAR_FORMATTED_REGEX),
+      ...text.matchAll(AADHAAR_RAW_REGEX),
+    ];
+    for (const m of aadhaarMatches) {
+      if (!isAadhaarNumber(m[0])) continue;
+      const clean = m[0].replace(/\D/g, "");
+      if (clean === SURROGATE_AADHAAR_DIGITS) continue; // PRY's own demo value
+      if (/^\d{12}$/.test(m[0])) {
+        const prefix = text.slice(Math.max(0, (m.index ?? 0) - 32), m.index ?? 0);
+        if (!AADHAAR_KEY_HINT.test(prefix)) continue; // unnamed telemetry ID
       }
+      return { found: true, kind: "aadhaar", sample: "•••• •••• " + clean.slice(-4) };
     }
 
     // 3. PAN check

@@ -1104,7 +1104,7 @@ const agg = createTripwireAggregator();
 ok("fresh aggregator reports zero intercepts",
   agg.total() === 0 && agg.counts().size === 0);
 ok("fresh aggregator summary names the count",
-  agg.summary().includes("0 outbound PII leaks blocked"));
+  agg.summary().includes("0 outbound PII leaks flagged"));
 
 agg.bump({ url: "https://mail.google.com/sync/i/fd?c=1", method: "POST", piiType: "credit_card", sample: "•••• 9411", timestamp: 1 });
 agg.bump({ url: "https://www.mail.google.com/sync/i/fd?c=2", method: "POST", piiType: "credit_card", sample: "•••• 0930", timestamp: 2 });
@@ -1116,7 +1116,7 @@ ok("counts by type: credit_card ×2, email ×1",
 ok("hosts are normalized (www stripped) and counted",
   agg.hosts().get("mail.google.com") === 2 && agg.hosts().get("analytics.thirdparty.com") === 1);
 const aggSummary = agg.summary();
-ok("summary headline carries the total", aggSummary.includes("3 outbound PII leaks blocked"));
+ok("summary headline carries the total", aggSummary.includes("3 outbound PII leaks flagged"));
 ok("summary breaks down by type, highest first",
   aggSummary.includes("CREDIT_CARD ×2") && aggSummary.includes("EMAIL ×1"));
 ok("summary orders types by count descending",

@@ -152,7 +152,7 @@ check("XHR with non-BIN number does NOT alert", alerts.length === 0);
 // ─── sendBeacon path ─────────────────────────────────────────────────────────
 alerts.length = 0;
 const beacon = context.navigator.sendBeacon;
-beacon.call({}, "https://track.example.com/beacon", `ref=${AADHAAR}`);
+beacon.call({}, "https://track.example.com/beacon", `ref=${AADHAAR_SPACED}`);
 check("sendBeacon with Aadhaar alerts aadhaar", lastAlert()?.piiType === "aadhaar");
 
 alerts.length = 0;
@@ -195,6 +195,27 @@ alerts.length = 0;
 const realAadhaar = "2345 6789 0124";
 await hookedFetch("https://track.example.com/pixel", { method: "POST", body: JSON.stringify({ id: realAadhaar }) });
 check("a different Verhoeff-valid Aadhaar still alerts", lastAlert()?.piiType === "aadhaar");
+
+// ─── Raw 12-digit runs need an identity key (telemetry FP class) ────────────
+// A raw unspaced Verhoeff-valid number with no aadhaar/uid key is telemetry
+// noise (observed live: a play.google.com beacon flagged as Aadhaar).
+alerts.length = 0;
+await hookedFetch("https://play.google.com/log", { method: "POST", body: JSON.stringify({ event: "ping", order_id: AADHAAR }) });
+check("raw unspaced 12-digit run WITHOUT identity key does NOT alert", alerts.length === 0,
+  JSON.stringify(alerts));
+
+alerts.length = 0;
+await hookedFetch("https://gov.example.com/verify", { method: "POST", body: JSON.stringify({ aadhaar: AADHAAR }) });
+check("raw unspaced 12-digit run WITH aadhaar key alerts", lastAlert()?.piiType === "aadhaar");
+
+alerts.length = 0;
+await hookedFetch("https://track.example.com/p", { method: "POST", body: `uid=${AADHAAR}` });
+check("raw unspaced run with uid= key alerts", lastAlert()?.piiType === "aadhaar");
+
+// Spaced 4-4-4 form still flags on Verhoeff alone, no key needed.
+alerts.length = 0;
+await hookedFetch("https://track.example.com/p", { method: "POST", body: `note=${AADHAAR_SPACED}` });
+check("formatted 4-4-4 Aadhaar still alerts without any key", lastAlert()?.piiType === "aadhaar");
 
 // ─── Summarise ────────────────────────────────────────────────────────────────
 console.log(`\n${pass} tripwire assertions passed.${fail > 0 ? ` ${fail} FAILED` : ""}`);

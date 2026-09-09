@@ -24,6 +24,8 @@ const OUT = "assets/store";
 const SHOT1 = "C:/Users/dell/Downloads/Screenshot 2026-09-09 091054.jpg";
 const SHOT2 =
   "C:/Users/dell/.zcode/cli/image-cache/sess_6c197e73-af1c-4ac6-bec9-bc50adc5d104/image-926ec9be02ddb60544efd3f561bb0a19.png";
+const SHOT3 =
+  "C:/Users/dell/.zcode/cli/image-cache/sess_6c197e73-af1c-4ac6-bec9-bc50adc5d104/image-e2bb572a72afa121cd377a55f31482cd.png";
 
 /** Sample the top-left pixel so padding bars blend with the artwork. */
 async function cornerColor(file) {
@@ -71,6 +73,14 @@ await toStorePng(
   await sharp(SHOT2).composite([{ input: region, left: blur.left, top: blur.top }]).toBuffer(),
   `${OUT}/shot-2-gmail-cws.png`,
   1280, 800, bg2.css,
+);
+
+// ── Shot 3: original-vs-redacted live proof. Same contain-pad treatment. ──
+const bg3 = await cornerColor(SHOT3);
+await toStorePng(
+  SHOT3,
+  `${OUT}/shot-3-redaction-proof-cws.png`,
+  1280, 800, bg3.css,
 );
 
 // ── Marquee: composed at 1400x560 (2.5:1). Headline typo fixed; the actual

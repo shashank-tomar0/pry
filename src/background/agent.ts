@@ -1148,6 +1148,28 @@ ${freshRendered}`,
       const resolvedInput = resolveTokens(call.input);
       const resolvedAction = { name: call.name as never, input: resolvedInput };
 
+      // POST-RESOLVE GUARD: any token syntax that survives resolution means
+      // the vault could not honor it (vault mismatch, corrupted token text).
+      // Typing a literal "<CRED_1>" into a live page would be a real failure
+      // (an email to a literally-invalid address), so the action is refused
+      // with a precise tool error the model can recover from.
+      if (/<[A-Z]+_\d+>/.test(JSON.stringify(resolvedInput))) {
+        emit({
+          kind: "patch",
+          id: stepId,
+          text: "Blocked — a vault token failed to resolve.",
+          pending: false,
+        });
+        results.push({
+          id: call.id,
+          isError: true,
+          content:
+            "A <TYPE_N> token in your arguments could not be resolved to a real value. " +
+            "Do not retry the same call. Call read_page and use a token exactly as it appears in the latest page read.",
+        });
+        continue;
+      }
+
       // GATE: run the safety checks against the RESOLVED action so the value
       // patterns (cards, Aadhaar, PAN, API keys) see the real secret — not the
       // token the model was shown. Element-credential checks read name/role/

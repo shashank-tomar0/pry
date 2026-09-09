@@ -9,8 +9,43 @@ function sleep(ms: number): Promise<void> {
 }
 
 function describe(el: Element): string {
-  const name = (el as HTMLElement).innerText?.trim().slice(0, 60);
-  return `<${el.tagName.toLowerCase()}${name ? ` "${name}"` : ""}>`;
+  // A click detail of just "<button>" is undebuggable and untrustworthy for
+  // the model — icon-only buttons have empty innerText, so fall back to the
+  // accessible name sources before giving up on a name.
+  const name =
+    (el as HTMLElement).innerText?.trim().slice(0, 60) ||
+    el.getAttribute("aria-label")?.trim().slice(0, 60) ||
+    (el as HTMLInputElement).placeholder?.trim().slice(0, 60) ||
+    el.getAttribute("title")?.trim().slice(0, 60) ||
+    el.getAttribute("name")?.trim().slice(0, 60) ||
+    "";
+  return `<${el.tagName.toLowerCase()}${name ? ` "${name}"` : " (unnamed)"}>`;
+}
+
+/**
+ * Counts DOM mutations for `ms` after an action so the result can say whether
+ * the page actually reacted. "Clicked <button>." with ok:true is not evidence
+ * anything happened — a synthetic click on an inert overlay, a hidden handler,
+ * or a stale node all return fine while nothing changes. Telling the model
+ * "no visible page reaction" turns a silent failure into a recoverable one.
+ */
+function observeReaction(ms: number): Promise<number> {
+  return new Promise((resolve) => {
+    let count = 0;
+    const observer = new MutationObserver((mutations) => {
+      count += mutations.length;
+    });
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      characterData: true,
+    });
+    setTimeout(() => {
+      observer.disconnect();
+      resolve(count);
+    }, ms);
+  });
 }
 
 function resolve(input: Record<string, unknown>): Element | string {
@@ -118,8 +153,19 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
     await sleep(400);
   }
 
+  // Ground truth beats intent: the page may reformat, truncate, chip or
+  // prefix what we typed (Gmail's recipient combobox showed a different
+  // value than the one we sent, and the model burned turns reconciling the
+  // two). Report what the field holds NOW so the model never has to guess.
+  const echo =
+    target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
+      ? target.value
+      : (target.textContent ?? "");
+
   return done(
-    `Typed ${JSON.stringify(text)} into ${describe(target)}${submit ? " and pressed Enter" : ""}.`,
+    `Typed ${JSON.stringify(text)} into ${describe(target)}. ` +
+      `Field now shows: ${JSON.stringify(echo.trim().slice(0, 60))}` +
+      (submit ? ", and pressed Enter." : "."),
   );
 }
 
@@ -152,9 +198,13 @@ export async function act(action: AgentAction): Promise<ActionResult> {
         const el = resolve(input);
         if (typeof el === "string") return fail(el);
         await bringIntoView(el);
+        const reaction = observeReaction(500);
         realClick(el);
-        await sleep(500);
-        return done(`Clicked ${describe(el)}.`);
+        const updates = await reaction;
+        const verdict = updates > 0
+          ? ` Page reacted (${updates} DOM updates).`
+          : " NO visible page reaction — the click may have missed or the control is inert. Call read_page to confirm the state before retrying.";
+        return done(`Clicked ${describe(el)}.${verdict}`);
       }
 
       case "type": {

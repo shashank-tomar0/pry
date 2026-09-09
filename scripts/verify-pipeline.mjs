@@ -864,6 +864,16 @@ ok("digit inside a word next to token is not stripped",
   repairTokenConcatenation("ref7<CRED_1>") === "ref7<CRED_1>",
   `got ${repairTokenConcatenation("ref7<CRED_1>")}`);
 
+// Live-failure class from the Gmail run: the model emitted an INVISIBLE
+// character between the digit and the token, which defeated the strict
+// digit-touching-< match and let "7" ride into the typed email.
+ok("zero-width char between glued digit and token is neutralized",
+  repairTokenConcatenation("7\u200b<CRED_1>") === "<CRED_1>",
+  `got ${JSON.stringify(repairTokenConcatenation("7\u200b<CRED_1>"))}`);
+ok("BOM / joiner characters are stripped outright",
+  repairTokenConcatenation("\ufeff<CRED_1>\u200d") === "<CRED_1>",
+  `got ${JSON.stringify(repairTokenConcatenation("\ufeff<CRED_1>\u200d"))}`);
+
 // End-to-end: the exact failure from the live Gmail run — "7<CRED_1>" must
 // resolve to the bare vault value, not "7shashank@gmail.com".
 tokenizer.clear();

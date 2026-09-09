@@ -55,8 +55,8 @@ export function createTripwireAggregator(): TripwireAggregator {
       .map(([kind, count]) => `${kind} ×${count}`);
     const headline =
       totalIntercepts === 1
-        ? "1 outbound PII leak blocked"
-        : `${totalIntercepts} outbound PII leaks blocked`;
+        ? "1 outbound PII leak flagged"
+        : `${totalIntercepts} outbound PII leaks flagged`;
     return kinds.length > 0 ? `${headline} · ${kinds.join(" · ")}` : headline;
   }
 

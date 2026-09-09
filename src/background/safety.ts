@@ -14,7 +14,6 @@
  */
 
 import type { AgentAction, PageElement, PageSnapshot } from "../shared/types";
-import type { DetectedPII } from "./pii-detector";
 
 // ─── Credential Patterns ────────────────────────────────────────────────────
 
@@ -231,29 +230,3 @@ export function detectInjection(snapshot: PageSnapshot): string | undefined {
   return undefined;
 }
 
-// ─── PII Detection for Network Boundary ─────────────────────────────────────
-
-/**
- * Checks whether a screenshot or DOM snapshot contains PII that should
- * be redacted before transmission. Used by the agent loop to decide
- * whether to send raw data or processed data.
- */
-export function hasPIIForTransmission(detections: DetectedPII[]): {
-  needsRedaction: boolean;
-  faceCount: number;
-  credentialCount: number;
-  idNumberCount: number;
-} {
-  const faceCount = detections.filter((d) => d.kind === "face").length;
-  const credentialCount = detections.filter(
-    (d) => d.kind === "credential" || d.kind === "api_key",
-  ).length;
-  const idNumberCount = detections.filter((d) => d.kind === "id_number").length;
-
-  return {
-    needsRedaction: faceCount > 0 || credentialCount > 0 || idNumberCount > 0,
-    faceCount,
-    credentialCount,
-    idNumberCount,
-  };
-}

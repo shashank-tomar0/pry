@@ -41,81 +41,6 @@ export interface DetectedPII {
   label: string;
 }
 
-// ─── Face Detection ─────────────────────────────────────────────────────────
-
-// FaceDetector is available in Chrome but not in the TypeScript types.
-declare class FaceDetector {
-  constructor(options?: { fastMode?: boolean; maxDetectedFaces?: number });
-  detect(image: ImageBitmap | HTMLImageElement): Promise<Array<{
-    boundingBox: { x: number; y: number; width: number; height: number };
-    names: string[];
-  }>>;
-}
-
-let faceDetectorInstance: InstanceType<typeof FaceDetector> | undefined;
-
-/**
- * Browser-native FaceDetector (Chrome 100+, behind flag in some builds).
- * Falls back to no detection if unavailable (graceful degradation).
- */
-async function getFaceDetector(): Promise<InstanceType<typeof FaceDetector> | undefined> {
-  if (faceDetectorInstance) return faceDetectorInstance;
-
-  // Try the built-in API first (cheapest, WebGPU-accelerated on Chrome).
-  if (typeof FaceDetector !== "undefined") {
-    try {
-      faceDetectorInstance = new FaceDetector({ fastMode: true, maxDetectedFaces: 10 });
-      return faceDetectorInstance;
-    } catch {
-      // Not available in this context (e.g., offscreen document limitations).
-    }
-  }
-
-  return undefined;
-}
-
-/**
- * Detect faces in an ImageBitmap or HTMLImageElement.
- * Returns bounding boxes normalized to 0–1 coordinates.
- */
-export async function detectFaces(
-  image: ImageBitmap | HTMLImageElement,
-  imageWidth: number,
-  imageHeight: number,
-): Promise<DetectedPII[]> {
-  const results: DetectedPII[] = [];
-
-  const detector = await getFaceDetector();
-  if (!detector) {
-    // Fallback: use a simple skin-color heuristic (not as accurate but
-    // provides some coverage when native API is unavailable).
-    return results;
-  }
-
-  try {
-    const faces = await detector.detect(image);
-    for (const face of faces) {
-      const box = face.boundingBox;
-      results.push({
-        kind: "face",
-        box: {
-          x: box.x / imageWidth,
-          y: box.y / imageHeight,
-          width: box.width / imageWidth,
-          height: box.height / imageHeight,
-        },
-        confidence: face.names.length > 0 ? 0.95 : 0.7,
-        label: "Face detected",
-      });
-    }
-  } catch {
-    // Face detection failed silently — no faces added, redaction proceeds
-    // with other PII channels.
-  }
-
-  return results;
-}
-
 import { isAadhaarNumber, isCardNumber } from "../shared/checksums";
 
 // ─── DOM-Based PII Detection ───────────────────────────────────────────────
@@ -302,14 +227,6 @@ export function detectTextPIIDetailed(text: string): {
 }
 
 /**
- * Scans free text for PII (validated). Kept for callers that only need the
- * accepted detections; use `detectTextPIIDetailed` to also see lookalikes.
- */
-export function detectTextPII(text: string): DetectedPII[] {
-  return detectTextPIIDetailed(text).detections;
-}
-
-/**
  * Combined PII detection across all channels, with rejected lookalikes.
  * Called before any data leaves the client.
  */
@@ -324,14 +241,13 @@ export function detectAllPIIDetailed(
     }>;
     text: string;
   },
-  faceDetections: DetectedPII[] = [],
 ): {
   detections: DetectedPII[];
   rejected: DetectedPII[];
 } {
   const text = detectTextPIIDetailed(snapshot.text);
   return {
-    detections: [...faceDetections, ...detectDOMPII(snapshot), ...text.detections],
+    detections: [...detectDOMPII(snapshot), ...text.detections],
     rejected: text.rejected,
   };
 }
@@ -351,7 +267,6 @@ export function detectAllPII(
     }>;
     text: string;
   },
-  faceDetections: DetectedPII[] = [],
 ): DetectedPII[] {
-  return detectAllPIIDetailed(snapshot, faceDetections).detections;
+  return detectAllPIIDetailed(snapshot).detections;
 }

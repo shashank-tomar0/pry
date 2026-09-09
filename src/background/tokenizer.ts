@@ -162,66 +162,6 @@ export class PIITokenizer {
   }
 
   /**
-   * Tokenize all detected PII in a snapshot's elements and text.
-   * Returns a new snapshot with tokens in place of sensitive values.
-   */
-  tokenizeSnapshot(snapshot: {
-    elements: Array<{
-      id: number;
-      role: string;
-      name: string;
-      value?: string;
-      attrs?: Record<string, string>;
-    }>;
-    text: string;
-    url: string;
-    title: string;
-  }): {
-    elements: Array<{
-      id: number;
-      role: string;
-      name: string;
-      value?: string;
-      attrs?: Record<string, string>;
-    }>;
-    text: string;
-    url: string;
-    title: string;
-    tokenCount: number;
-  } {
-    let tokenCount = 0;
-
-    const elements = snapshot.elements.map((el) => {
-      const newEl = { ...el };
-
-      // Tokenize element values that are sensitive.
-      if (newEl.value && this.shouldTokenizeValue(newEl)) {
-        newEl.value = this.tokenize(newEl.value, "credential");
-        tokenCount++;
-      }
-
-      return newEl;
-    });
-
-    // Tokenize ID numbers in page text.
-    let text = snapshot.text;
-    const idPatterns: Array<{ pattern: RegExp; kind: DetectedPII["kind"] }> = [
-      { pattern: /\b\d{4}\s?\d{4}\s?\d{4}\b/g, kind: "id_number" },
-      { pattern: /\b[A-Z]{5}\d{4}[A-Z]\b/g, kind: "id_number" },
-      { pattern: /\b\d{3}-\d{2}-\d{4}\b/g, kind: "id_number" },
-    ];
-
-    for (const { pattern, kind } of idPatterns) {
-      text = text.replace(pattern, (match) => {
-        tokenCount++;
-        return this.tokenize(match, kind);
-      });
-    }
-
-    return { ...snapshot, elements, text, tokenCount };
-  }
-
-  /**
    * Tokenize values that the detectors actually flagged.
    *
    * Detection and tokenization were previously disconnected: the detectors
@@ -350,20 +290,6 @@ export class PIITokenizer {
     }
 
     return { task: result, tokenCount };
-  }
-
-  /**
-   * Determine if an element's value should be tokenized based on its
-   * role and attributes.
-   */
-  private shouldTokenizeValue(el: { role: string; attrs?: Record<string, string> }): boolean {
-    if (el.role === "password") return true;
-    if (el.attrs?.inputType === "password") return true;
-    if (el.attrs?.inputType === "hidden") return false;
-
-    // Check credential patterns on the element's metadata.
-    const haystack = `${el.role} ${Object.values(el.attrs ?? {}).join(" ")}`;
-    return /\b(password|secret|key|token|cvv|otp)\b/i.test(haystack);
   }
 
   /**

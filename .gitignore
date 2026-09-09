@@ -9,3 +9,10 @@ scripts/.verify-out.mjs
 scripts/.tripwire-iife.js
 eng.traineddata
 .ocr-cache/
+
+# Local working files (never publish)
+%TEMP%*
+.freebuff/
+pry-live.html
+pry-io.html
+verify-landing.html

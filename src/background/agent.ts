@@ -112,9 +112,11 @@ interface SanitizeCtx {
   llmOnly: boolean;
   /** Total applicable rules loaded for logging/experience. */
   ruleCount: number;
+  /** When false, DOM PII is redacted directly instead of tokenized (user toggle). */
+  tokenize: boolean;
 }
 
-const EMPTY_SANITIZE_CTX: SanitizeCtx = { fpKeys: new Set(), llmOnly: false, ruleCount: 0 };
+const EMPTY_SANITIZE_CTX: SanitizeCtx = { fpKeys: new Set(), llmOnly: false, ruleCount: 0, tokenize: true };
 
 /** Readable audit label per PII kind (visual detections already carry theirs). */
 const AUDIT_KIND_LABELS: Record<string, string> = {
@@ -185,18 +187,26 @@ function sanitizeSnapshot(
 
   // 3. Tokenize the values the detectors actually flagged (names, emails,
   //    phones, ID numbers) so they become vault tokens the LLM can reference
-  //    instead of raw values.
-  const tokenized = tokenizer.tokenizeDetections(snapshot, allDetections);
+  //    instead of raw values. When the user disabled tokenization, skip the
+  //    vault and go straight to [REDACTED] (still redacted, never leaked).
+  let tokenized;
+  let swept;
+  if (ctx.tokenize !== false) {
+    tokenized = tokenizer.tokenizeDetections(snapshot, allDetections);
 
-  // 3b. Vault sweep: replace ANY remaining vault value in element values,
-  //     names, or page text with its token — even on elements no detector
-  //     flagged. Without this, a value the agent just typed into a field
-  //     (e.g. an email in Gmail's compose To box, which sits outside the
-  //     container pageText() reads) would ride raw into the next planner turn.
-  const swept = tokenizer.redactVaultValuesInSnapshot({
-    elements: tokenized.elements,
-    text: tokenized.text,
-  });
+    // 3b. Vault sweep: replace ANY remaining vault value in element values,
+    //     names, or page text with its token — even on elements no detector
+    //     flagged. Without this, a value the agent just typed into a field
+    //     (e.g. an email in Gmail's compose To box, which sits outside the
+    //     container pageText() reads) would ride raw into the next planner turn.
+    swept = tokenizer.redactVaultValuesInSnapshot({
+      elements: tokenized.elements,
+      text: tokenized.text,
+    });
+  } else {
+    tokenized = { elements: snapshot.elements, text: snapshot.text, tokenCount: 0 };
+    swept = tokenized;
+  }
 
   // 4. Redact whatever could not be tokenized (replace with [REDACTED]).
   const { elements, text, redactedCount } = redactSnapshot(
@@ -237,7 +247,7 @@ export interface AgentDeps {
   askConfirm: (id: string, summary: string) => Promise<boolean>;
   signal: AbortSignal;
   /** Capture and process a screenshot through the privacy pipeline. */
-  captureScreenshot?: () => Promise<{
+  captureScreenshot?: (tabId: number) => Promise<{
     original: string;
     processed: import("../shared/types").ProcessedScreenshotResult;
   } | null>;
@@ -415,6 +425,7 @@ export async function runTask(
     fpKeys: buildSuppressionKeys(applicableRules),
     llmOnly: recommendsLLMOnly(applicableRules),
     ruleCount: applicableRules.length,
+    tokenize: settings.privacy.tokenizePII !== false,
   };
   if (applicableRules.length > 0) {
     const fpRules = applicableRules.filter((r) => r.category === "pii_detection").length;
@@ -507,7 +518,7 @@ export async function runTask(
   // Capture initial screenshot through privacy pipeline (if available).
   if (captureScreenshot) {
     try {
-      const screenshotResult = await captureScreenshot();
+      const screenshotResult = await captureScreenshot(controller.tabId);
       if (screenshotResult) {
         const processed = screenshotResult.processed;
         const visualDetections = processed.detections.map((d) => ({
@@ -772,10 +783,18 @@ export async function runTask(
     // only when a learned strategy rule has not flagged deterministic as a
     // failure mode for this page type.
     if (step === 0 && !sanitizeCtx.llmOnly) {
+      // The user line in the transcript is already tokenized (start()
+      // tokenized before runTask), and the deterministic planner only needs
+      // the task text — so this is the same string, never a raw secret.
       const detResult = tryDeterministic(task, snapshot ?? null);
       if (detResult.resolved && detResult.action) {
         // Only use deterministic for non-navigate actions on step 0.
         // Navigate on step 0 is fine — the user explicitly said "go to X".
+        // The deterministic action is raw task text — resolve any vault tokens
+        // through the same last-moment path the LLM actions use, so a typed
+        // value like an email is real by execution time, not "<CRED_1>".
+        const detInput = resolveTokens(detResult.action.input);
+        const detAction = { ...detResult.action, input: detInput };
         const detId = nextId();
         emit({
           kind: "entry",
@@ -788,11 +807,14 @@ export async function runTask(
           },
         });
 
-        const detDecision = gate(detResult.action, snapshot, settings.confirmRisky);
+        // Gate the RESOLVED action (same rule as the LLM path): the value
+        // patterns must see the real secret, not a token. A missing `reason`
+        // (deterministic only adds one for click/type) must not crash the run.
+        const detDecision = gate(detAction, snapshot, settings.confirmRisky);
         if (detDecision.verdict === "allow") {
           recordAction(detResult.action.name, detResult.action.input);
           const detStart = performance.now();
-          const detOutcome = await execute(controller, detResult.action);
+          const detOutcome = await execute(controller, detAction);
           const detLatency = performance.now() - detStart;
           controller = detOutcome.controller;
 
@@ -831,7 +853,14 @@ export async function runTask(
 
           continue;
         }
-        // If verdict is confirm/refuse, fall through to LLM.
+        // If verdict is confirm/refuse, hand the turn to the LLM — the LLM-path
+        // gate (same resolved-input rule) will re-decide with a proper
+        // approval prompt. Without this patch the step card would spin forever.
+        emit({
+          kind: "patch", id: detId,
+          text: "Needs approval — escalating to the planner.",
+          pending: false,
+        });
       }
     }
 
@@ -1009,7 +1038,6 @@ export async function runTask(
     for (const call of turn.toolCalls) {
       if (signal.aborted) return;
 
-      const action = { name: call.name as never, input: call.input };
       const stepId = nextId();
 
       emit({
@@ -1023,27 +1051,12 @@ export async function runTask(
         },
       });
 
-      const decision = gate(action, snapshot, settings.confirmRisky);
-
-      if (decision.verdict === "refuse") {
-        emit({ kind: "patch", id: stepId, text: `Blocked — ${decision.reason}`, pending: false });
-        results.push({ id: call.id, content: decision.reason, isError: true });
-        continue;
-      }
-
-      if (decision.verdict === "confirm") {
-        const approved = await askConfirm(stepId, decision.summary);
-        if (!approved) {
-          emit({ kind: "patch", id: stepId, text: "Declined by user.", pending: false });
-          results.push({
-            id: call.id,
-            isError: true,
-            content:
-              "The user declined this action. Do not retry it. Ask them what they want instead, or continue with the rest of the task.",
-          });
-          continue;
-        }
-      }
+      // Gate runs AFTER token resolution (below) so the value-level secret
+      // checks see the real resolved value, not the <CRED_1> token the model
+      // was shown. Gating the tokenized input would let a secret ride through
+      // the value patterns and be typed into the page. Element-credential
+      // detection still works on the tokenized snapshot (name/role/attrs never
+      // carry the value), so moving resolution first loses nothing.
 
       // VALIDATE: reject element IDs the client never sent.
       // When stale, auto-receive and inject fresh snapshot to save an LLM round trip.
@@ -1135,6 +1148,32 @@ ${freshRendered}`,
       const resolvedInput = resolveTokens(call.input);
       const resolvedAction = { name: call.name as never, input: resolvedInput };
 
+      // GATE: run the safety checks against the RESOLVED action so the value
+      // patterns (cards, Aadhaar, PAN, API keys) see the real secret — not the
+      // token the model was shown. Element-credential checks read name/role/
+      // attrs from the tokenized snapshot and are unaffected.
+      const decision = gate(resolvedAction, snapshot, settings.confirmRisky);
+
+      if (decision.verdict === "refuse") {
+        emit({ kind: "patch", id: stepId, text: `Blocked — ${decision.reason}`, pending: false });
+        results.push({ id: call.id, content: decision.reason, isError: true });
+        continue;
+      }
+
+      if (decision.verdict === "confirm") {
+        const approved = await askConfirm(stepId, decision.summary);
+        if (!approved) {
+          emit({ kind: "patch", id: stepId, text: "Declined by user.", pending: false });
+          results.push({
+            id: call.id,
+            isError: true,
+            content:
+              "The user declined this action. Do not retry it. Ask them what they want instead, or continue with the rest of the task.",
+          });
+          continue;
+        }
+      }
+
       recordAction(call.name, call.input);
       const actionStart = performance.now();
       const outcome = await execute(controller, resolvedAction);
@@ -1221,7 +1260,7 @@ ${freshRendered}`,
           // Capture screenshot after page change (if available).
           if (captureScreenshot) {
             try {
-              const screenshotResult = await captureScreenshot();
+              const screenshotResult = await captureScreenshot(controller.tabId);
               if (screenshotResult) {
                 const processed = screenshotResult.processed;
                 const visualDetections = processed.detections.map((d) => ({

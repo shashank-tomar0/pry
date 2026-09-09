@@ -1317,4 +1317,100 @@ ok("stale but high-confidence rule survives with decay",
   surviving.some((r) => r.id === "r3" && r.confidence > 0.7 && r.confidence < 0.95),
   JSON.stringify(surviving.map((r) => [r.id, r.confidence])));
 
+// ─── Scenario X: safety gate sees RESOLVED values, not tokens ───────────────
+console.log("\n=== Scenario X: safety gate operates on resolved values ===\n");
+
+const { gate } = await import("../src/background/safety.ts");
+
+// The model is shown a tokenized snapshot, so a sensitive VALUE is "<CRED_1>".
+// If a card/Aadhaar gets typed into an INNOCENT field (an injected prompt or a
+// confused model), the value check is the only thing that stops it. Gating the
+// tokenized input sees "<CRED_1>" → misses it; gating the RESOLVED input sees
+// the real card → refuses.
+const gateSnap = {
+  url: "https://example.com/checkout",
+  title: "Checkout",
+  text: "",
+  truncated: false,
+  scroll: { y: 0, maxY: 0 },
+  elements: [
+    { id: 0, role: "textbox", name: "Card number", value: "<CRED_1>", attrs: { inputType: "text" } },
+    { id: 1, role: "textbox", name: "Order notes", value: "", attrs: { inputType: "text" } },
+  ],
+};
+
+// The hole: a tokenized card value into an innocent field is NOT caught —
+// the value gate can't see the real card behind <CRED_1>.
+const tokenizedAction = { name: "type", input: { element_id: 1, text: "<CRED_1>", reason: "notes" } };
+ok("tokenized card in an innocent field is NOT caught by the value gate (the hole)",
+  gate(tokenizedAction, gateSnap, true).verdict !== "refuse");
+
+// Gate on the RESOLVED input: the real card number must be REFUSED even
+// though the field is innocent — this is what the agent-loop fix now does.
+const resolvedActionInnocent = { name: "type", input: { element_id: 1, text: "4111 1111 1111 1111", reason: "notes" } };
+ok("resolved card in an innocent field is REFUSED (value check sees the secret)",
+  gate(resolvedActionInnocent, gateSnap, true).verdict === "refuse");
+
+// Sanity: a benign value into a benign field is still allowed.
+ok("benign value into an innocent field is allowed",
+  gate({ name: "type", input: { element_id: 1, text: "leave at door", reason: "notes" } }, gateSnap, true).verdict === "allow");
+
+// A password FIELD is refused as a field regardless of the typed value.
+const passwordSnap = {
+  ...gateSnap,
+  elements: [
+    { id: 2, role: "password", name: "Password", value: "••••••", attrs: { inputType: "password" } },
+    { id: 1, role: "textbox", name: "Order notes", value: "", attrs: { inputType: "text" } },
+  ],
+};
+ok("a password FIELD is refused even when the typed value is a harmless token",
+  gate({ name: "type", input: { element_id: 2, text: "<PII_3>", reason: "fill" } }, passwordSnap, true).verdict === "refuse");
+
+// ─── Scenario L: store-readiness fixes (B5 digit re-tokenization, B6 Unicode, B7 schemes) ──
+console.log("\n=== Scenario L: reformatted-digit redaction, Unicode PII, URL schemes ===\n");
+
+// B5: the page reformats a typed Aadhaar with dashes instead of spaces.
+// The exact-string sweep misses "9999 0123 4567"; the digit-run fallback must
+// still pull it back to its token before the detail reaches the model.
+tokenizer.clear();
+const aadhaarTok = tokenizer.tokenize("999901234567", "id_number");
+const reformatted = `Typed into field: 9999-0123-4567 (formatted)`;
+const afterB5 = tokenizer.redactValues(reformatted);
+ok("B5: page-reformatted digits are still re-tokenized",
+  !afterB5.includes("9999") && afterB5.includes(aadhaarTok), afterB5);
+ok("B5: exact-format values still match (no regression)",
+  tokenizer.redactValues("see 999901234567 here").includes(aadhaarTok));
+
+// B6: a Devanagari name in the user's task gets tokenized, not shipped raw.
+tokenizer.clear();
+const devResult = tokenizer.tokenizeTask("send invoice to राम शर्मा");
+ok("B6: Devanagari names are tokenized out of the task",
+  !devResult.task.includes("राम") && devResult.tokenCount >= 1,
+  JSON.stringify(devResult));
+const devSnap = {
+  url: "https://example.com", title: "t", truncated: false, scroll: { y: 0, maxY: 0 },
+  elements: [{ id: 0, role: "textbox", name: "Full name", value: "राम शर्मा", attrs: { inputType: "text" } }],
+  // A DIFFERENT Devanagari name in page text — the field value above is
+  // already detected, so the free-text scan would (correctly) dedup it.
+  text: "To: अमित वर्मा — please confirm delivery address.",
+};
+const devCtx = detectContextualPII(devSnap);
+ok("B6: contextual detector flags Devanagari person names (field value)",
+  devCtx.some((d) => d.kind === "person" && d.value.includes("राम")),
+  JSON.stringify(devCtx.map((d) => [d.kind, d.value])));
+ok("B6: Devanagari name caught in page text near structured keyword",
+  devCtx.some((d) => d.label === "Name in page text" && d.value.includes("अमित")),
+  JSON.stringify(devCtx.map((d) => [d.label, d.value])));
+
+// B7: navigate/open_tab refuse non-web schemes.
+const { isNavigableUrl } = await import("../src/background/executor.ts");
+ok("B7: http and https navigate", isNavigableUrl("https://gmail.com") && isNavigableUrl("http://localhost:11434"));
+ok("B7: file:// refused", !isNavigableUrl("file:///C:/Windows/system32/config"));
+ok("B7: chrome:// and browser-internal refused",
+  !isNavigableUrl("chrome://history") && !isNavigableUrl("edge://settings") && !isNavigableUrl("about:blank"));
+ok("B7: javascript: and data: URIs refused",
+  !isNavigableUrl("javascript:alert(1)") && !isNavigableUrl("data:text/html,<script>alert(1)</script>"));
+ok("B7: scheme-less input still allowed (normalized to https by normaliseUrl)",
+  isNavigableUrl("example.com"));
+
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

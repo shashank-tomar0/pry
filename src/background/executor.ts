@@ -104,6 +104,29 @@ export function isRestricted(url: string | undefined): boolean {
   );
 }
 
+/** Only these schemes may drive a navigate/open_tab — browser-internal and
+ * non-web schemes (file:, chrome:, about:, data:, javascript:, edge:, etc.)
+ * are refused so the model or a prompt-injected page cannot steer the agent
+ * onto internal pages or privileged URI handlers. */
+const ALLOWED_NAV_SCHEMES = new Set(["http:", "https:"]);
+
+/**
+ * Returns `true` when a navigable URL uses only allowed schemes, or `false`
+ * (refusing the navigation) for anything browser-internal or non-web.
+ * Exported for the verification harness; the agent loop calls execute(),
+ * which enforces this before any chrome.tabs call.
+ */
+export function isNavigableUrl(raw: string): boolean {
+  try {
+    const colon = raw.indexOf(":");
+    if (colon === -1) return true; // no scheme — normalised later
+    const scheme = raw.slice(0, colon + 1).toLowerCase();
+    return ALLOWED_NAV_SCHEMES.has(scheme);
+  } catch {
+    return false;
+  }
+}
+
 function normaliseUrl(raw: string): string {
   if (/^https?:\/\//i.test(raw)) {
     // A host with no dot (https://gmail) is never a real site: correct known
@@ -179,7 +202,19 @@ export async function execute(
 
   switch (name) {
     case "navigate": {
-      const url = normaliseUrl(String(input.url ?? ""));
+      const rawUrl = String(input.url ?? "");
+      if (!isNavigableUrl(rawUrl)) {
+        return {
+          result: {
+            ok: false,
+            detail:
+              `Refusing to navigate to "${rawUrl.slice(0, 60)}" — only http/https destinations are allowed. ` +
+              `I can't open browser-internal pages, local files, or custom URL handlers.`,
+          },
+          controller,
+        };
+      }
+      const url = normaliseUrl(rawUrl);
       await chrome.tabs.update(controller.tabId, { url });
       await controller.waitForLoad();
       const tab = await chrome.tabs.get(controller.tabId).catch(() => null);
@@ -216,7 +251,18 @@ export async function execute(
     }
 
     case "open_tab": {
-      const url = normaliseUrl(String(input.url ?? ""));
+      const rawUrl = String(input.url ?? "");
+      if (!isNavigableUrl(rawUrl)) {
+        return {
+          result: {
+            ok: false,
+            detail:
+              `Refusing to open "${rawUrl.slice(0, 60)}" — only http/https destinations are allowed.`,
+          },
+          controller,
+        };
+      }
+      const url = normaliseUrl(rawUrl);
       const tab = await chrome.tabs.create({ url, active: true });
       const next = new TabController(tab.id!);
       await next.waitForLoad();

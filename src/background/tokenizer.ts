@@ -41,6 +41,17 @@ export class PIITokenizer {
   private vault: TokenVault = new Map();
   private counters: Record<string, number> = {};
 
+  /** True when a vault value is a letter-run we must word-bound — Latin, or any
+   * script (Devanagari etc.). Letter-run values get word-boundary guards so a
+   * short value never clobbers a longer word in either script. */
+  private isLetterRun(value: string): boolean {
+    return /^[\p{L}\p{M} ]+$/u.test(value);
+  }
+
+  private wordBoundPattern(escaped: string): RegExp {
+    return new RegExp(`(^|[^\p{L}\p{M}])${escaped}(?=$|[^\p{L}\p{M}])`, "gu");
+  }
+
   /**
    * Generate a unique token for a value.
    * If the value was already tokenized, return the existing token.
@@ -286,12 +297,13 @@ export class PIITokenizer {
 
       // 2) Text path: replace remaining occurrences (guarded by length so we
       //    never mangle tiny substrings like "No" inside ordinary sentences,
-      //    and word-bounded so "Singh" never corrupts "Singhania").
+      //    and word-bounded so "Singh" never corrupts "Singhania" — in any
+      //    script, so "राम" doesn't corrupt a longer Devanagari word).
       if (val.length >= 4 && text.includes(val)) {
         const escaped = val.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const isAlpha = /^[A-Za-z ]+$/.test(val);
+        const isAlpha = this.isLetterRun(val);
         const bounded = isAlpha
-          ? new RegExp(`(^|[^A-Za-z])${escaped}(?=$|[^A-Za-z])`, "g")
+          ? this.wordBoundPattern(escaped)
           : new RegExp(escaped, "g");
         const next = text.replace(bounded, (match, lead) => `${lead ?? ""}${token}`);
         if (next !== text) {
@@ -320,9 +332,13 @@ export class PIITokenizer {
     // 2. Tokenize names that appear after common contextual patterns
     // "from Sharma Traders" → "from <PII_3>"
     // "to John Doe" → "to <PII_1>"
+    // `[\p{L}][\p{L}\p{M}]+` matches name-like letter runs in ANY script, so
+    // Devanagari/other Indian-script names are tokenized instead of riding raw.
+    // The end guard is a negative lookahead, not \b: \b is ASCII-\w-based, so
+    // it never fires after a non-Latin letter run.
     const namePatterns = [
-      { pattern: /\b(from|to|sender|recipient|addressed to|sent by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/g, kind: "pii_text" as const },
-      { pattern: /\b(name|company|business|firm|organization|vendor|supplier|client)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/g, kind: "pii_text" as const },
+      { pattern: /\b(from|to|sender|recipient|addressed to|sent by)\s+([\p{L}][\p{L}\p{M}]+(?:\s+[\p{L}][\p{L}\p{M}]+)+)(?![\p{L}\p{M}])/gu, kind: "pii_text" as const },
+      { pattern: /\b(name|company|business|firm|organization|vendor|supplier|client)[:\s]+([\p{L}][\p{L}\p{M}]+(?:\s+[\p{L}][\p{L}\p{M}]+)+)(?![\p{L}\p{M}])/gu, kind: "pii_text" as const },
     ];
 
     for (const { pattern, kind } of namePatterns) {
@@ -367,13 +383,38 @@ export class PIITokenizer {
       .sort((a, b) => b.original.length - a.original.length);
     for (const entry of entries) {
       const val = entry.original;
-      if (!out.includes(val)) continue;
-      const escaped = val.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const isAlpha = /^[A-Za-z ]+$/.test(val);
-      const pattern = isAlpha
-        ? new RegExp(`(^|[^A-Za-z])${escaped}(?=$|[^A-Za-z])`, "g")
-        : new RegExp(escaped, "g");
-      out = out.replace(pattern, (match, lead) => `${lead ?? ""}${entry.token}`);
+      if (out.includes(val)) {
+        const escaped = val.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const isAlpha = this.isLetterRun(val);
+        const pattern = isAlpha
+          ? this.wordBoundPattern(escaped)
+          : new RegExp(escaped, "g");
+        out = out.replace(pattern, (match, lead) => `${lead ?? ""}${entry.token}`);
+        continue;
+      }
+
+      // The page often reformats a typed value (Aadhaar "4111 1111 1111" →
+      // "4111-1111-1111", a card with spaces, a phone re-grouped). The exact
+      // string no longer matches, so the raw secret would ride back into the
+      // model context + stored transcript. For digit-bearing values, fall back
+      // to a digit-run match that tolerates the separators the page added: we
+      // any non-digit between each digit and replace the whole run. Only
+      // matches when the digit sequence is 6+ long (short values risk
+      // clobbering unrelated numbers), and the run stays exact in its digits
+      // so it can't swallow a longer neighbouring number.
+      const digits = val.replace(/\D/g, "");
+      if (digits.length >= 6) {
+        const optionalSep = `[\\s\\-._/]?`;
+        const digitPattern = new RegExp(
+          `(?<![0-9])${digits.split("").map((c) => c + optionalSep).join("")}(?![0-9])`,
+          "g",
+        );
+        const before = out;
+        out = out.replace(digitPattern, entry.token);
+        if (out !== before) continue;
+        // If the bounded digit match still fails (page encoded it differently),
+        // leave the raw value rather than risk over-clobbering other numbers.
+      }
     }
     return out;
   }
@@ -411,9 +452,9 @@ export class PIITokenizer {
         const val = entry.original;
         if (!out.includes(val)) continue;
         const escaped = val.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const isAlpha = /^[A-Za-z ]+$/.test(val);
+        const isAlpha = this.isLetterRun(val);
         const pattern = isAlpha
-          ? new RegExp(`(^|[^A-Za-z])${escaped}(?=$|[^A-Za-z])`, "g")
+          ? this.wordBoundPattern(escaped)
           : new RegExp(escaped, "g");
         out = out.replace(pattern, (match, lead) => `${lead ?? ""}${entry.token}`);
       }

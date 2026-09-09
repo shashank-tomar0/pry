@@ -286,6 +286,14 @@ export function snapshot(): PageSnapshot {
       const aEntry = isTextEntry(a) ? 0 : 1;
       const bEntry = isTextEntry(b) ? 0 : 1;
       if (aEntry !== bEntry) return aEntry - bEntry;
+      // Open autocomplete/listbox suggestion items go LAST: a search field
+      // left focused keeps its suggestion panel over the results, and those
+      // options used to crowd the actual result links out of the element
+      // budget (the "clicked the channel card, not the first video" failure).
+      // They stay reachable — just only when the budget allows.
+      const aSuggestion = a.closest('[role="listbox"]') ? 1 : 0;
+      const bSuggestion = b.closest('[role="listbox"]') ? 1 : 0;
+      if (aSuggestion !== bSuggestion) return aSuggestion - bSuggestion;
       return ra.top - rb.top || ra.left - rb.left;
     });
 

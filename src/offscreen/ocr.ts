@@ -70,6 +70,15 @@ export async function ocrDataUrl(
     const text = result?.data?.text ?? "";
     return text.trim().length > 0 ? text : null;
   } catch {
+    // A timed-out recognize leaves the single worker busy forever — every
+    // later screenshot would queue behind the wedged job and time out in
+    // turn. Terminate and rebuild so the next call starts clean.
+    try {
+      await worker.terminate();
+    } catch {
+      // Already dead — nothing to terminate.
+    }
+    workerPromise = null;
     return null;
   }
 }

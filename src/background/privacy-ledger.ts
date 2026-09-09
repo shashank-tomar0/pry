@@ -183,14 +183,6 @@ export async function recordRedaction(redactedCount: number, method: string): Pr
 }
 
 /**
- * Record a token resolution (token → real value at action time).
- */
-export async function recordResolution(token: string, kind: string): Promise<LedgerEntry> {
-  // Never store the resolved value - only that a resolution happened.
-  return addEntry("resolve", { token, kind });
-}
-
-/**
  * Record an action execution.
  */
 export async function recordAction(tool: string, success: boolean, elementId?: number): Promise<LedgerEntry> {
@@ -284,8 +276,12 @@ export async function getLedgerSummary(): Promise<{
   let totalActions = 0;
 
   // Quick chain check (just links, no hash re-verification for speed).
+  // Seed from the first kept entry when older entries were trimmed by the
+  // MAX_ENTRIES cap — a truncated chain's first link points at a dropped
+  // entry, and seeding "0…0" would report TAMPERED forever after entry 501.
   let chainValid = true;
-  let prevHash = "0".repeat(64);
+  let prevHash =
+    entries.length > 0 && entries[0].seq > 1 ? entries[0].prevHash : "0".repeat(64);
   for (const entry of entries) {
     if (entry.prevHash !== prevHash) {
       chainValid = false;

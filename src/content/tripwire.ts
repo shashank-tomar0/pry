@@ -13,6 +13,7 @@ import {
   generatePanSurrogate,
   generateEmailSurrogate,
 } from "../background/surrogates";
+import { isAadhaarNumber, luhnValid } from "../shared/checksums";
 
 (function initPryTripwire() {
   if ((window as any).__PRY_TRIPWIRE_INSTALLED__) return;
@@ -38,60 +39,9 @@ import {
   const SURROGATE_EMAIL: string = SURROGATES.email();
 
   // ─── Mathematical Validation Helpers ─────────────────────────────────────────
-
-  function luhnCheck(digits: string): boolean {
-    const clean = digits.replace(/\D/g, "");
-    if (clean.length < 13 || clean.length > 19) return false;
-    let sum = 0;
-    let alternate = false;
-    for (let i = clean.length - 1; i >= 0; i--) {
-      let n = parseInt(clean[i], 10);
-      if (alternate) {
-        n *= 2;
-        if (n > 9) n -= 9;
-      }
-      sum += n;
-      alternate = !alternate;
-    }
-    return sum % 10 === 0;
-  }
-
-  // Verhoeff multiplication and permutation tables
-  const dTable = [
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-    [1, 2, 3, 4, 0, 6, 7, 8, 9, 5],
-    [2, 3, 4, 0, 1, 7, 8, 9, 5, 6],
-    [3, 4, 0, 1, 2, 8, 9, 5, 6, 7],
-    [4, 0, 1, 2, 3, 9, 5, 6, 7, 8],
-    [5, 9, 8, 7, 6, 0, 4, 3, 2, 1],
-    [6, 5, 9, 8, 7, 1, 0, 4, 3, 2],
-    [7, 6, 5, 9, 8, 2, 1, 0, 4, 3],
-    [8, 7, 6, 5, 9, 3, 2, 1, 0, 4],
-    [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
-  ];
-
-  const pTable = [
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-    [1, 5, 7, 6, 2, 8, 3, 0, 9, 4],
-    [5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
-    [8, 9, 1, 6, 0, 4, 3, 5, 2, 7],
-    [9, 4, 5, 3, 1, 2, 6, 8, 7, 0],
-    [4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
-    [2, 7, 9, 3, 8, 0, 6, 4, 1, 5],
-    [7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
-  ];
-
-  function verhoeffCheck(numStr: string): boolean {
-    const clean = numStr.replace(/\D/g, "");
-    if (clean.length !== 12) return false;
-    let c = 0;
-    const reversed = clean.split("").reverse();
-    for (let i = 0; i < reversed.length; i++) {
-      const digit = parseInt(reversed[i], 10);
-      c = dTable[c][pTable[i % 8][digit]];
-    }
-    return c === 0;
-  }
+  // Luhn and Verhoeff come from shared/checksums (bundled in) — one source of
+  // truth with the detector pipeline. isAadhaarNumber also rejects numbers
+  // UIDAI never issues (leading 0/1), which is strictly more correct here.
 
   const EMAIL_REGEX = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/;
 
@@ -139,7 +89,7 @@ import {
       for (const m of cardMatches) {
         const clean = m.replace(/\D/g, "");
         if (clean === SURROGATE_CARD_DIGITS) continue; // PRY's own demo value
-        if (cardShapePasses(clean) && luhnCheck(clean)) {
+        if (cardShapePasses(clean) && luhnValid(clean)) {
           return { found: true, kind: "credit_card", sample: "•••• •••• •••• " + clean.slice(-4) };
         }
       }
@@ -149,7 +99,7 @@ import {
     const aadhaarMatches = text.match(AADHAAR_REGEX);
     if (aadhaarMatches) {
       for (const m of aadhaarMatches) {
-        if (verhoeffCheck(m)) {
+        if (isAadhaarNumber(m)) {
           const clean = m.replace(/\D/g, "");
           if (clean === SURROGATE_AADHAAR_DIGITS) continue; // PRY's own demo value
           return { found: true, kind: "aadhaar", sample: "•••• •••• " + clean.slice(-4) };

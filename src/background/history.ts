@@ -52,14 +52,6 @@ export async function getSessions(): Promise<Session[]> {
 }
 
 /**
- * Get a single session by ID.
- */
-export async function getSession(id: string): Promise<Session | null> {
-  const sessions = await getSessions();
-  return sessions.find((s) => s.id === id) ?? null;
-}
-
-/**
  * Delete a session by ID.
  */
 export async function deleteSession(id: string): Promise<void> {
@@ -76,15 +68,3 @@ export async function clearHistory(): Promise<void> {
   await chrome.storage.local.remove(STORAGE_KEY);
 }
 
-/**
- * Search sessions by task description.
- */
-export async function searchSessions(query: string): Promise<Session[]> {
-  const sessions = await getSessions();
-  const lower = query.toLowerCase();
-  return sessions.filter(
-    (s) =>
-      s.task.toLowerCase().includes(lower) ||
-      s.summary.toLowerCase().includes(lower),
-  );
-}

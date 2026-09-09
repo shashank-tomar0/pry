@@ -99,17 +99,17 @@ const svg = Buffer.from(`
 <svg width="1400" height="560" xmlns="http://www.w3.org/2000/svg">
   <rect width="1400" height="560" fill="#0d0a16"/>
   <rect x="0" y="0" width="1400" height="6" fill="${RED}"/>
-  <rect x="70" y="140" width="46" height="10" fill="${RED}"/>
-  <text x="70" y="212" font-family="Arial Black, Arial, sans-serif" font-weight="900"
-        font-size="46" fill="${RED}" letter-spacing="1">AUTOMATE ANY TASK</text>
-  <text x="70" y="270" font-family="Arial Black, Arial, sans-serif" font-weight="900"
-        font-size="46" fill="#ffffff" letter-spacing="1">IN YOUR BROWSER</text>
-  <text x="70" y="336" font-family="Consolas, monospace" font-weight="700"
-        font-size="24" fill="${RED}" letter-spacing="8">PRY AGENT</text>
-  <text x="70" y="396" font-family="Arial, sans-serif"
-        font-size="22" fill="#9aa0b0">PII detection, tokenization and redaction.</text>
-  <text x="70" y="426" font-family="Arial, sans-serif"
-        font-size="22" fill="#9aa0b0">All on your device. Verified with OCR.</text>
+  <rect x="70" y="132" width="46" height="8" fill="${RED}"/>
+  <text x="70" y="204" font-family="Consolas, 'Courier New', monospace" font-weight="700"
+        font-size="58" fill="${RED}" letter-spacing="2">AUTOMATE ANY TASK</text>
+  <text x="70" y="278" font-family="Consolas, 'Courier New', monospace" font-weight="700"
+        font-size="58" fill="#ffffff" letter-spacing="2">IN YOUR BROWSER<tspan fill="${RED}">_</tspan></text>
+  <text x="70" y="346" font-family="Ink Free, 'Segoe Print', cursive"
+        font-size="38" fill="${RED}">PRY Agent</text>
+  <text x="70" y="408" font-family="Consolas, 'Courier New', monospace"
+        font-size="21" fill="#9aa0b0">&gt; PII detection, tokenization and redaction.</text>
+  <text x="70" y="438" font-family="Consolas, 'Courier New', monospace"
+        font-size="21" fill="#9aa0b0">&gt; All on your device. Verified with OCR.</text>
   <rect x="738" y="47" width="664" height="468" fill="none" stroke="${RED}" stroke-width="3"/>
 </svg>`);
 

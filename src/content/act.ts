@@ -150,6 +150,11 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
     // Plain forms ignore a synthetic Enter, so submit them directly instead.
     const form = (target as HTMLInputElement).form;
     if (!handled && form) form.requestSubmit?.();
+    // Blur after submitting: sites keep autocomplete/search-suggestion
+    // dropdowns open while the input holds focus (YouTube's suggestion panel
+    // stayed open over the results and its option items then flooded the next
+    // page read, crowding out the real results). Losing focus closes them.
+    (target as HTMLElement).blur?.();
     await sleep(400);
   }
 

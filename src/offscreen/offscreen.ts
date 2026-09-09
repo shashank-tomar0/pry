@@ -297,6 +297,11 @@ async function processScreenshot(
   height: number,
   sensitiveRegions: SensitiveRegion[] = [],
   dpr: number = 1,
+  privacy?: {
+    blurFaces: boolean;
+    maskCredentials: boolean;
+    showRedactionLabels: boolean;
+  },
 ): Promise<{
   redactedDataUrl: string;
   detections: Array<{
@@ -348,6 +353,10 @@ async function processScreenshot(
   // Scale factor: DOM coordinates are CSS pixels, screenshot is device pixels.
   const scale = dpr;
 
+  const maskCredentials = privacy?.maskCredentials !== false;
+  const blurFaces = privacy?.blurFaces !== false;
+  const showLabels = privacy?.showRedactionLabels === true;
+
   // 1. DOM-guided redaction — redact known sensitive regions.
   for (const region of sensitiveRegions) {
     // Scale CSS coordinates to device pixels + expand by 4px padding.
@@ -359,10 +368,14 @@ async function processScreenshot(
 
     if (rw <= 0 || rh <= 0) continue;
 
-    // Use blur for faces/labels/input fields, solid black mask for credentials/IDs.
+    // Use blur for labels/plain input fields, solid mask for credentials/IDs.
     const useBlur = region.kind === "credential_label" || region.kind === "input_field";
 
-    if (useBlur) {
+    // full-mask credential regions (password/card/Aadhaar/API-key fields) are
+    // gated by the user's maskCredentials toggle. Soft input-field blur always
+    // runs (a generic field the user types into is still sensitive), but when
+    // masking is off we degrade to blur so the pixels are still protected.
+    if (useBlur || !maskCredentials) {
       // Deterministic blur (see boxBlurRegion): alters pixels on every Chrome
       // build, so re-OCR verification can always confirm the redaction.
       boxBlurRegion(ctx, rx, ry, rw, rh, 6 * scale);
@@ -392,6 +405,21 @@ async function processScreenshot(
       label: region.label,
     });
     redactionRegions.push({ x: rx, y: ry, width: rw, height: rh, kind: region.kind, label: region.label });
+
+    // Optional demo labels: a small chip above the redacted region so viewers
+    // can see exactly where PII was hidden. Off by default; only used for demos.
+    if (showLabels) {
+      const chipText = "🔒 redacted";
+      ctx.font = `600 ${Math.max(9, Math.round(10 * scale))}px system-ui, sans-serif`;
+      const tw = ctx.measureText(chipText).width;
+      const cy = Math.max(0, ry - 14 * scale);
+      ctx.fillStyle = "#dc2626";
+      ctx.fillRect(rx, cy, tw + 8 * scale, 14 * scale);
+      ctx.fillStyle = "#ffffff";
+      ctx.textBaseline = "middle";
+      ctx.textAlign = "left";
+      ctx.fillText(chipText, rx + 4 * scale, cy + 7 * scale);
+    }
   }
 
   // 2. Face detection — try Chrome FaceDetector API first, fallback to skin-color.
@@ -438,8 +466,12 @@ async function processScreenshot(
     const rh = Math.min(height - ry, Math.round(face.height + expandY * 2));
 
     if (rw > 10 && rh > 10) {
-      // Apply blur to face region (deterministic, verifiable).
-      boxBlurRegion(ctx, rx, ry, rw, rh, 10 * scale);
+      if (blurFaces) {
+        // Apply blur to face region (deterministic, verifiable).
+        boxBlurRegion(ctx, rx, ry, rw, rh, 10 * scale);
+
+        redactionRegions.push({ x: rx, y: ry, width: rw, height: rh, kind: "face", label: "Face detected" });
+      }
 
       allDetections.push({
         kind: "face",
@@ -452,7 +484,6 @@ async function processScreenshot(
         confidence: face.confidence,
         label: "Face detected",
       });
-      redactionRegions.push({ x: rx, y: ry, width: rw, height: rh, kind: "face", label: "Face detected" });
     }
   }
 
@@ -580,6 +611,11 @@ chrome.runtime.onMessage.addListener(
       height?: number;
       sensitiveRegions?: SensitiveRegion[];
       dpr?: number;
+      privacy?: {
+        blurFaces: boolean;
+        maskCredentials: boolean;
+        showRedactionLabels: boolean;
+      };
     },
     _sender: chrome.runtime.MessageSender,
     sendResponse: (response: any) => void,
@@ -597,6 +633,7 @@ chrome.runtime.onMessage.addListener(
         message.height,
         message.sensitiveRegions ?? [],
         message.dpr ?? 1,
+        message.privacy,
       )
         .then((result) => {
           // Send result back via sendMessage, NOT sendResponse.

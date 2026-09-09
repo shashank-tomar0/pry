@@ -56,9 +56,21 @@ const FINANCIAL_FIELD_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
 
 // ─── Text Value Patterns (Contextual) ───────────────────────────────────────
 
+/** True when `word` looks like a name part in ANY script — Latin title-case
+ * (Rahul, Dr., Kumari) or a run of Unicode letters/marks (राम, शर्मा, தமிழ்).
+ * ASCII-only `[A-Z][a-z]+` missed every non-Latin name, which for Indian
+ * users (Devanagari, Tamil, Telugu, …) let raw names ride past the pipeline. */
+function isNameWord(word: string): boolean {
+  if (/^[A-Z][a-z]+$/.test(word)) return true; // Latin title-case
+  if (/^[A-Z]\.?$/.test(word)) return true; // single initial "A."
+  if (/^(Mr|Mrs|Ms|Dr|Prof|Shri|Smt|Kumari|Sir|Madam)\.?$/i.test(word)) return true;
+  // Any-script: ≥2 Unicode letters/marks, no digits — covers Devanagari etc.
+  return /^[\p{L}\p{M}]{2,}$/u.test(word);
+}
+
 /**
  * Detect person names in text values using contextual clues.
- * Names typically: 2-4 words, each capitalized, no digits.
+ * Names typically: 2-4 words, each a name-like word (any script), no digits.
  */
 function looksLikePersonName(value: string): boolean {
   const trimmed = value.trim();
@@ -68,16 +80,8 @@ function looksLikePersonName(value: string): boolean {
   const words = trimmed.split(/\s+/);
   if (words.length < 2 || words.length > 4) return false;
 
-  // Each word should start with uppercase (or be a common prefix like "Dr.", "Mr.").
-  const nameWordPattern = /^([A-Z][a-z]+|[A-Z]\.?)$/;
-  const prefixWords = /^(Mr|Mrs|Ms|Dr|Prof|Shri|Smt|Kumari|Sir|Madam)\.?$/i;
-
   let nameWords = 0;
-  for (const word of words) {
-    if (prefixWords.test(word) || nameWordPattern.test(word)) {
-      nameWords++;
-    }
-  }
+  for (const word of words) nameWords += isNameWord(word) ? 1 : 0;
 
   // At least 70% of words should look like name parts.
   return nameWords / words.length >= 0.7;
@@ -94,12 +98,14 @@ function looksLikeOrgName(value: string): boolean {
   const orgSuffixes = /\b(Inc|LLC|Ltd|Pvt|Corp|Co|Company|Solutions|Technologies|Tech|Services|Group|Associates|Partners|Enterprises|Stores|Traders|Trading)\b/i;
   if (orgSuffixes.test(trimmed)) return true;
 
-  // All caps or title case with 2+ words and no digits.
+  // 2+ words, no digits, and either all Latin title-case OR all Unicode-letter
+  // words (covers Devanagari/other-script org names).
   const words = trimmed.split(/\s+/);
   if (words.length >= 2 && words.length <= 6) {
     const hasNoDigits = !/\d/.test(trimmed);
     const allTitleCase = words.every((w) => /^[A-Z]/.test(w));
-    if (hasNoDigits && allTitleCase) return true;
+    const allScriptWords = words.every((w) => /^[\p{L}\p{M}]+$/u.test(w));
+    if (hasNoDigits && (allTitleCase || allScriptWords)) return true;
   }
 
   return false;
@@ -217,11 +223,14 @@ export function detectContextualPII(snapshot: {
     }
   }
 
-  // Scan page text for names near identity keywords. Only STRUCTURED forms
+// Scan page text for names near identity keywords. Only STRUCTURED forms
   // count ("From:", "To:", "addressed to X", "sent by X") — bare mid-sentence
-  // "to X" / "from X" matches video titles and prose on every site ("…go to
-  // Learn DevOps Bootcamp…"), which produced phantom person detections.
-  const nameKeywordPattern = /\b((?:from|to|sender|recipient|name|company): *|addressed to |sent by )([A-Z][a-z]+(?: +[A-Z][a-z]+){1,3})\b/gi;
+  // "to X" / "from X" matches video titles and prose on every site ("...go to
+  // Learn DevOps Bootcamp..."), which produced phantom person detections.
+  // `[\p{L}][\p{L}\p{M}]+` matches a name-like run of letters in ANY script.
+  // End guard is a negative lookahead, not \b (\b is ASCII-\w-based and never
+  // fires after a Devanagari/other-script letter run).
+  const nameKeywordPattern = /\b((?:from|to|sender|recipient|name|company): *|addressed to |sent by )([\p{L}][\p{L}\p{M}]+(?: +[\p{L}][\p{L}\p{M}]+){1,3})(?![\p{L}\p{M}])/giu;
   let match;
   while ((match = nameKeywordPattern.exec(snapshot.text)) !== null) {
     const name = match[2];

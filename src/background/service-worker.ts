@@ -9,6 +9,7 @@ import type {
 } from "../shared/types";
 import { createTripwireAggregator } from "./tripwire-aggregator";
 import { normaliseSettings } from "../shared/types";
+import { tokenizer } from "./tokenizer";
 import { runTask } from "./agent";
 import { createPlanner } from "./providers";
 import { generateLessons } from "./lesson-generator";
@@ -202,12 +203,15 @@ async function ensureOffscreenDocument(): Promise<void> {
 }
 
 /**
- * Capture the visible tab area. This MUST run in the service worker
- * because chrome.tabs.captureVisibleTab is not available in content scripts.
+ * Capture the visible tab area for a specific tab. This MUST run in the
+ * service worker because chrome.tabs.captureVisibleTab is not available in
+ * content scripts. Takes the agent's tabId so it captures the page the agent
+ * is driving — not whatever tab happens to be focused (which would redact and
+ * egress the wrong page's pixels if the user switches tabs mid-run).
  */
-async function captureVisibleTab(): Promise<{ dataUrl: string; width: number; height: number } | null> {
+async function captureVisibleTab(tabId: number): Promise<{ dataUrl: string; width: number; height: number } | null> {
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab?.id) return null;
 
     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, { format: "png" });
@@ -229,6 +233,8 @@ async function captureVisibleTab(): Promise<{ dataUrl: string; width: number; he
 /**
  * Process a screenshot through the offscreen document's privacy pipeline.
  * Returns the redacted image and detection results.
+ * `privacy` carries the user's toggles (face blur, credential masking,
+ * redaction labels) so the offscreen pipeline honors them.
  */
 async function processScreenshot(
   dataUrl: string,
@@ -239,6 +245,11 @@ async function processScreenshot(
     kind: string; label: string;
   }> = [],
   dpr: number = 1,
+  privacy?: {
+    blurFaces: boolean;
+    maskCredentials: boolean;
+    showRedactionLabels: boolean;
+  },
 ): Promise<ProcessedScreenshotResult> {
   await ensureOffscreenDocument();
 
@@ -271,7 +282,8 @@ async function processScreenshot(
     };
     chrome.runtime.onMessage.addListener(listener);
 
-    // Send the screenshot + sensitive regions + DPR to the offscreen document.
+    // Send the screenshot + sensitive regions + DPR + privacy toggles to the
+    // offscreen document.
     chrome.runtime.sendMessage({
       type: "process-screenshot",
       requestId,
@@ -280,6 +292,7 @@ async function processScreenshot(
       height,
       sensitiveRegions,
       dpr,
+      privacy,
     });
   });
 }
@@ -356,24 +369,34 @@ async function getSensitiveRegions(tabId: number): Promise<{
 /**
  * Capture and process a screenshot in one call.
  * Returns both original (for audit comparison) and processed (redacted).
+ * `tabId` is the agent's driving tab — captures and regions come from THAT
+ * tab, never the currently-focused one, so switching tabs mid-run can't make
+ * the pipeline redact and egress the wrong page.
  */
-export async function captureAndProcessScreenshot(): Promise<{
+export async function captureAndProcessScreenshot(
+  tabId: number,
+  privacy: Settings["privacy"],
+): Promise<{
   original: string;
   processed: ProcessedScreenshotResult;
 } | null> {
-  const captured = await captureVisibleTab();
+  const captured = await captureVisibleTab(tabId);
   if (!captured) return null;
 
-  // Get sensitive regions + DPR from the content script.
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  const sensitiveData = tab?.id ? await getSensitiveRegions(tab.id) : null;
+  // Sensitive regions + DPR come from the SAME tab we captured.
+  const sensitiveData = await getSensitiveRegions(tabId);
   const dpr = sensitiveData?.dpr ?? 1;
   const sensitiveRegions = sensitiveData?.regions ?? [];
 
-  console.log(`[PRY] Screenshot: ${captured.width}x${captured.height} @ ${dpr}x DPR, ${sensitiveRegions.length} sensitive regions found`);
+  console.log(`[PRY] Screenshot (tab ${tabId}): ${captured.width}x${captured.height} @ ${dpr}x DPR, ${sensitiveRegions.length} sensitive regions found`);
 
   const processed = await processScreenshot(
     captured.dataUrl, captured.width, captured.height, sensitiveRegions, dpr,
+    {
+      blurFaces: privacy.blurFaces,
+      maskCredentials: privacy.maskCredentials,
+      showRedactionLabels: privacy.showRedactionLabels,
+    },
   );
   return { original: captured.dataUrl, processed };
 }
@@ -462,20 +485,31 @@ async function start(task: string, tabId: number): Promise<void> {
 
   const settings = await loadSettings();
 
+  // Tokenize the user's task once, up-front, so:
+  //   1. the model only ever sees <CRED_1> / <ORG_3> (never raw secrets typed
+  //      into the prompt), and
+  //   2. the session stored to chrome.storage holds the tokenized task, not a
+  //      raw password/card/name the user happened to type into the request.
+  // The shared tokenizer de-dupes, so runTask's own pass adds no new tokens.
+  const { task: tokenizedTask } = tokenizer.tokenizeTask(task);
+
   running = true;
   abort = new AbortController();
   taskStartTime = Date.now();
   auditEntries = [];
   emit({ kind: "status", running: true });
-  emit({ kind: "entry", entry: { id: `u-${Date.now()}`, role: "user", text: task } });
+  emit({ kind: "entry", entry: { id: `u-${Date.now()}`, role: "user", text: tokenizedTask } });
 
   try {
-    await runTask(task, tabId, {
+    await runTask(tokenizedTask, tabId, {
       settings,
       emit,
       askConfirm,
       signal: abort.signal,
-      captureScreenshot: captureAndProcessScreenshot,
+      // Bind the privacy toggles at run start so offscreen redaction honors
+      // the user's settings rather than always running with defaults.
+      captureScreenshot: (id) =>
+        captureAndProcessScreenshot(id, settings.privacy),
       recordAudit: recordAuditEntry,
       history: conversationMemory,
     });
@@ -498,7 +532,10 @@ async function start(task: string, tabId: number): Promise<void> {
     const hasError = transcript.some((e) => e.role === "error");
     await saveSession({
       id: `session-${taskStartTime}`,
-      task,
+      // Store the tokenized task so raw PII the user typed into the prompt
+      // never meets chrome.storage. The transcript + summary are already
+      // tokenized (the model replies and the user line both carry tokens).
+      task: tokenizedTask,
       startedAt: taskStartTime,
       completedAt: Date.now(),
       status: hasError ? "failed" : wasAborted ? "stopped" : "completed",
@@ -513,7 +550,7 @@ async function start(task: string, tabId: number): Promise<void> {
     const lastAssistant = [...transcript].reverse().find((e) => e.role === "assistant");
     if (lastAssistant?.text) {
       conversationMemory.push({
-        task: task.slice(0, CONVERSATION_TASK_MAX),
+        task: tokenizedTask.slice(0, CONVERSATION_TASK_MAX),
         answer: lastAssistant.text.slice(0, CONVERSATION_ANSWER_MAX),
         timestamp: Date.now(),
       });

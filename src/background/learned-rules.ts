@@ -30,6 +30,17 @@ const RULE_STALE_DAYS = 30;
 const RULE_EXPIRY_CONFIDENCE = 0.6;
 
 /**
+ * Rules carry fractional confidence that traces of decay and increment
+ * (0.6 * 0.995^ageDays ≈ 0.59999…, then + 0.1) push off a clean value like
+ * 0.7 into 0.6999999999651907. That float noise is meaningless to humans and
+ * breaks exact-value assertions, so confidence is quantized to 3 decimals on
+ * every read/write. The increment step (+0.1) is exact at this precision.
+ */
+function roundConfidence(value: number): number {
+  return Math.round(value * 1000) / 1000;
+}
+
+/**
  * Pure: apply time-based decay/expiry to a rule list. `now` is injectable so
  * the harness can test age logic deterministically.
  */
@@ -40,7 +51,7 @@ export function applyRuleLifecycle(
   const out: LearnedRule[] = [];
   for (const rule of rules) {
     const ageDays = Math.max(0, (now - rule.lastConfirmedAt) / 86_400_000);
-    const decayed = rule.confidence * Math.pow(1 - RULE_DECAY_PER_DAY, ageDays);
+    const decayed = roundConfidence(rule.confidence * Math.pow(1 - RULE_DECAY_PER_DAY, ageDays));
     rule.confidence = decayed;
     if (decayed < 0.1) continue; // faded out entirely
     if (ageDays > RULE_STALE_DAYS && decayed < RULE_EXPIRY_CONFIDENCE) continue; // stale + weak
@@ -86,7 +97,7 @@ export async function applyReflectionResults(results: ReflectionResult): Promise
     const rule = rules.find((r) => r.id === ruleId);
     if (rule) {
       rule.confirmedCount++;
-      rule.confidence = Math.min(1.0, rule.confidence + 0.1);
+      rule.confidence = roundConfidence(Math.min(1.0, rule.confidence + 0.1));
       rule.lastConfirmedAt = Date.now();
     }
   }
@@ -95,7 +106,7 @@ export async function applyReflectionResults(results: ReflectionResult): Promise
   for (const ruleId of results.contradictedRules) {
     const rule = rules.find((r) => r.id === ruleId);
     if (rule) {
-      rule.confidence = Math.max(0.0, rule.confidence - 0.2);
+      rule.confidence = roundConfidence(Math.max(0.0, rule.confidence - 0.2));
       // Remove rules that drop below threshold.
       if (rule.confidence < 0.1) {
         const idx = rules.indexOf(rule);

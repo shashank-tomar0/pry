@@ -289,6 +289,32 @@ $("save").addEventListener("click", async () => {
     return;
   }
 
+  // Validate the ElevenLabs key at Save time — a bad key used to surface
+  // only later, as a 401 at mic-press. GET /v1/user is the cheapest
+  // authenticated call and answers "is this key real" immediately.
+  if (settings.elevenlabs.apiKey
+      && (settings.elevenlabs.sttEnabled || settings.elevenlabs.ttsEnabled)) {
+    savedEl.className = "status-msg";
+    savedEl.textContent = "Validating ElevenLabs key…";
+    try {
+      const check = await fetch("https://api.elevenlabs.io/v1/user", {
+        headers: { "xi-api-key": settings.elevenlabs.apiKey },
+      });
+      if (!check.ok) {
+        savedEl.className = "status-msg bad";
+        savedEl.textContent =
+          check.status === 401
+            ? "ElevenLabs rejected this key (invalid_api_key). Re-copy it from elevenlabs.io → Profile → API Keys — the full key starts with 'sk_' and is shown only once."
+            : `ElevenLabs returned ${check.status} for this key. Try again or use a fresh key.`;
+        return;
+      }
+    } catch (err) {
+      savedEl.className = "status-msg bad";
+      savedEl.textContent = `Could not reach ElevenLabs to validate the key: ${err instanceof Error ? err.message : String(err)}`;
+      return;
+    }
+  }
+
   // Ollama needs no API key.
   if (!settings.apiKeys[settings.provider] && settings.provider !== "ollama") {
     savedEl.className = "status-msg bad";

@@ -386,6 +386,20 @@ export async function captureAndProcessScreenshot(
 
   // Sensitive regions + DPR come from the SAME tab we captured.
   const sensitiveData = await getSensitiveRegions(tabId);
+  if (!sensitiveData) {
+    // The content script could not deliver regions (file:// without the
+    // access toggle, a page it cannot inject into, or a hang). Say so in the
+    // transcript: text PII will NOT be redacted in this frame, and silence
+    // here is exactly how that used to look like a mystery.
+    emit({
+      kind: "entry",
+      entry: {
+        id: `regions-fail-${Date.now()}`,
+        role: "system",
+        text: "Privacy: sensitive-region detection is unavailable on this page (content script not running - e.g. file:// without 'Allow access to file URLs'). Text PII in this screenshot may stay visible; faces are still blurred on-device.",
+      },
+    });
+  }
   const dpr = sensitiveData?.dpr ?? 1;
   const sensitiveRegions = sensitiveData?.regions ?? [];
 
@@ -700,9 +714,17 @@ chrome.runtime.onMessage.addListener(
         return false;
       }
 
-      case "get-state":
-        sendResponse({ transcript, running });
-        return false;
+      case "get-state": {
+        // Settings ride along: the side panel's voice bootstrap reads them
+        // from here (they were missing once — the mic button could never
+        // appear because elevenlabs settings were always undefined).
+        void loadSettings().then((settings) => {
+          sendResponse({ transcript, running, settings });
+        }).catch(() => {
+          sendResponse({ transcript, running });
+        });
+        return true; // async response
+      }
 
       case "get-history":
         void getSessions().then((sessions) => sendResponse({ sessions }));

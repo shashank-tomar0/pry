@@ -20,6 +20,71 @@ import { verifyRegions, emptyVerification, detectPIIInText, layoutRegionCrops } 
 import { getSyntheticSurrogate } from "../background/surrogates";
 import { ocrDataUrl } from "./ocr";
 import type { VerificationResult } from "../shared/types";
+import { detectSpans } from "../ml/ner";
+import { classifyInjection } from "../ml/guard";
+import { FilesetResolver, FaceDetector as MpFaceDetector } from "@mediapipe/tasks-vision";
+
+// ─── BlazeFace (real face detection, Tier 0) ────────────────────────────────
+// Replaces the skin-color heuristic as the PRIMARY face channel. The model
+// (~224 KB tflite, vendored) runs via MediaPipe tasks-vision on a CPU delegate
+// inside the offscreen document. The skin-color blob detector remains the
+// fallback for the case the model files are absent.
+
+let blazeFacePromise: Promise<MpFaceDetector | null> | null = null;
+let blazeFaceFailed = false;
+
+async function getBlazeFace(): Promise<MpFaceDetector | null> {
+  if (blazeFaceFailed) return null;
+  if (!blazeFacePromise) {
+    blazeFacePromise = (async () => {
+      const files = await FilesetResolver.forVisionTasks(
+        chrome.runtime.getURL("vendor/mediapipe/wasm"),
+      );
+      return MpFaceDetector.createFromOptions(files, {
+        baseOptions: {
+          modelAssetPath: chrome.runtime.getURL("models/blazeface/face_detection_short_range.tflite"),
+          delegate: "CPU",
+        },
+        runningMode: "IMAGE",
+        minDetectionConfidence: 0.4,
+      });
+    })().catch(() => {
+      blazeFaceFailed = true;
+      return null;
+    });
+  }
+  const detector = await blazeFacePromise;
+  return detector ?? null;
+}
+
+/**
+ * BlazeFace pass over the ORIGINAL pixels. Boxes come back in image pixel
+ * coordinates — the same space the caller's blur loop already works in.
+ */
+async function detectFacesWithBlazeFace(
+  canvas: OffscreenCanvas,
+): Promise<Array<{ x: number; y: number; width: number; height: number; confidence: number }>> {
+  const detector = await getBlazeFace();
+  if (!detector) return [];
+  const bitmap = await createImageBitmap(canvas);
+  try {
+    const result = await detector.detect(bitmap);
+    return (result.detections ?? [])
+      .map((d) => {
+        const bb = d.boundingBox ?? { originX: 0, originY: 0, width: 0, height: 0 };
+        return {
+          x: bb.originX,
+          y: bb.originY,
+          width: bb.width,
+          height: bb.height,
+          confidence: d.categories?.[0]?.score ?? 0.8,
+        };
+      })
+      .filter((f) => f.width > 20 && f.height > 20);
+  } finally {
+    bitmap.close();
+  }
+}
 
 // ─── Chrome FaceDetector API (Chrome 100+, Shape Detection API) ─────────────
 
@@ -430,29 +495,43 @@ async function processScreenshot(
     }
   }
 
-  // 2. Face detection — try Chrome FaceDetector API first, fallback to skin-color.
+  // 2. Face detection — BlazeFace (real model) first, Chrome FaceDetector
+  // second, skin-color heuristic as the last-resort fallback.
   let faceBoxes: Array<{ x: number; y: number; width: number; height: number; confidence: number }> = [];
 
-  const chromeDetector = await getChromeFaceDetector();
-  if (chromeDetector) {
-    try {
-      const bitmap = await createImageBitmap(await (async () => {
-        const c = new OffscreenCanvas(width, height);
-        c.getContext("2d")!.drawImage(canvas, 0, 0);
-        return c.convertToBlob();
-      })());
-      const faces = await chromeDetector.detect(bitmap);
-      bitmap.close();
-      faceBoxes = faces.map((f) => ({
-        x: f.boundingBox.x,
-        y: f.boundingBox.y,
-        width: f.boundingBox.width,
-        height: f.boundingBox.height,
-        confidence: 0.95,
-      }));
-      console.log(`[PRY Offscreen] Chrome FaceDetector found ${faceBoxes.length} faces`);
-    } catch {
-      // Fall through to skin-color.
+  try {
+    faceBoxes = await detectFacesWithBlazeFace(canvas);
+    if (faceBoxes.length > 0) {
+      console.log(`[PRY Offscreen] BlazeFace found ${faceBoxes.length} faces`);
+    }
+  } catch {
+    // Fall through to the next channel.
+  }
+
+  if (faceBoxes.length === 0) {
+    const chromeDetector = await getChromeFaceDetector();
+    if (chromeDetector) {
+      try {
+        const bitmap = await createImageBitmap(await (async () => {
+          const c = new OffscreenCanvas(width, height);
+          c.getContext("2d")!.drawImage(canvas, 0, 0);
+          return c.convertToBlob();
+        })());
+        const faces = await chromeDetector.detect(bitmap);
+        bitmap.close();
+        faceBoxes = faces.map((f) => ({
+          x: f.boundingBox.x,
+          y: f.boundingBox.y,
+          width: f.boundingBox.width,
+          height: f.boundingBox.height,
+          confidence: 0.95,
+        }));
+        if (faceBoxes.length > 0) {
+          console.log(`[PRY Offscreen] Chrome FaceDetector found ${faceBoxes.length} faces`);
+        }
+      } catch {
+        // Fall through to skin-color.
+      }
     }
   }
 
@@ -461,7 +540,9 @@ async function processScreenshot(
     // redacted canvas, which may contain black masks).
     const imageData = originalCtx.getImageData(0, 0, width, height);
     faceBoxes = detectFacesBySkinColor(imageData, width, height);
-    console.log(`[PRY Offscreen] Skin-color heuristic found ${faceBoxes.length} faces`);
+    if (faceBoxes.length > 0) {
+      console.log(`[PRY Offscreen] Skin-color heuristic found ${faceBoxes.length} faces`);
+    }
   }
 
   for (const face of faceBoxes) {
@@ -496,7 +577,7 @@ async function processScreenshot(
   }
 
   // 3. Convert to Blob.
-  const redactedBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.85 });
+  const redactedBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.92 });
   const redactedDataUrl = await blobToDataUrl(redactedBlob);
 
   // 4. Re-OCR verification — decode the EXACT bytes that will be shipped (the
@@ -624,6 +705,7 @@ chrome.runtime.onMessage.addListener(
         maskCredentials: boolean;
         showRedactionLabels: boolean;
       };
+      text?: string;
     },
     _sender: chrome.runtime.MessageSender,
     sendResponse: (response: any) => void,
@@ -661,6 +743,21 @@ chrome.runtime.onMessage.addListener(
           sendResponse({ received: true, error: error.message });
         });
       return true;
+    }
+
+    // ─── ML inference (Tier 0) — runs here, never in the service worker ───
+    if (message.type === "ml-ner" && typeof message.text === "string") {
+      detectSpans(message.text)
+        .then((spans) => sendResponse({ ok: true, spans }))
+        .catch((err) => sendResponse({ ok: false, spans: [], error: String(err) }));
+      return true; // async
+    }
+
+    if (message.type === "ml-guard" && typeof message.text === "string") {
+      classifyInjection(message.text)
+        .then((verdict) => sendResponse({ ok: true, verdict }))
+        .catch((err) => sendResponse({ ok: false, verdict: null, error: String(err) }));
+      return true; // async
     }
 
     return false;

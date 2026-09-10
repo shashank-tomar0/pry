@@ -269,6 +269,8 @@ export interface Settings {
   vision: VisionSettings;
   /** Privacy pipeline configuration. */
   privacy: PrivacySettings;
+  /** ElevenLabs voice (hack branch, off by default). */
+  elevenlabs: ElevenLabsSettings;
 }
 
 export interface VisionSettings {
@@ -279,6 +281,22 @@ export interface VisionSettings {
    * default vision model" (see VISION_DEFAULT_MODELS in background/vision.ts).
    */
   model: string;
+}
+
+/**
+ * ElevenLabs voice settings (hack branch). Off by default; the key is stored
+ * client-side exactly like every other provider key in this extension.
+ * STT = Scribe Realtime (voice task input); TTS = Flash (spoken narration).
+ */
+export interface ElevenLabsSettings {
+  /** API key (required for both STT and TTS). */
+  apiKey: string;
+  /** Voice id for spoken output (ElevenLabs voice id). */
+  voiceId: string;
+  /** Hold-to-talk voice task input via Scribe Realtime. */
+  sttEnabled: boolean;
+  /** Spoken narration + final answers via streaming TTS. */
+  ttsEnabled: boolean;
 }
 
 export interface PrivacySettings {
@@ -315,6 +333,12 @@ export const DEFAULT_SETTINGS: Settings = {
     tokenizePII: true,
     showRedactionLabels: false,
   },
+  elevenlabs: {
+    apiKey: "",
+    voiceId: "",
+    sttEnabled: false,
+    ttsEnabled: false,
+  },
 };
 
 /** The shape stored before multi-provider support landed. */
@@ -349,6 +373,7 @@ export function normaliseSettings(stored: unknown): Settings {
       enabled: raw.vision?.enabled ?? legacyServerEnabled,
     },
     privacy: { ...DEFAULT_SETTINGS.privacy, ...(raw.privacy ?? {}) },
+    elevenlabs: { ...DEFAULT_SETTINGS.elevenlabs, ...(raw.elevenlabs ?? {}) },
   };
 
   // Pre-multi-provider installs stored a bare Anthropic key and model.

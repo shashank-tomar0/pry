@@ -413,6 +413,12 @@ body::after {
 }
 .run-arrow:hover { background: var(--color-accent); }
 .run-arrow.stop { background: var(--color-accent); }
+.run-arrow.mic { background: transparent; color: var(--color-ink); border-left-color: var(--color-rule); }
+.run-arrow.mic.listening { background: var(--color-accent); color: var(--color-paper); animation: mic-pulse 1.2s ease-in-out infinite; }
+@keyframes mic-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
 
 /* ─── Quick Actions ────────────────────────────────────────────────── */
 

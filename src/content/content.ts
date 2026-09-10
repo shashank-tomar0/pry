@@ -27,7 +27,17 @@ chrome.runtime.onMessage.addListener(
 
       case "act":
         // Async work requires keeping the message channel open (return true).
-        act(request.action).then(sendResponse);
+        // The catch matters: if the page navigates mid-action the context is
+        // destroyed, and an unresolved channel surfaces in the background as
+        // "the message channel closed before a response was received".
+        act(request.action)
+          .then(sendResponse)
+          .catch((err) =>
+            sendResponse({
+              ok: false,
+              detail: `Action interrupted: ${err instanceof Error ? err.message : String(err)}`,
+            } satisfies ActionResult),
+          );
         return true;
 
       case "capture-screenshot":

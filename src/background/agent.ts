@@ -890,7 +890,25 @@ export async function runTask(
         if (detDecision.verdict === "allow") {
           recordAction(detResult.action.name, detResult.action.input);
           const detStart = performance.now();
-          const detOutcome = await execute(controller, detAction);
+          let detOutcome: Awaited<ReturnType<typeof execute>>;
+          try {
+            detOutcome = await execute(controller, detAction);
+          } catch (err) {
+            const detail = err instanceof Error ? err.message : String(err);
+            trackedActions.push({
+              tool: detAction.name,
+              success: false,
+              latencyMs: Math.round(performance.now() - detStart),
+              strategy: "deterministic",
+              error: detail,
+              cause: classifyFailure(detail),
+            });
+            emit({ kind: "patch", id: detId, text: `Action failed (${detail.slice(0, 80)}) — escalating to the planner.`, pending: false });
+            // Escalate: the LLM planner takes this turn instead (same pattern
+            // as the confirm/refuse fall-through above). trackedActions
+            // already recorded the failure for reflection.
+            break;
+          }
           const detLatency = performance.now() - detStart;
           controller = detOutcome.controller;
 
@@ -1302,7 +1320,31 @@ ${freshRendered}`,
 
       recordAction(call.name, call.input);
       const actionStart = performance.now();
-      const outcome = await execute(controller, resolvedAction);
+      let outcome: Awaited<ReturnType<typeof execute>>;
+      try {
+        outcome = await execute(controller, resolvedAction);
+      } catch (err) {
+        // An action-level failure (e.g. the page navigated mid-click and the
+        // channel closed) must not kill the run: report it as a tool error
+        // and let the planner re-read the page.
+        const detail = err instanceof Error ? err.message : String(err);
+        trackedActions.push({
+          tool: call.name,
+          success: false,
+          latencyMs: Math.round(performance.now() - actionStart),
+          strategy: "llm",
+          error: detail,
+          cause: classifyFailure(detail),
+        });
+        results.push({
+          id: call.id,
+          isError: true,
+          content: `The action did not complete: ${detail}. Call read_page and continue from the page's current state.`,
+        });
+        errorCount++;
+        emit({ kind: "patch", id: stepId, text: "Action failed — recovering.", pending: false });
+        continue;
+      }
       const actionLatency = performance.now() - actionStart;
       controller = outcome.controller;
       const { result } = outcome;

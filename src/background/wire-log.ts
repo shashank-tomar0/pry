@@ -13,12 +13,10 @@
  * something survives. A privacy claim that is only checked in CI is a claim
  * about CI.
  *
- * The log holds sanitized payloads by definition — they are what was sent —
- * so it is safe to display. Nothing here ever sees a raw capture.
- *
- * Kept in memory on purpose: screenshots would dominate a storage-backed log,
- * and a log that grows without limit in a service worker is a memory leak
- * with a nice name.
+ * Persistence: MV3 suspends the service worker within ~30s of idle, which
+ * used to wipe the in-memory array — the panel opened after a run showed an
+ * empty log. Records now persist to chrome.storage.local (write-behind) and
+ * reload lazily, so the audit survives the worker and the browser.
  */
 
 import { matchPiiInText } from "../shared/text-pii-patterns";
@@ -56,10 +54,39 @@ export interface WireRecord {
   totalChars: number;
 }
 
+const STORAGE_KEY = "pry-wire-log";
 const MAX_RECORDS = 24;
 
 let records: WireRecord[] = [];
 let sequence = 0;
+let loaded = false;
+
+async function persist(): Promise<void> {
+  try {
+    await chrome.storage.local.set({ [STORAGE_KEY]: records });
+  } catch {
+    // Storage full or unavailable — the in-memory log still serves this run.
+  }
+}
+
+/** Lazily reload persisted records (after a service-worker suspension). */
+export async function loadWire(): Promise<void> {
+  if (loaded) return;
+  loaded = true;
+  try {
+    const { [STORAGE_KEY]: stored } = await chrome.storage.local.get(STORAGE_KEY);
+    if (Array.isArray(stored) && stored.length > 0) {
+      records = stored.slice(-MAX_RECORDS);
+      // Resume the sequence past the highest stored id (ids are w<n>).
+      for (const r of records) {
+        const n = Number(String(r.id ?? "").slice(1));
+        if (Number.isFinite(n) && n > sequence) sequence = n;
+      }
+    }
+  } catch {
+    // Storage unavailable — start empty.
+  }
+}
 
 /** Every vault token in a string, deduplicated and sorted. */
 export function tokensIn(text: string): string[] {
@@ -85,14 +112,19 @@ export function recordWire(entry: Omit<WireRecord, "id" | "at">): WireRecord {
   const record: WireRecord = { ...entry, id: `w${++sequence}`, at: Date.now() };
   records.push(record);
   if (records.length > MAX_RECORDS) records = records.slice(-MAX_RECORDS);
+  void persist();
   return record;
 }
 
-export function wireRecords(): WireRecord[] {
+/** Awaits the lazy reload, then returns the persisted log. */
+export async function wireRecords(): Promise<WireRecord[]> {
+  await loadWire();
   return records;
 }
 
 export function clearWire(): void {
   records = [];
   sequence = 0;
+  loaded = true;
+  void chrome.storage.local.remove(STORAGE_KEY).catch(() => undefined);
 }

@@ -433,22 +433,26 @@ async function processScreenshot(
 
     if (rw <= 0 || rh <= 0) continue;
 
-    // Use blur for labels/plain input fields and for PII found in plain text
-    // (email/phone/id *_text spans from the pixel channel). Blur is right for
-    // text: a surrogate box drawn over a paragraph line would over-cover and
-    // look broken, while deterministic blur alters every pixel (re-OCR can
-    // still verify it). Everything else — credential/ID *fields* — gets the
-    // surrogate inpaint treatment.
+    // Solid black box for PII found in plain text (email/phone/id *_text
+    // spans from the pixel channel): the exact-span redaction users expect,
+    // trivially verified by re-OCR, and it reads unambiguously as "this was
+    // redacted". Labels and plain input fields still blur (over-covering a
+    // whole field with a black box destroys layout context). Everything
+    // else — credential/ID *fields* — gets the surrogate inpaint treatment.
+    const solidText = region.kind.endsWith("_text");
     const useBlur =
       region.kind === "credential_label" ||
-      region.kind === "input_field" ||
-      region.kind.endsWith("_text");
+      region.kind === "input_field";
 
     // full-mask credential regions (password/card/Aadhaar/API-key fields) are
     // gated by the user's maskCredentials toggle. Soft input-field blur always
     // runs (a generic field the user types into is still sensitive), but when
     // masking is off we degrade to blur so the pixels are still protected.
-    if (useBlur || !maskCredentials) {
+    if (solidText) {
+      // Solid black, zero information left: the span is exactly the PII.
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(rx, ry, rw, rh);
+    } else if (useBlur || !maskCredentials) {
       // Deterministic blur (see boxBlurRegion): alters pixels on every Chrome
       // build, so re-OCR verification can always confirm the redaction.
       boxBlurRegion(ctx, rx, ry, rw, rh, 6 * scale);

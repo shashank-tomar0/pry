@@ -1720,4 +1720,35 @@ ok("bridge caps spans at 12 (locate message size bound)", getActiveNerSpans().le
 setActiveNerSpans([]);
 ok("clearing spans empties the bridge (no cross-page stale spans)", getActiveNerSpans().length === 0);
 
+// ── Model-agnostic NER label mapping (whichever PII model lands) ──────────
+console.log("\n=== Scenario AE: model-agnostic PII label mapping ===\n");
+
+const { keepLabel } = await import("../src/shared/ner-labels.ts");
+
+// ConLL vocab.
+ok("ConLL PER/ORG/LOC labels kept", keepLabel("PER") && keepLabel("ORG") && keepLabel("LOC"));
+// PII-specialized vocabularies (Piiranha-style).
+ok("Piiranha-style PII labels kept",
+  keepLabel("EMAIL") && keepLabel("PERSON_NAME") && keepLabel("PHONE_NUMBER")
+    && keepLabel("SSN") && keepLabel("ADDRESS") && keepLabel("DOB"));
+// GLiNER-style zero-shot labels.
+ok("GLiNER-style labels kept",
+  keepLabel("name") && keepLabel("email address") && keepLabel("account number"));
+// Generic non-PII families stay readable.
+ok("non-PII labels are NOT kept",
+  !keepLabel("EVENT") && !keepLabel("PRODUCT") && !keepLabel("MISC")
+    && !keepLabel("SKILL") && !keepLabel("QUANTITY") && !keepLabel("DATE"));
+
+// Friendly audit names for PII vocabularies via the fusion layer.
+const fusedLbl = fuseDetections([], [
+  { text: "Rahul Sharma", label: "PERSON_NAME", score: 0.9 },
+  { text: "rahul@acme.in", label: "EMAIL", score: 0.95 },
+  { text: "Acme Pvt Ltd", label: "COMPANY", score: 0.8 },
+]);
+ok("fusion maps PII vocabularies to friendly audit labels",
+  fusedLbl.detections.some((d) => d.value === "Rahul Sharma" && d.label === "NER Person name")
+    && fusedLbl.detections.some((d) => d.value === "rahul@acme.in" && d.label === "NER Email address")
+    && fusedLbl.detections.some((d) => d.value === "Acme Pvt Ltd" && d.label === "NER Organization"),
+  JSON.stringify(fusedLbl.detections.map((d) => d.label)));
+
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

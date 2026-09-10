@@ -5,7 +5,7 @@
 | Diagram Component | Status | Gap |
 |---|---|---|
 | **CAPTURE** (DOM tree + screenshot) | ✅ Built | Working |
-| **DETECT PII** (DOM signals, pattern, ML) | ✅ Built | Missing ML face/OCR model |
+| **DETECT PII** (DOM signals, pattern, ML) | ✅ Built | BlazeFace shipped; NER/guard models optional (degrade cleanly) |
 | **TEXT → TOKENIZE** (Aadhaar, PAN, names) | ✅ Built | Missing: tokenize user task too |
 | **PIXEL → REDACT** (faces, signatures) | ✅ Built | Missing: signature/QR detection |
 | **VAULT** (token ↔ value, memory only) | ✅ Built | Working |
@@ -153,6 +153,35 @@ For each phase:
 4. Check service worker console for pipeline logs
 5. Verify Privacy Audit panel shows correct detections
 6. Verify the action completes successfully
+
+## On-Device NER Model Status (verified 2026-09-11)
+
+**Running today (transformers.js token-classification, label-agnostic policy):**
+`onnx-community/distilbert-NER` (PER/ORG/LOC). The loader (`src/ml/ner.ts`) keeps
+any span whose model label names a PII class — ConLL PER/ORG/LOC, Piiranha-style
+classes (EMAIL, PERSON_NAME, PHONE_NUMBER…), or GLiNER-style zero-shot labels
+("name", "email address"…) — so swapping in a better token classifier needs zero
+changes to the fusion layer. 311 assertions pin the policy.
+
+**GLiNER is the Tier-1 target, and today it cannot run in the browser** (both
+blockers verified against the live packages):
+1. **No runtime.** transformers.js v4.2 (latest) has no GLiNER architecture —
+   GLiNER's span-pair scoring head is not a standard token-classification head,
+   and the only JS GLiNER runtime (`@lmoe/gliner-onnx`) depends on
+   `onnxruntime-node`, which cannot run in the extension's offscreen document.
+2. **Model size.** GLiNER-PII's quantized ONNX is 197 MB (fp16 333 MB) — ~4x the
+   entire current package; the general `gliner_base` is similar order.
+
+Unlock paths (pick when a real eval can gate it):
+- **Precomputed label embeddings + onnxruntime-web**: GLiNER ONNX takes
+  `labels_embeddings` as input — precompute the 60+ PII labels' embeddings once
+  (a few hundred KB tensor) and run the main graph directly on onnxruntime-web
+  (already vendored), bypassing transformers.js pipeline dispatch entirely.
+- **Piiranha** (PII-specialized, 17 classes, 98%+ recall) is transformers.js-
+  compatible but its quantized ONNX is 317 MB — out of package budget until
+  distilling or a smaller PII-tuned checkpoint exists.
+- **Port GLiNER's head into transformers.js** (upstream contribution) — then
+  GLiNER-small (DeBERTa-small, ~25 MB q8) becomes the on-device PII brain.
 
 ## What Judges Will See
 

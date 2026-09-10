@@ -139,9 +139,26 @@
         <button id="audit-close" class="link-btn">CLOSE ×</button>
       </div>
       <div id="audit-summary" class="audit-summary"></div>
+      <div id="audit-verification" class="audit-verification"></div>
       <div id="audit-screenshots" class="audit-screenshots"></div>
       <div id="audit-detections" class="audit-detections"></div>
       <div id="audit-tokens" class="audit-tokens"></div>
+    </div>
+
+    <!-- Zoom lightbox: click any audit image to inspect it at full size.
+         The redacted view renders the same detection boxes as overlays, so
+         the "proof" is visible even zoomed way out. -->
+    <div id="zoom-modal" class="zoom-modal hidden">
+      <div class="zoom-backdrop" data-zoom-close></div>
+      <div class="zoom-box">
+        <div class="zoom-head">
+          <span id="zoom-title" class="zoom-title"></span>
+          <button id="zoom-fit" class="zoom-toggle">FIT</button>
+          <button id="zoom-one" class="zoom-toggle">1:1</button>
+          <button id="zoom-close" class="link-btn">CLOSE ×</button>
+        </div>
+        <div id="zoom-body" class="zoom-body"></div>
+      </div>
     </div>
 
     <!-- ─── Tripwire Radar Panel ──────────────────────────────────────── -->

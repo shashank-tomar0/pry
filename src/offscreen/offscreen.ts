@@ -477,7 +477,15 @@ async function processScreenshot(
 
     allDetections.push({
       kind: (region.kind === "credential_label" || region.kind === "input_field") ? "credential" : region.kind as any,
-      box: { x: region.x, y: region.y, width: region.width, height: region.height },
+      // Normalized 0-1 coordinates (same convention as face boxes) so the
+      // audit panel can overlay proof markers on the thumbnail regardless of
+      // DPR or display size: x_norm = cssPx * dpr / deviceWidth.
+      box: {
+        x: (region.x * scale) / width,
+        y: (region.y * scale) / height,
+        width: (region.width * scale) / width,
+        height: (region.height * scale) / height,
+      },
       confidence: 0.95,
       label: region.label,
     });

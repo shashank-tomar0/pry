@@ -70,8 +70,19 @@ try {
 }
 
 console.log("== NER (token-classification) ==");
-// Preferred: ONNX build of a ConLL-style NER (PER/ORG/LOC) that transformers.js
+// Preferred: ONNX build of a PII-capable token classifier that transformers.js
 // runs natively. Candidates in priority order; first available wins.
+//
+// Why not GLiNER (gliner-pii / gliner_base)? Two hard blockers as of today:
+//   1. transformers.js (v4.2, latest) has NO GLiNER architecture — the span-
+//      pair scoring head is not a standard token-classification head, so the
+//      token-classification pipeline cannot run it. The only JS GLiNER
+//      runtime (npm @lmoe/gliner-onnx) depends on onnxruntime-NODE and cannot
+//      run in the extension's offscreen document.
+//   2. GLiNER-PII's quantized ONNX is 197 MB — 4x the entire current package.
+// GLiNER remains the Tier-1 NER upgrade path; the loader below is label-
+// agnostic, so swapping in a GLiNER-backed runtime later needs zero changes
+// to the fusion/detection layer.
 const NER_CANDIDATES = [
   "onnx-community/distilbert-NER",
   "Xenova/distilbert-base-uncased-finetuned-conll03-english",

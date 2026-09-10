@@ -40,7 +40,7 @@ import { piiKindFromOcrLabel } from "./reocr-verification";
 import type { DetectedPII } from "./pii-detector";
 import { observeWithVision, VISION_SUPPORTED, VISION_DEFAULT_MODELS } from "./vision";
 import { recordWire, tokensIn, scanForLeaks } from "./wire-log";
-import { requestMlNer, requestMlGuard } from "./ml-bridge";
+import { requestMlNer, requestMlGuard, setActiveNerSpans, probeMlFiles } from "./ml-bridge";
 import { fuseDetections, type NerSpanInput } from "./detector-v2";
 import {
   initLedger, recordSnapshot, recordDetections,
@@ -476,6 +476,26 @@ export async function runTask(
     ner: settings.ml?.ner !== false,
     guard: settings.ml?.guard !== false,
   };
+
+  // Honest ML status: announce ONCE per run which on-device capabilities are
+  // actually bundled. Never claiming a model that isn't there is the contract
+  // — and it turns the "models/ is empty" state from a silent mystery into a
+  // visible, actionable line in the transcript.
+  probeMlFiles().then((m) => {
+    const parts: string[] = [];
+    if (m.face) parts.push("faces: BlazeFace bundled");
+    if (mlFlags.ner) parts.push(m.ner ? "NER model bundled" : "NER model not bundled (regex + checksums active)");
+    if (mlFlags.guard) parts.push(m.guard ? "injection guard bundled" : "injection guard not bundled (regex heuristic active)");
+    if (parts.length === 0) return;
+    emit({
+      kind: "entry",
+      entry: {
+        id: nextId(),
+        role: "system",
+        text: `On-device ML: ${parts.join(" · ")}.`,
+      },
+    });
+  });
   // Latest DOM (text) detections for the audit view — the screenshots only
   // carry visual detections, so without this the proof panel hides the emails,
   // phones and ID numbers the DOM sanitizer actually tokenized.
@@ -489,6 +509,9 @@ export async function runTask(
     // model is missing or slow; the run never stalls on it.
     try {
       const spans: NerSpanInput[] = await requestMlNer(snapshot.text, mlFlags, signal);
+      // Hand the span texts to the screenshot path: they become black-box
+      // regions in the next captured frame (the NER-to-pixel bridge).
+      setActiveNerSpans(spans.map((sp) => sp.text));
       if (spans.length > 0) {
         sanitizeCtx.mlDetections = spans.map((s) => ({
           kind: "pii_text" as const,
@@ -506,6 +529,7 @@ export async function runTask(
         });
       }
     } catch {
+      setActiveNerSpans([]);
       // NER is additive — never block the run.
     }
 

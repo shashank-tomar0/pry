@@ -109,7 +109,8 @@ export type ContentRequest =
   | { kind: "ping" }
   | { kind: "capture-screenshot" }
   | { kind: "capture-and-act"; action: AgentAction }
-  | { kind: "get-sensitive-regions" };
+  | { kind: "get-sensitive-regions" }
+  | { kind: "locate-spans"; spans: string[] };
 
 /** A rendered entry in the side panel transcript. */
 export interface TranscriptEntry {

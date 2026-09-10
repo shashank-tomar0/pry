@@ -12,7 +12,7 @@
 
 import type { ContentRequest, ActionResult } from "../shared/types";
 import { act } from "./act";
-import { snapshot, getSensitiveRegions } from "./perceive";
+import { snapshot, getSensitiveRegions, locateSpans } from "./perceive";
 
 chrome.runtime.onMessage.addListener(
   (request: ContentRequest, _sender, sendResponse: (r: unknown) => void) => {
@@ -52,6 +52,17 @@ chrome.runtime.onMessage.addListener(
           ok: true,
           detail: "sensitive-regions",
           sensitiveRegions: getSensitiveRegions(),
+          dpr: window.devicePixelRatio || 1,
+        });
+        return false;
+
+      case "locate-spans":
+        // NER→pixel bridge: the offscreen model named spans; the content
+        // script measures where they are painted and returns black-box rects.
+        sendResponse({
+          ok: true,
+          detail: "located-spans",
+          sensitiveRegions: locateSpans((request as { spans?: string[] }).spans ?? []),
           dpr: window.devicePixelRatio || 1,
         });
         return false;

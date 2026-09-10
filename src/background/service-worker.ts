@@ -10,6 +10,7 @@ import type {
 import { createTripwireAggregator } from "./tripwire-aggregator";
 import { normaliseSettings } from "../shared/types";
 import { tokenizer } from "./tokenizer";
+import { clearWire, wireRecords } from "./wire-log";
 import { runTask } from "./agent";
 import { createPlanner } from "./providers";
 import { generateLessons } from "./lesson-generator";
@@ -827,6 +828,15 @@ chrome.runtime.onMessage.addListener(
           alerts: tripwireLog,
           summary: tripwireAggregator.summary(),
         });
+        return false;
+
+      case "get-wire-log":
+        sendResponse({ records: wireRecords() });
+        return false;
+
+      case "clear-wire-log":
+        clearWire();
+        sendResponse({ ok: true });
         return false;
 
       default:

@@ -220,7 +220,9 @@ function formatMarkdown(text: string): string {
   return processed;
 }
 
-type PanelId = "privacy-audit" | "learning-dashboard" | "tripwire-panel" | "history-panel";
+type PanelId = "privacy-audit" | "learning-dashboard" | "tripwire-panel" | "wire-panel" | "history-panel";
+
+const wirePanel = $("wire-panel");
 
 function setActivePanel(panelId: PanelId | null): void {
   const isCurrentlyOpen = (id: PanelId): boolean => {
@@ -228,6 +230,7 @@ function setActivePanel(panelId: PanelId | null): void {
       case "privacy-audit": return !privacyAuditEl.classList.contains("hidden");
       case "learning-dashboard": return !learningDashboardEl.classList.contains("hidden");
       case "tripwire-panel": return !tripwirePanel?.classList.contains("hidden");
+      case "wire-panel": return !wirePanel?.classList.contains("hidden");
       case "history-panel": return !historyPanel.classList.contains("hidden");
     }
   };
@@ -237,11 +240,13 @@ function setActivePanel(panelId: PanelId | null): void {
   privacyAuditEl.classList.add("hidden");
   learningDashboardEl.classList.add("hidden");
   tripwirePanel?.classList.add("hidden");
+  wirePanel?.classList.add("hidden");
   historyPanel.classList.add("hidden");
 
   $("btn-perception")?.classList.toggle("active", target === "privacy-audit");
   $("btn-learning")?.classList.toggle("active", target === "learning-dashboard");
   $("btn-radar")?.classList.toggle("active", target === "tripwire-panel");
+  $("btn-wire")?.classList.toggle("active", target === "wire-panel");
   $("btn-history")?.classList.toggle("active", target === "history-panel");
 
   if (!target) return;
@@ -257,6 +262,10 @@ function setActivePanel(panelId: PanelId | null): void {
     case "tripwire-panel":
       tripwirePanel?.classList.remove("hidden");
       void refreshTripwireLog();
+      break;
+    case "wire-panel":
+      wirePanel?.classList.remove("hidden");
+      void refreshWireLog();
       break;
     case "history-panel":
       historyPanel.classList.remove("hidden");
@@ -1228,6 +1237,94 @@ async function refreshTripwireLog(): Promise<void> {
 // Tripwire Radar view
 $("btn-radar")?.addEventListener("click", () => setActivePanel("tripwire-panel"));
 $("tripwire-close")?.addEventListener("click", () => setActivePanel(null));
+
+// ─── Wire Log view ─────────────────────────────────────────────────────────
+// Answers exactly one question: what did the model receive? Every record is
+// the sanitized payload as it crossed the wire, plus the leak re-scan. A
+// red banner on a record means PII survived the pipeline on that turn — the
+// loudest possible failure, shown where it cannot be missed.
+
+interface WireLeakView { label: string; sample: string }
+interface WireMessageView { role: string; text: string }
+interface WireRecordView {
+  id: string;
+  turn: number;
+  at: number;
+  destination: string;
+  systemChars: number;
+  messages: WireMessageView[];
+  tokens: string[];
+  leaked: WireLeakView[];
+  totalChars: number;
+}
+
+async function refreshWireLog(): Promise<void> {
+  const response = (await send({ kind: "get-wire-log" })) as
+    | { records?: WireRecordView[] }
+    | undefined;
+  renderWireLog(response?.records ?? []);
+}
+
+function renderWireLog(records: WireRecordView[]): void {
+  const summaryEl = document.getElementById("wire-summary");
+  const listEl = document.getElementById("wire-records");
+  if (!summaryEl || !listEl) return;
+
+  const leakCount = records.reduce((n, r) => n + r.leaked.length, 0);
+  summaryEl.textContent = records.length === 0
+    ? "No planner turns recorded yet. Run a task — every turn is logged here with a leak re-scan."
+    : `${records.length} turn(s) logged · ${leakCount === 0 ? "no leaks detected on any outgoing payload" : `${leakCount} LEAK(S) DETECTED`}`;
+
+  listEl.textContent = "";
+  // Newest first, mirroring the transcript.
+  for (const record of [...records].reverse()) {
+    const card = document.createElement("div");
+    card.className = "wire-record" + (record.leaked.length > 0 ? " wire-leak" : "");
+
+    const head = document.createElement("div");
+    head.className = "wire-head";
+    const turnLabel = record.turn === 0 ? "initial turn" : `turn ${record.turn}`;
+    head.innerHTML =
+      `<span class="wire-dest">${escapeHtml(record.destination)}</span>` +
+      `<span class="wire-meta">${turnLabel} · ${record.totalChars} chars · ${new Date(record.at).toLocaleTimeString()}</span>`;
+    card.appendChild(head);
+
+    if (record.leaked.length > 0) {
+      const banner = document.createElement("div");
+      banner.className = "wire-leak-banner";
+      banner.textContent =
+        `⚠ LEAK: ${record.leaked.map((l) => `${l.label} (${l.sample})`).join(", ")} reached the model.`;
+      card.appendChild(banner);
+    }
+
+    if (record.tokens.length > 0) {
+      const tokens = document.createElement("div");
+      tokens.className = "wire-tokens";
+      tokens.textContent = `tokens: ${record.tokens.join(" ")}`;
+      card.appendChild(tokens);
+    }
+
+    for (const message of record.messages) {
+      const line = document.createElement("div");
+      line.className = `wire-msg wire-${message.role}`;
+      const role = document.createElement("span");
+      role.className = "wire-role";
+      role.textContent = message.role;
+      const body = document.createElement("span");
+      body.className = "wire-text";
+      body.textContent = message.text.length > 500
+        ? `${message.text.slice(0, 500)}…`
+        : message.text;
+      line.append(role, body);
+      card.appendChild(line);
+    }
+
+    listEl.appendChild(card);
+  }
+}
+
+$("btn-wire")?.addEventListener("click", () => setActivePanel("wire-panel"));
+$("wire-close")?.addEventListener("click", () => setActivePanel(null));
 
 // Global Escape key listener to close active drawer
 window.addEventListener("keydown", (e) => {

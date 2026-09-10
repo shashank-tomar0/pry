@@ -16,6 +16,7 @@
       </div>
       <div class="topbar-right">
         <button class="icon-btn" id="btn-radar" title="Live Egress Tripwire Radar">🛡️</button>
+        <button class="icon-btn" id="btn-wire" title="Wire log — exactly what the model received">📡</button>
         <button class="icon-btn" id="btn-history" title="Session history">☰</button>
         <button class="icon-btn" id="btn-learning" title="Self-improvement dashboard">🧠</button>
         <button class="icon-btn" id="btn-perception" title="Privacy audit">◉</button>
@@ -144,6 +145,17 @@
     </div>
 
     <!-- ─── Tripwire Radar Panel ──────────────────────────────────────── -->
+    <div id="wire-panel" class="tripwire-panel hidden">
+      <div class="audit-header">
+        <span class="audit-title">📡 WIRE LOG — WHAT THE MODEL RECEIVED</span>
+        <button id="wire-close" class="link-btn">CLOSE ×</button>
+      </div>
+      <div class="tripwire-content">
+        <div class="wire-summary" id="wire-summary"></div>
+        <div id="wire-records"></div>
+      </div>
+    </div>
+
     <div id="tripwire-panel" class="tripwire-panel hidden">
       <div class="audit-header">
         <span class="audit-title">🛡️ LIVE EGRESS TRIPWIRE RADAR</span>

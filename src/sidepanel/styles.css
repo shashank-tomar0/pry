@@ -420,6 +420,53 @@ body::after {
   50% { opacity: 0.55; }
 }
 
+/* ─── Wire Log ─────────────────────────────────────────────────────────── */
+.wire-summary {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-accent);
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--color-rule);
+}
+.wire-record {
+  border: 1px solid var(--color-rule);
+  margin: 8px 10px;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.wire-record.wire-leak { border-color: var(--color-accent); border-width: 2px; }
+.wire-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.wire-dest { font-weight: 700; }
+.wire-meta { opacity: 0.7; }
+.wire-leak-banner {
+  background: var(--color-accent);
+  color: var(--color-paper);
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  font-weight: 700;
+}
+.wire-tokens { color: var(--color-accent); margin-bottom: 6px; }
+.wire-msg {
+  display: flex;
+  gap: 8px;
+  padding: 3px 0;
+  border-top: 1px dashed var(--color-rule);
+  align-items: baseline;
+}
+.wire-role {
+  flex: 0 0 62px;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--color-accent);
+}
+.wire-text { word-break: break-word; white-space: pre-wrap; }
+
 /* ─── Quick Actions ────────────────────────────────────────────────── */
 
 .quick-grid {

@@ -231,6 +231,8 @@ export type PanelCommand =
   | { kind: "clear-learning" }
   | { kind: "get-ledger" }
   | { kind: "get-tripwire-log" }
+  | { kind: "get-wire-log" }
+  | { kind: "clear-wire-log" }
   | {
       kind: "record-correction";
       /** Omit to correct the most recent run. */

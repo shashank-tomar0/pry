@@ -1628,4 +1628,55 @@ ok("leaked findings are preserved on the record (loud banner data)",
   wireLog.wireRecords()[0].leaked.length === 1
     && wireLog.wireRecords()[0].leaked[0].label === "Email address");
 
+// ── Tier-0 ML: fusion detector + ml settings migration ──────────────────────
+console.log("\n=== Scenario AC: fusion detector v2 + ml settings ===\n");
+
+const { fuseDetections } = await import("../src/background/detector-v2.ts");
+
+const baseDetections = [
+  { kind: "credential", value: "priya.sharma@example.in", confidence: 0.9, label: "Email address" },
+  { kind: "id_number", value: "234567890124", confidence: 0.7, label: "Aadhaar number" },
+];
+
+// A person name the regex never catches: NER adds it.
+const fused1 = fuseDetections(baseDetections, [
+  { text: "Priya Sharma", label: "PER", score: 0.92 },
+]);
+ok("fusion: NER adds a person name regex missed",
+  fused1.added === 1
+    && fused1.detections.some((d) => d.value === "Priya Sharma" && d.label === "NER Person name")
+    && fused1.detections.length === 3,
+  JSON.stringify(fused1.detections.map((d) => d.value)));
+
+// A NER span that duplicates a regex value is dropped (checksum wins).
+const fused2 = fuseDetections(baseDetections, [
+  { text: "priya.sharma@example.in", label: "PER", score: 0.99 },
+]);
+ok("fusion: NER span duplicating a regex value is dropped", fused2.added === 0);
+
+// A NER span contained INSIDE a regex value (partial overlap) is dropped too.
+const fused3 = fuseDetections(baseDetections, [
+  { text: "234567890", label: "PER", score: 0.8 },
+]);
+ok("fusion: partially-overlapping NER span is dropped", fused3.added === 0);
+
+// Duplicate NER spans collapse.
+const fused4 = fuseDetections([], [
+  { text: "Rahul Sharma", label: "PER", score: 0.9 },
+  { text: "Rahul Sharma", label: "PER", score: 0.88 },
+]);
+ok("fusion: duplicate NER spans collapse to one", fused4.added === 1);
+
+// Tiny spans are skipped.
+ok("fusion: sub-3-char spans are skipped",
+  fuseDetections([], [{ text: "ab", label: "PER", score: 0.9 }]).added === 0);
+
+// Settings: ml defaults + merge.
+const mlDefaults = normaliseSettings(undefined);
+ok("ml settings default to enabled (degradation is automatic)",
+  mlDefaults.ml.ner === true && mlDefaults.ml.guard === true);
+const mlMerged = normaliseSettings({ ml: { ner: false } });
+ok("ml settings merge preserves stored guard flag",
+  mlMerged.ml.ner === false && mlMerged.ml.guard === true);
+
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

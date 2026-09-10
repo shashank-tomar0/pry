@@ -497,7 +497,56 @@ export function getSensitiveRegions(): SensitiveRegion[] {
     });
   }
 
+  // On-screen receipt (the user-facing box): shows how many sensitive items
+  // were just located on THIS screen. Auto-fades; never intercepts input.
+  showDetectionBadge(regions.length);
+
   return regions;
+}
+
+let badgeEl: HTMLElement | null = null;
+let badgeHideTimer: number | undefined;
+
+/**
+ * Floating count chip on the page itself. Created once, reused, faded out
+ * after a few seconds so it never becomes part of the page. pointer-events
+ * are disabled — it is a receipt, not a control.
+ */
+function showDetectionBadge(count: number): void {
+  try {
+    if (count <= 0) return;
+    if (!badgeEl || !badgeEl.isConnected) {
+      badgeEl = document.createElement("div");
+      badgeEl.setAttribute("data-pry-badge", "");
+      badgeEl.style.cssText = [
+        "position: fixed",
+        "top: 12px",
+        "right: 12px",
+        "z-index: 2147483646",
+        "pointer-events: none",
+        "font-family: Consolas, monospace",
+        "font-size: 12px",
+        "font-weight: 700",
+        "color: #fff",
+        "background: #1a1a1a",
+        "border: 1px solid #d0202e",
+        "border-radius: 4px",
+        "padding: 6px 10px",
+        "opacity: 0",
+        "transition: opacity 0.4s ease",
+        "box-shadow: 0 2px 8px rgba(0,0,0,0.35)",
+      ].join(";");
+      document.documentElement.appendChild(badgeEl);
+    }
+    badgeEl.textContent = `PRY · ${count} sensitive item${count === 1 ? "" : "s"} masked on screen`;
+    badgeEl.style.opacity = "1";
+    clearTimeout(badgeHideTimer);
+    badgeHideTimer = window.setTimeout(() => {
+      if (badgeEl) badgeEl.style.opacity = "0";
+    }, 4000);
+  } catch {
+    // A badge must never break perception.
+  }
 }
 
 function getSensitiveKind(el: Element): string {

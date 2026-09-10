@@ -402,6 +402,26 @@
     </div>
 
     <div class="section">
+      <div class="section-title">On-Device ML (Tier 0)</div>
+      <div class="section-subtitle">Local models — inference never leaves the device. Missing models degrade to the non-ML path automatically.</div>
+      <div class="field-row" style="margin-top: 8px;">
+        <div class="field-group">
+          <label class="field-label">NER Detection (names/orgs/locations)</label>
+          <div style="padding-top: 6px;">
+            <input type="checkbox" class="toggle" id="ml-ner" checked />
+          </div>
+        </div>
+        <div class="field-group">
+          <label class="field-label">Injection Guard (page text)</label>
+          <div style="padding-top: 6px;">
+            <input type="checkbox" class="toggle" id="ml-guard" checked />
+          </div>
+        </div>
+      </div>
+      <p class="section-subtitle" style="margin-top: 8px;">Fetch models: <code>node scripts/fetch-models.mjs</code> then rebuild. Without them these toggles are no-ops.</p>
+    </div>
+
+    <div class="section">
       <div class="section-title">ElevenLabs Voice</div>
       <div class="section-subtitle">Voice task input (Scribe) and spoken narration (Flash v2.5). Off by default.</div>
       <div class="field-row" style="margin-top: 8px;">

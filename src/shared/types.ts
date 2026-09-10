@@ -273,6 +273,20 @@ export interface Settings {
   privacy: PrivacySettings;
   /** ElevenLabs voice (hack branch, off by default). */
   elevenlabs: ElevenLabsSettings;
+  /**
+   * On-device ML (Tier 0). Both flags default ON because the runtime
+   * degrades automatically: when a model file is missing the feature falls
+   * back to the non-ML path (regex/checksum detection, regex injection
+   * guard, skin-color faces). Fetch models with scripts/fetch-models.mjs.
+   */
+  ml: MlSettings;
+}
+
+export interface MlSettings {
+  /** NER detection (GLiNER-style token classification) fused into the detector. */
+  ner: boolean;
+  /** Prompt-injection classifier scanning page text before the planner. */
+  guard: boolean;
 }
 
 export interface VisionSettings {
@@ -341,6 +355,10 @@ export const DEFAULT_SETTINGS: Settings = {
     sttEnabled: false,
     ttsEnabled: false,
   },
+  ml: {
+    ner: true,
+    guard: true,
+  },
 };
 
 /** The shape stored before multi-provider support landed. */
@@ -376,6 +394,7 @@ export function normaliseSettings(stored: unknown): Settings {
     },
     privacy: { ...DEFAULT_SETTINGS.privacy, ...(raw.privacy ?? {}) },
     elevenlabs: { ...DEFAULT_SETTINGS.elevenlabs, ...(raw.elevenlabs ?? {}) },
+    ml: { ...DEFAULT_SETTINGS.ml, ...(raw.ml ?? {}) },
   };
 
   // Pre-multi-provider installs stored a bare Anthropic key and model.

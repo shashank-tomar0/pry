@@ -21,6 +21,10 @@ const elApiKeyEl = $<HTMLInputElement>("elevenlabs-api-key");
 const elVoiceIdEl = $<HTMLInputElement>("elevenlabs-voice-id");
 const elSttEl = $<HTMLInputElement>("elevenlabs-stt-enabled");
 const elTtsEl = $<HTMLInputElement>("elevenlabs-tts-enabled");
+
+// On-device ML (Tier 0).
+const mlNerEl = $<HTMLInputElement>("ml-ner");
+const mlGuardEl = $<HTMLInputElement>("ml-guard");
 const refreshBtn = $<HTMLButtonElement>("refresh-models");
 const savedEl = $("saved");
 const activeModelDisplay = $("active-model-display");
@@ -115,6 +119,10 @@ function renderAll(): void {
   elVoiceIdEl.value = settings.elevenlabs.voiceId;
   elSttEl.checked = settings.elevenlabs.sttEnabled;
   elTtsEl.checked = settings.elevenlabs.ttsEnabled;
+
+  // On-device ML.
+  mlNerEl.checked = settings.ml.ner;
+  mlGuardEl.checked = settings.ml.guard;
 
   // Privacy.
   blurFacesEl.checked = settings.privacy.blurFaces;
@@ -272,6 +280,8 @@ $("save").addEventListener("click", async () => {
   settings.elevenlabs.voiceId = elVoiceIdEl.value.trim() || "21m00Tcm4TlvDq8ikWAM";
   settings.elevenlabs.sttEnabled = elSttEl.checked;
   settings.elevenlabs.ttsEnabled = elTtsEl.checked;
+  settings.ml.ner = mlNerEl.checked;
+  settings.ml.guard = mlGuardEl.checked;
   if ((settings.elevenlabs.sttEnabled || settings.elevenlabs.ttsEnabled)
       && !settings.elevenlabs.apiKey) {
     savedEl.className = "status-msg bad";

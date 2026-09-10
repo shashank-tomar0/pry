@@ -1,5 +1,5 @@
 import * as esbuild from "esbuild";
-import { cp, mkdir, rm } from "node:fs/promises";
+import { cp, mkdir, rm, readdir } from "node:fs/promises";
 
 const watch = process.argv.includes("--watch");
 
@@ -42,6 +42,29 @@ try {
 } catch {
   // Models directory may not exist yet — that's fine, the extension
   // degrades gracefully to DOM-only perception.
+}
+
+// ─── ML runtime assets (Tier 0) ──────────────────────────────────────────────
+// ONNX Runtime wasm binaries (transformers.js resolves them from this exact
+// directory) and the MediaPipe tasks-vision wasm (BlazeFace). Both are
+// vendored so no inference code is ever fetched from a CDN.
+try {
+  await mkdir("dist/vendor/ort", { recursive: true });
+  for (const f of await readdir("node_modules/onnxruntime-web/dist")) {
+    if (f.endsWith(".wasm") || f.endsWith(".mjs")) {
+      await cp(`node_modules/onnxruntime-web/dist/${f}`, `dist/vendor/ort/${f}`);
+    }
+  }
+} catch {
+  // onnxruntime-web not installed — ML features degrade, extension still works.
+}
+try {
+  await mkdir("dist/vendor/mediapipe/wasm", { recursive: true });
+  for (const f of await readdir("node_modules/@mediapipe/tasks-vision/wasm")) {
+    await cp(`node_modules/@mediapipe/tasks-vision/wasm/${f}`, `dist/vendor/mediapipe/wasm/${f}`);
+  }
+} catch {
+  // Same degrade: BlazeFace falls back to skin-color.
 }
 
 /**

@@ -37,8 +37,11 @@ import { getApplicableRules, buildSuppressionKeys, recommendsLLMOnly } from "./l
 import { getLessons, matchLessons } from "./lessons";
 import { getTrajectories, matchTrajectories } from "./trajectories";
 import { piiKindFromOcrLabel } from "./reocr-verification";
+import type { DetectedPII } from "./pii-detector";
 import { observeWithVision, VISION_SUPPORTED, VISION_DEFAULT_MODELS } from "./vision";
 import { recordWire, tokensIn, scanForLeaks } from "./wire-log";
+import { requestMlNer, requestMlGuard } from "./ml-bridge";
+import { fuseDetections, type NerSpanInput } from "./detector-v2";
 import {
   initLedger, recordSnapshot, recordDetections,
   recordAction as ledgerRecordAction,
@@ -115,6 +118,11 @@ interface SanitizeCtx {
   ruleCount: number;
   /** When false, DOM PII is redacted directly instead of tokenized (user toggle). */
   tokenize: boolean;
+  /**
+   * Tier-0 NER spans (Detection v2), fetched per snapshot by the caller and
+   * fused into detection here. Fused first so tokenize/redact see one list.
+   */
+  mlDetections?: DetectedPII[];
 }
 
 const EMPTY_SANITIZE_CTX: SanitizeCtx = { fpKeys: new Set(), llmOnly: false, ruleCount: 0, tokenize: true };
@@ -186,6 +194,25 @@ function sanitizeSnapshot(
   });
   const allDetections = [...keptRegex, ...keptContextual];
 
+  // 2.5 Detection v2 fusion: NER spans (fetched per snapshot by the caller)
+  // merge with the regex/contextual detections. Checksum-backed detections
+  // win duplicates; NER adds the recall the patterns never had.
+  let mlMerged: Array<{ kind: string; method: string; confidence: number }> = [];
+  if (ctx.mlDetections && ctx.mlDetections.length > 0) {
+    const fused = fuseDetections(allDetections, ctx.mlDetections.map((d) => ({
+      text: d.value ?? "",
+      label: d.label.startsWith("NER ") ? d.label.slice(4) : d.label,
+      score: d.confidence,
+    })));
+    allDetections.length = 0;
+    allDetections.push(...fused.detections);
+    mlMerged = ctx.mlDetections.map((d) => ({
+      kind: d.kind,
+      method: "ml_ner",
+      confidence: d.confidence,
+    }));
+  }
+
   // 3. Tokenize the values the detectors actually flagged (names, emails,
   //    phones, ID numbers) so they become vault tokens the LLM can reference
   //    instead of raw values. When the user disabled tokenization, skip the
@@ -228,6 +255,7 @@ function sanitizeSnapshot(
     detections: [
       ...keptRegex.map((d) => ({ kind: d.kind, method: "regex", confidence: d.confidence })),
       ...keptContextual.map((d) => ({ kind: d.kind, method: "contextual", confidence: d.confidence })),
+      ...mlMerged,
     ],
     suppressed,
     rejected: detailed.rejected.map((r) => ({
@@ -444,6 +472,10 @@ export async function runTask(
   }
 
   let piiTotal = 0;
+  const mlFlags = {
+    ner: settings.ml?.ner !== false,
+    guard: settings.ml?.guard !== false,
+  };
   // Latest DOM (text) detections for the audit view — the screenshots only
   // carry visual detections, so without this the proof panel hides the emails,
   // phones and ID numbers the DOM sanitizer actually tokenized.
@@ -451,6 +483,49 @@ export async function runTask(
   if (snapshot) {
     // Record snapshot in privacy ledger.
     recordSnapshot(snapshot.url, snapshot.title, snapshot.elements.length).catch(() => {});
+
+    // Tier-0 NER (Detection v2): fetch spans for the page text before
+    // sanitizing so the fusion layer sees them. Degrades to [] when the
+    // model is missing or slow; the run never stalls on it.
+    try {
+      const spans: NerSpanInput[] = await requestMlNer(snapshot.text, mlFlags, signal);
+      if (spans.length > 0) {
+        sanitizeCtx.mlDetections = spans.map((s) => ({
+          kind: "pii_text" as const,
+          value: s.text,
+          confidence: Math.min(0.95, Math.max(0.5, s.score)),
+          label: `NER ${s.label}`,
+        }));
+        emit({
+          kind: "entry",
+          entry: {
+            id: nextId(),
+            role: "system",
+            text: `On-device NER: ${spans.length} name/location span(s) detected by the local model.`,
+          },
+        });
+      }
+    } catch {
+      // NER is additive — never block the run.
+    }
+
+    // Tier-0 injection guard: the model's semantic verdict on this page's
+    // text, announced alongside the regex detector's opinion.
+    try {
+      const verdict = await requestMlGuard(snapshot.text, mlFlags, signal);
+      if (verdict?.injection) {
+        emit({
+          kind: "entry",
+          entry: {
+            id: nextId(),
+            role: "system",
+            text: `Injection guard: page text scored ${verdict.score.toFixed(2)} (${verdict.label}) by the local classifier. Treated as data, not instructions.`,
+          },
+        });
+      }
+    } catch {
+      // Same contract — additive, never blocking.
+    }
 
     const { sanitized, piiCount, detections, suppressed, rejected } = sanitizeSnapshot(snapshot, sanitizeCtx);
     snapshot = sanitized;

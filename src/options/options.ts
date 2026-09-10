@@ -269,7 +269,7 @@ $("save").addEventListener("click", async () => {
   // a no-op (the side panel checks the flag + key together), but warn so
   // users know nothing will happen.
   settings.elevenlabs.apiKey = elApiKeyEl.value.trim();
-  settings.elevenlabs.voiceId = elVoiceIdEl.value.trim();
+  settings.elevenlabs.voiceId = elVoiceIdEl.value.trim() || "21m00Tcm4TlvDq8ikWAM";
   settings.elevenlabs.sttEnabled = elSttEl.checked;
   settings.elevenlabs.ttsEnabled = elTtsEl.checked;
   if ((settings.elevenlabs.sttEnabled || settings.elevenlabs.ttsEnabled)

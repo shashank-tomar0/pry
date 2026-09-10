@@ -30,13 +30,14 @@ async function bootstrapVoice(): Promise<void> {
   }
   if (micBtn) micBtn.classList.add("hidden");
 
-  if (!el?.apiKey || !el.voiceId || (!el.sttEnabled && !el.ttsEnabled)) return;
+  if (!el?.apiKey || (!el.sttEnabled && !el.ttsEnabled)) return;
+  const voiceId = el.voiceId?.trim() || "21m00Tcm4TlvDq8ikWAM";
 
   const { VoiceController } = await import("./voice-controller");
 
   voice = new VoiceController({
     apiKey: el.apiKey,
-    voiceId: el.voiceId,
+    voiceId,
     submitTask: (task) => void submit(task),
     setUserEntryText: (text) => {
       if (taskInput) taskInput.value = text;
@@ -118,6 +119,7 @@ const nodes = new Map<string, HTMLElement>();
 const rawTexts = new Map<string, string>();
 let pendingConfirmId: string | null = null;
 let perceptionCount = 0;
+let currentRunAssistantId: string | null = null;
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -551,6 +553,9 @@ function appendAuditVerificationChip(audit: {
 chrome.runtime.onMessage.addListener((event: AgentEvent) => {
   switch (event.kind) {
     case "entry":
+      if (event.entry.role === "assistant") {
+        currentRunAssistantId = event.entry.id;
+      }
       render(event.entry);
       break;
 
@@ -583,17 +588,12 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
 
     case "status":
       setRunning(event.running);
-      // Voice-out: speak the complete final answer when the task finishes.
-      // rawTexts holds the full concatenated text after all streaming patches
-      // are applied — this is the right moment, not the first 200-char chunk.
-      if (!event.running && voice) {
-        const lastAssistantId = [...nodes.entries()]
-          .reverse()
-          .find(([, node]) => node.classList.contains("assistant"))?.[0];
-        if (lastAssistantId) {
-          const fullText = rawTexts.get(lastAssistantId) ?? "";
-          if (fullText) void maybeSpeak(fullText);
-        }
+      if (event.running) {
+        currentRunAssistantId = null;
+      } else if (voice && currentRunAssistantId) {
+        const fullText = (rawTexts.get(currentRunAssistantId) ?? "").trim();
+        currentRunAssistantId = null;
+        if (fullText) void maybeSpeak(fullText);
       }
       break;
 
@@ -1073,11 +1073,15 @@ taskInput.addEventListener("input", () => {
 
 // Stop button
 stopBtn.addEventListener("click", () => {
+  currentRunAssistantId = null;
+  voice?.cancel();
   void send({ kind: "stop" });
 });
 
 // New task
 $("new-task-btn").addEventListener("click", () => {
+  currentRunAssistantId = null;
+  voice?.cancel();
   void send({ kind: "reset" });
   nodes.clear();
   rawTexts.clear();

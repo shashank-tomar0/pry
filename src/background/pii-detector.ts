@@ -89,8 +89,10 @@ const INTERNATIONAL_ID_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
 
 const CARD_NUMBER_PATTERN = /\b(?:\d{4}[\s-]?){3}\d{4}\b/;
 const EMAIL_PATTERN = /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/;
-// Indian mobile: +91 XXXXX XXXXX or 10 digits starting 6-9.
-const PHONE_PATTERN = /\b(\+91[\s-]?)?[6-9]\d{9}\b/;
+// Indian mobile: +91 prefix or bare 10 digits starting 6-9, optional internal
+// separator ("98765 43210"). Matches the pixel-channel matcher in
+// shared/text-pii-patterns.ts so both channels see the same classes.
+const PHONE_PATTERN = /(?<!\d)(?:\+91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?!\d)/g;
 // Generic phone-looking numbers used inside phone-labeled fields are handled
 // contextually — this free-text channel only flags unambiguous patterns.
 

@@ -1516,4 +1516,60 @@ ok("mintScribeToken rejects empty key with a clear message",
     }
   })());
 
+// ─── Scenario AA: pixel-channel PII matchers (the text-file leak fix) ──────
+// The screenshot redaction channel now uses the SAME matchers as the text
+// channel. These pin: emails/phones found in plain text, checksum-validated
+// IDs, lookalikes rejected, and overlap de-duplication.
+console.log("\n=== Scenario AA: pixel-channel PII matchers (matchPiiInText) ===\n");
+
+const { matchPiiInText } = await import("../src/shared/text-pii-patterns.ts");
+
+// Email in plain text — the exact class the tester's text-file leak exposed.
+const emailHits = matchPiiInText("reach me at rahul.sharma@gmail.com anytime");
+ok("email in plain text is detected",
+  emailHits.some((m) => m.kind === "email" && m.value === "rahul.sharma@gmail.com"),
+  JSON.stringify(emailHits));
+
+// Indian phone, both formats.
+ok("+91 formatted phone detected",
+  matchPiiInText("call +91 98765 43210 now").some((m) => m.kind === "phone"));
+ok("bare 10-digit phone detected",
+  matchPiiInText("call 9876543210 now").some((m) => m.kind === "phone"));
+
+// Checksum-validated IDs pass; lookalikes are rejected exactly like the
+// text channel rejects them (no over-redaction of order numbers).
+const pxSeed = "23456789012";
+const pxAadhaar = pxSeed + verhoeffCheckDigit(pxSeed);
+const idHits = matchPiiInText(`Aadhaar: ${pxAadhaar.slice(0,4)} ${pxAadhaar.slice(4,8)} ${pxAadhaar.slice(8)}`);
+ok("formatted Verhoeff-valid Aadhaar detected as id_text",
+  idHits.some((m) => m.kind === "id_text" && m.label === "Aadhaar number"),
+  JSON.stringify(idHits));
+const pxBad = pxAadhaar.slice(0, 11) + (pxAadhaar[11] === "9" ? "8" : String(Number(pxAadhaar[11]) + 1));
+ok("checksum-invalid Aadhaar lookalike rejected",
+  !matchPiiInText(`Order ${pxBad.slice(0,4)} ${pxBad.slice(4,8)} ${pxBad.slice(8)}`)
+    .some((m) => m.label === "Aadhaar number"));
+ok("Luhn-valid card detected", matchPiiInText("card 4111 1111 1111 1111")
+  .some((m) => m.label === "Card number"));
+ok("Luhn-invalid card rejected",
+  !matchPiiInText("card 4111 1111 1111 1112").some((m) => m.label === "Card number"));
+ok("PAN detected", matchPiiInText("PAN ABCDE1234F")
+  .some((m) => m.kind === "id_text" && m.label === "PAN card"));
+
+// Overlap de-dup: a formatted Aadhaar must not ALSO match as a bare phone
+// (12 digits could partially overlap the phone shape without the guard).
+const overlap = matchPiiInText("id 623456789012 and email a@b.co");
+ok("no phone match inside a 12-digit id run",
+  !overlap.some((m) => m.kind === "phone" && m.value.length < 12 && /6234567890/.test(m.value)),
+  JSON.stringify(overlap));
+
+// Clean text produces nothing (no false positives on prose).
+ok("ordinary prose yields no matches",
+  matchPiiInText("The quick brown fox jumps over the lazy dog near the riverbank.").length === 0);
+
+// Position data is exact enough to build a Range (start < end, in bounds).
+const positioned = matchPiiInText("email foo.bar@x.co here");
+ok("match positions are exact and ordered",
+  positioned.every((m) => m.start < m.end && m.end <= "email foo.bar@x.co here".length)
+    && positioned[0].start === 6);
+
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

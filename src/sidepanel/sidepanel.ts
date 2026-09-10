@@ -17,6 +17,9 @@ const stopBtn = $("stop-btn");
 // .ttsEnabled. Until those are on, no Scribe WS, no Flash TTS, no mic usage.
 import type { VoiceController } from "./voice-controller";
 let voice: VoiceController | null = null;
+// Mic listeners attach exactly once (bootstrapVoice runs on every settings
+// save; re-adding pointer listeners would stack handlers on the same button).
+let micListenersAttached = false;
 
 async function bootstrapVoice(): Promise<void> {
   const settings = (await send({ kind: "get-state" })) as { settings?: import("../shared/types").Settings } | undefined;
@@ -58,7 +61,10 @@ async function bootstrapVoice(): Promise<void> {
   });
 
   // Mic button: hold-to-talk. Press to start, release to commit.
-  if (micBtn) {
+  // Listeners reference the module-level `voice` (not a captured instance),
+  // so they stay correct across re-bootstraps — attach them only once.
+  if (micBtn && !micListenersAttached) {
+    micListenersAttached = true;
     const press = async (ev: PointerEvent) => {
       ev.preventDefault();
       micBtn.setPointerCapture(ev.pointerId);

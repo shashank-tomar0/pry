@@ -19,7 +19,6 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.120.0",
-    "@elevenlabs/client": "^1.25.0",
     "@tesseract.js-data/eng": "^1.0.0",
     "openai": "^7.5.0",
     "tesseract.js": "^7.0.0"

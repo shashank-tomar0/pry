@@ -1701,4 +1701,23 @@ wireLog.clearWire();
 const wiped = (await chrome.storage.local.get("pry-wire-log"))["pry-wire-log"];
 ok("clearWire wipes persisted records", !wiped || wiped.length === 0);
 
+// ── NER→pixel bridge: span-state channel ───────────────────────────────────
+console.log("\n=== Scenario AD: NER→pixel bridge (span state) ===\n");
+
+const { setActiveNerSpans, getActiveNerSpans } = await import("../src/background/ml-bridge.ts");
+
+setActiveNerSpans(["Priya Sharma", "  Priya Sharma  ", "ab", "", "Acme Corp", "Acme Corp", "Delhi", "xxxxx"]);
+const stored = getActiveNerSpans();
+ok("bridge stores deduped, trimmed NER spans",
+  stored.length === 4 && stored.includes("Priya Sharma") && stored.includes("Acme Corp") && stored.includes("Delhi"),
+  JSON.stringify(stored));
+ok("bridge drops sub-3-char and empty spans",
+  !stored.includes("ab") && !stored.includes(""));
+ok("getActiveNerSpans returns a copy — callers cannot mutate state",
+  (() => { const s = getActiveNerSpans(); s.push("injected"); return getActiveNerSpans().length === 4; })());
+setActiveNerSpans(Array.from({ length: 20 }, (_, i) => `span-${i}`));
+ok("bridge caps spans at 12 (locate message size bound)", getActiveNerSpans().length === 12);
+setActiveNerSpans([]);
+ok("clearing spans empties the bridge (no cross-page stale spans)", getActiveNerSpans().length === 0);
+
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

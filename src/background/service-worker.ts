@@ -11,6 +11,7 @@ import { createTripwireAggregator } from "./tripwire-aggregator";
 import { normaliseSettings } from "../shared/types";
 import { tokenizer } from "./tokenizer";
 import { clearWire, wireRecords } from "./wire-log";
+import { getActiveNerSpans } from "./ml-bridge";
 import { runTask } from "./agent";
 import { createPlanner } from "./providers";
 import { generateLessons } from "./lesson-generator";
@@ -352,15 +353,39 @@ async function getSensitiveRegions(tabId: number): Promise<{
       await new Promise((r) => setTimeout(r, 100));
     }
 
-    const result = (await callContent({ kind: "get-sensitive-regions" })) as
-      | { ok: true; value: { sensitiveRegions?: unknown[]; dpr?: number } }
-      | { ok: false; reason: "timeout" | "error" };
-    if (!result.ok || !result.value.sensitiveRegions) {
+    // Fire both region sources in parallel: the DOM/regex channel AND the
+    // NER→pixel bridge (model-found spans located in painted text). locateSpans
+    // only returns rects where that exact text is visible, so spans left over
+    // from a previous page can never over-redact the current one.
+    const activeNerSpans = getActiveNerSpans();
+    const [result, nerResult] = await Promise.all([
+      callContent({ kind: "get-sensitive-regions" }),
+      activeNerSpans.length > 0
+        ? callContent({ kind: "locate-spans", spans: activeNerSpans })
+        : Promise.resolve(null),
+    ]);
+    const nerValue = nerResult?.ok
+      ? (nerResult.value as { sensitiveRegions?: unknown[] } | null)
+      : null;
+    if (!result.ok) {
       console.log("[PRY] No sensitive regions returned from content script");
       return null;
     }
-    console.log(`[PRY] Content script found ${(result.value.sensitiveRegions as unknown[]).length} sensitive regions, DPR=${result.value.dpr}`);
-    return { regions: result.value.sensitiveRegions as never, dpr: result.value.dpr ?? 1 };
+    const value = result.value as { sensitiveRegions?: unknown[]; dpr?: number };
+    if (!value.sensitiveRegions) {
+      console.log("[PRY] No sensitive regions returned from content script");
+      return null;
+    }
+    const regions = value.sensitiveRegions as Array<{
+      x: number; y: number; width: number; height: number; kind: string; label: string;
+    }>;
+    let nerFound = 0;
+    if (nerValue?.sensitiveRegions) {
+      nerFound = nerValue.sensitiveRegions.length;
+      regions.push(...(nerValue.sensitiveRegions as typeof regions));
+    }
+    console.log(`[PRY] Content script found ${regions.length} sensitive regions (${nerFound} from on-device NER), DPR=${value.dpr}`);
+    return { regions, dpr: value.dpr ?? 1 };
   } catch (err) {
     console.warn("[PRY] getSensitiveRegions failed:", err);
     return null;

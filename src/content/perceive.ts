@@ -494,22 +494,29 @@ export function getSensitiveRegions(): SensitiveRegion[] {
 
   // On-screen receipt (the user-facing box): shows how many sensitive items
   // were just located on THIS screen. Auto-fades; never intercepts input.
-  showDetectionBadge(regions.length);
+  lastRegionCount = regions.length;
+  showDetectionBadge([`${regions.length} sensitive item${regions.length === 1 ? "" : "s"} masked on screen`]);
 
   return regions;
 }
+
+// Last DOM/regex region count, so the NER receipt can report the combined
+// total instead of clobbering the DOM channel's line.
+let lastRegionCount = 0;
 
 let badgeEl: HTMLElement | null = null;
 let badgeHideTimer: number | undefined;
 
 /**
- * Floating count chip on the page itself. Created once, reused, faded out
+ * Floating receipt chip on the page itself. Created once, reused, faded out
  * after a few seconds so it never becomes part of the page. pointer-events
- * are disabled — it is a receipt, not a control.
+ * are disabled — it is a receipt, not a control. Each entry in `lines` is
+ * rendered as its own row (regex count, NER provenance, …).
  */
-function showDetectionBadge(count: number): void {
+function showDetectionBadge(lines: string[]): void {
   try {
-    if (count <= 0) return;
+    const rows = lines.filter((l) => l && l.trim());
+    if (rows.length === 0) return;
     if (!badgeEl || !badgeEl.isConnected) {
       badgeEl = document.createElement("div");
       badgeEl.setAttribute("data-pry-badge", "");
@@ -530,10 +537,13 @@ function showDetectionBadge(count: number): void {
         "opacity: 0",
         "transition: opacity 0.4s ease",
         "box-shadow: 0 2px 8px rgba(0,0,0,0.35)",
+        "white-space: nowrap",
       ].join(";");
       document.documentElement.appendChild(badgeEl);
     }
-    badgeEl.textContent = `PRY · ${count} sensitive item${count === 1 ? "" : "s"} masked on screen`;
+    badgeEl.innerHTML = rows
+      .map((line) => `<div>${line.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</div>`)
+      .join("");
     badgeEl.style.opacity = "1";
     clearTimeout(badgeHideTimer);
     badgeHideTimer = window.setTimeout(() => {
@@ -542,6 +552,70 @@ function showDetectionBadge(count: number): void {
   } catch {
     // A badge must never break perception.
   }
+}
+
+/**
+ * The NER→pixel bridge: the offscreen model says "this text contains these
+ * names/orgs/locations" — this locates each span in the visible text nodes
+ * and returns solid-black regions, exactly like the regex channel. This is
+ * what makes "GLiNER detected these PII" true ON SCREEN, closing the Tier-0
+ * gap where names in prose were tokenized but stayed readable in pixels.
+ */
+export function locateSpans(spans: string[]): SensitiveRegion[] {
+  const regions: SensitiveRegion[] = [];
+  if (!spans || spans.length === 0) return regions;
+  const wanted = spans.map((s) => s.trim()).filter((s) => s.length >= 3).slice(0, 12);
+  if (wanted.length === 0) return regions;
+
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let node: Node | null;
+  while ((node = walker.nextNode())) {
+    const text = node.textContent ?? "";
+    if (text.length < 3) continue;
+    for (const span of wanted) {
+      let from = 0;
+      let hit = text.indexOf(span, from);
+      while (hit !== -1) {
+        try {
+          const range = document.createRange();
+          range.setStart(node, hit);
+          range.setEnd(node, hit + span.length);
+          const rects = Array.from(range.getClientRects()).filter(
+            (r) => r.width > 0 && r.height > 0,
+          );
+          range.detach?.();
+          for (const rect of rects) {
+            if (rect.top >= innerHeight || rect.bottom <= 0) continue;
+            regions.push({
+              x: Math.round(rect.left),
+              y: Math.round(rect.top),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height),
+              kind: "ner_text",
+              label: `NER: ${span.slice(0, 24)}`,
+            });
+          }
+        } catch {
+          // Detached node mid-walk — skip this occurrence.
+        }
+        from = hit + span.length;
+        hit = text.indexOf(span, from);
+      }
+    }
+  }
+
+  // On-screen receipt with provenance: the combined total, plus the model's
+  // own contribution — "the model found these, not a regex".
+  if (regions.length > 0) {
+    const lines: string[] = [];
+    if (lastRegionCount > 0) {
+      lines.push(`${lastRegionCount} sensitive item${lastRegionCount === 1 ? "" : "s"} masked on screen`);
+    }
+    lines.push(`+${regions.length} name/location span${regions.length === 1 ? "" : "s"} from on-device model`);
+    showDetectionBadge(lines);
+  }
+
+  return regions;
 }
 
 function getSensitiveKind(el: Element): string {

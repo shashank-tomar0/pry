@@ -347,17 +347,28 @@ tripwire scanner, checksum validation, learning loop). Of the original roadmap:
   ledger, and a live dashboard.
 - **Egress accounting** — every byte sent to a remote planner is counted and
   shown honestly in the toolbar badge; local-only (Ollama) runs show 0.
+- **On-device ML (Tier 0)** — BlazeFace face detection (bundled), an NER
+  token-classification model for PER/ORG/LOC spans (loaded from `models/ner/`
+  when present), and a prompt-injection classifier (from `models/guard/` when
+  present), all running locally in the offscreen document. Missing models
+  degrade automatically to the regex + checksum path and the transcript says
+  so out loud — never a silent claim.
+- **NER→pixel bridge** — model-found name/location spans are located in the
+  painted DOM and solid black-boxed in the screenshot, with provenance shown
+  on the on-screen badge ("+N … from on-device model").
+- **In-page PII badge overlay** — a floating count chip on the page itself
+  during every perception, auto-fading, pointer-transparent.
 
 ### Still on the roadmap (not shipped — no fake claims)
 - **On-device vision models** — Florence-2 / PP-OCR / ONNX page understanding
-  (the `models/` directory is reserved for these; today's perception is DOM +
-  screenshot redaction + optional provider VLM, never raw pixels).
-- **In-page PII badge overlay** — a floating count chip on the page itself.
+  (perception stays DOM + screenshot redaction + optional provider VLM, never
+  raw pixels).
 - **Adaptive prompt compression** — context-budget-aware snapshot trimming.
 - **Session replay** — step-by-step playback of a completed run.
 
 These remain future work precisely so the shipped feature set stays honest:
-nothing in v1.0 depends on files that are not bundled in `dist/`.
+nothing in v1.0 depends on files that are not bundled in `dist/` (the ML
+runtimes are fully vendored; model files load only from the package itself).
 
 ## License
 

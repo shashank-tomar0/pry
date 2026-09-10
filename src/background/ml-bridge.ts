@@ -71,3 +71,51 @@ export async function requestMlGuard(
   );
   return res.verdict ?? null;
 }
+
+// ─── NER span state (the NER→pixel bridge) ──────────────────────────────────
+// runTask stores the spans the model found on the current snapshot; the
+// screenshot path reads them to black-box those exact names in the pixels.
+// Without this, a NER detection is tokenized in the text channel but the
+// name stays readable on screen — the two-channel bug, model edition.
+
+let activeNerSpans: string[] = [];
+
+// Hygiene for the cross-message channel: dedupe, trim, drop sub-3-char noise,
+// and cap at 12 so the locate-spans message stays small even if the model
+// returns a huge span list. Mirrors the guards locateSpans applies again on
+// the content side — defense in depth.
+export function setActiveNerSpans(spans: string[]): void {
+  const seen = new Set<string>();
+  const clean: string[] = [];
+  for (const s of spans ?? []) {
+    const t = (s ?? "").trim();
+    if (t.length < 3 || seen.has(t) || clean.length >= 12) continue;
+    seen.add(t);
+    clean.push(t);
+  }
+  activeNerSpans = clean;
+}
+
+export function getActiveNerSpans(): string[] {
+  // Copy: callers (the capture path) must never be able to mutate the state
+  // that the next turn's screenshot depends on.
+  return [...activeNerSpans];
+}
+
+/** Probe which model files actually shipped (cheap HEAD on package URLs). */
+export async function probeMlFiles(): Promise<{ ner: boolean; guard: boolean; face: boolean }> {
+  const probe = async (path: string): Promise<boolean> => {
+    try {
+      const res = await fetch(chrome.runtime.getURL(path), { method: "HEAD" });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  };
+  const [ner, guard, face] = await Promise.all([
+    probe("models/ner/onnx/model_quantized.onnx"),
+    probe("models/guard/onnx/model_quantized.onnx"),
+    probe("models/blazeface/face_detection_short_range.tflite"),
+  ]);
+  return { ner, guard, face };
+}

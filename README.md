@@ -34,7 +34,7 @@ Modern browser agents — Browser Use, Anthropic Computer Use, OpenAI Operator �
 - **Screenshot Redaction** — The offscreen document captures `captureVisibleTab`, applies DOM-guided masking to credential fields, and detects faces via Chrome FaceDetector API with a skin-color heuristic fallback. Redacted screenshots are JPEG-compressed at 0.85 quality.
 - **Safety Gate** — A single enforcement point runs before every action. The agent refuses to type into password fields, blocks values that match PII patterns, and requires user confirmation for irreversible actions (purchases, deletions, submissions).
 - **Deterministic Planner** — Simple tasks resolve without any LLM call: click by text match, fill by label, scroll, navigate, press key. Sub-100ms latency for common form interactions.
-- **Multi-Provider LLM Support** — Anthropic, OpenAI, OpenRouter, and Ollama (local). The agent adapts its system prompt size for small local models to avoid context overflow.
+- **Multi-Provider LLM Support** — Anthropic, OpenAI, OpenRouter, Groq, NVIDIA NIM, and Ollama (local). The agent adapts its system prompt size for small local models to avoid context overflow.
 - **Loop Detection** — Tracks recent actions and breaks out when the same action repeats beyond a threshold, preventing infinite loops on unresponsive pages.
 - **Session History** — Completed tasks are saved to `chrome.storage.local` with transcripts, PII metrics, and duration for later review.
 
@@ -232,7 +232,7 @@ The agent detects `provider === "ollama"` and applies several adaptations for lo
 | Safety gate | Pattern-matching enforcement | Blocks credential typing, confirms irreversible actions |
 | Storage | chrome.storage.local | Settings, session history |
 | Type safety | TypeScript 5.6 | End-to-end type checking |
-| Testing | Node headless harness (esbuild + assert) | Pipeline, tripwire black-box, and OCR verification (190+ assertions) |
+| Testing | Node headless harness (esbuild + assert) | Pipeline, tripwire black-box, OCR verification, wire log, ML fusion (300+ assertions) |
 
 ---
 
@@ -327,7 +327,7 @@ Open the extension options page and add an API key for Anthropic, OpenAI, or Ope
 ## Release Status (v1.0)
 
 What is documented above is what ships and is verified end-to-end by `npm run
-verify` (190 assertions: privacy pipeline, re-OCR pixel proof, MAIN-world
+verify` (300+ assertions: privacy pipeline, re-OCR pixel proof, MAIN-world
 tripwire scanner, checksum validation, learning loop). Of the original roadmap:
 
 ### Shipped and verified in v1.0

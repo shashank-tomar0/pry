@@ -467,14 +467,9 @@ export function getSensitiveRegions(): SensitiveRegion[] {
     });
   }
 
-  // 3. Scan visible text for ID numbers (Aadhaar, PAN, SSN, card numbers).
-  const idRegions = findTextRegions([
-    /\b\d{4}\s?\d{4}\s?\d{4}\b/,           // Aadhaar
-    /\b[A-Z]{5}\d{4}[A-Z]\b/,               // PAN
-    /\b\d{3}-\d{2}-\d{4}\b/,                // SSN
-    /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/, // Card numbers
-    /\b[A-Z]{2}\d{6,8}\b/,                   // Passport
-  ]);
+  // 3. Scan visible text for PII (emails, phones, checksum-validated IDs)
+  //    via the shared matchers — the same classes the text channel tokenizes.
+  const idRegions = findTextRegions();
   regions.push(...idRegions);
 
   // 4. Detect profile/avatar images that likely contain faces.
@@ -605,8 +600,7 @@ function findAssociatedLabel(el: Element): HTMLElement | null {
  * Every match gets Range-measured rectangles — one per wrapped line — and
  * checksum failures are skipped exactly like the text channel skips them.
  */
-function findTextRegions(patterns: RegExp[]): SensitiveRegion[] {
-  void patterns; // superseded by matchPiiInText; kept for call-site stability
+function findTextRegions(): SensitiveRegion[] {
   const regions: SensitiveRegion[] = [];
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   let node: Node | null;

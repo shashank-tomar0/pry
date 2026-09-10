@@ -96,6 +96,9 @@ const shared = {
   target: "chrome120",
   sourcemap: watch ? "inline" : false,
   minify: !watch,
+  // Production builds strip diagnostic console.log; warn/error survive
+  // (they carry the voice and recovery messages users need).
+  pure: watch ? [] : ["console.log"],
   logLevel: "info",
   define: {
     "process.env.NODE_ENV": watch ? '"development"' : '"production"',

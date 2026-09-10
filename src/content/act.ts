@@ -78,23 +78,21 @@ function describe(el: Element): string {
  * or a stale node all return fine while nothing changes. Telling the model
  * "no visible page reaction" turns a silent failure into a recoverable one.
  */
-function observeReaction(ms: number): Promise<number> {
-  return new Promise((resolve) => {
-    let count = 0;
-    const observer = new MutationObserver((mutations) => {
-      count += mutations.length;
-    });
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      characterData: true,
-    });
-    setTimeout(() => {
-      observer.disconnect();
-      resolve(count);
-    }, ms);
+function watchMutations(): { count: () => number; stop: () => void } {
+  let count = 0;
+  const observer = new MutationObserver((mutations) => {
+    count += mutations.length;
   });
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    characterData: true,
+  });
+  return {
+    count: () => count,
+    stop: () => observer.disconnect(),
+  };
 }
 
 function resolve(input: Record<string, unknown>): Element | string {
@@ -254,14 +252,16 @@ export async function act(action: AgentAction): Promise<ActionResult> {
         const el = resolve(input);
         if (typeof el === "string") return fail(el);
         await bringIntoView(el);
-        const reaction = observeReaction(CLICK_CEILING);
+        const reaction = watchMutations();
         realClick(el);
         // DOM-settle instead of a fixed sleep: fast on static pages, patient
-        // on slow mounts (cold Gmail compose). The observer above counts the
+        // on slow mounts (cold Gmail compose). The watcher counts the
         // mutations that arrived while settling, so the "Page reacted"
-        // verdict still measures real activity.
+        // verdict still measures real activity — and the count is read when
+        // settle resolves, not after a fixed window.
         await settle({ ceiling: CLICK_CEILING });
-        const updates = await reaction;
+        const updates = reaction.count();
+        reaction.stop();
         const verdict = updates > 0
           ? ` Page reacted (${updates} DOM updates).`
           : " NO visible page reaction — the click may have missed or the control is inert. Call read_page to confirm the state before retrying.";

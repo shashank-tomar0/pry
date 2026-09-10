@@ -16,3 +16,6 @@ eng.traineddata
 pry-live.html
 pry-io.html
 verify-landing.html
+.agents/
+.claude/
+skills-lock.json

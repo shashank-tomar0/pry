@@ -84,10 +84,19 @@ async function bootstrapVoice(): Promise<void> {
   }
 }
 
-/** Local status line shown only for voice events; falls back silently. */
+/** Local status line for voice events. Surfaces in the chat transcript as a
+ *  system entry so mic-permission denials and TTS errors are visible
+ *  (console.warn alone is invisible mid-demo). */
 function emitLocalStatus(text: string): void {
-  // We reuse the existing chat status pattern; voice errors are non-fatal.
   console.warn("[PRY voice]", text);
+  emit({
+    kind: "entry",
+    entry: {
+      id: `voice-${Date.now()}`,
+      role: "system",
+      text: `Voice: ${text}`,
+    },
+  });
 }
 
 /** Speak assistant text once a final answer arrives, gated on settings. */

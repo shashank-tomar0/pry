@@ -368,8 +368,16 @@ async function processScreenshot(
 
     if (rw <= 0 || rh <= 0) continue;
 
-    // Use blur for labels/plain input fields, solid mask for credentials/IDs.
-    const useBlur = region.kind === "credential_label" || region.kind === "input_field";
+    // Use blur for labels/plain input fields and for PII found in plain text
+    // (email/phone/id *_text spans from the pixel channel). Blur is right for
+    // text: a surrogate box drawn over a paragraph line would over-cover and
+    // look broken, while deterministic blur alters every pixel (re-OCR can
+    // still verify it). Everything else — credential/ID *fields* — gets the
+    // surrogate inpaint treatment.
+    const useBlur =
+      region.kind === "credential_label" ||
+      region.kind === "input_field" ||
+      region.kind.endsWith("_text");
 
     // full-mask credential regions (password/card/Aadhaar/API-key fields) are
     // gated by the user's maskCredentials toggle. Soft input-field blur always

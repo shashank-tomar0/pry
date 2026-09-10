@@ -1,5 +1,6 @@
 import type { ActionResult, AgentAction } from "../shared/types";
 import { lookup, snapshot } from "./perceive";
+import { settle, CLICK_CEILING } from "./settle";
 
 const fail = (detail: string): ActionResult => ({ ok: false, detail });
 const done = (detail: string): ActionResult => ({ ok: true, detail });
@@ -153,9 +154,11 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
     // Blur after submitting: sites keep autocomplete/search-suggestion
     // dropdowns open while the input holds focus (YouTube's suggestion panel
     // stayed open over the results and its option items then flooded the next
-    // page read, crowding out the real results). Losing focus closes them.
+    // page read). Losing focus closes them.
     (target as HTMLElement).blur?.();
-    await sleep(400);
+    // DOM-settle instead of a fixed 400ms: navigation commits get the full
+    // ceiling, no-op Enters return fast.
+    await settle({ start: 250, ceiling: 1500 });
   }
 
   // Ground truth beats intent: the page may reformat, truncate, chip or
@@ -203,8 +206,13 @@ export async function act(action: AgentAction): Promise<ActionResult> {
         const el = resolve(input);
         if (typeof el === "string") return fail(el);
         await bringIntoView(el);
-        const reaction = observeReaction(500);
+        const reaction = observeReaction(CLICK_CEILING);
         realClick(el);
+        // DOM-settle instead of a fixed sleep: fast on static pages, patient
+        // on slow mounts (cold Gmail compose). The observer above counts the
+        // mutations that arrived while settling, so the "Page reacted"
+        // verdict still measures real activity.
+        await settle({ ceiling: CLICK_CEILING });
         const updates = await reaction;
         const verdict = updates > 0
           ? ` Page reacted (${updates} DOM updates).`
@@ -248,7 +256,9 @@ export async function act(action: AgentAction): Promise<ActionResult> {
         const direction = input.direction === "up" ? -1 : 1;
         const amount = typeof input.amount === "number" ? input.amount : innerHeight * 0.8;
         scrollBy({ top: direction * amount, behavior: "instant" as ScrollBehavior });
-        await sleep(300);
+        // A scroll either moves the page immediately or never — keep the
+        // start window short, let lazy-loaded content extend the settle.
+        await settle({ start: 200, ceiling: 1200 });
         const atBottom = scrollY + innerHeight >= document.body.scrollHeight - 4;
         return done(
           `Scrolled ${input.direction === "up" ? "up" : "down"}. Now at y=${Math.round(scrollY)}` +
@@ -262,7 +272,7 @@ export async function act(action: AgentAction): Promise<ActionResult> {
         const init = { bubbles: true, cancelable: true, key, code: key };
         target.dispatchEvent(new KeyboardEvent("keydown", init));
         target.dispatchEvent(new KeyboardEvent("keyup", init));
-        await sleep(200);
+        await settle({ start: 150, ceiling: 600 });
         return done(`Pressed ${key}.`);
       }
 

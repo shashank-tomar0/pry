@@ -1,5 +1,5 @@
 import type { PageElement, PageSnapshot } from "../shared/types";
-import { isAadhaarNumber, isCardNumber } from "../shared/checksums";
+import { matchPiiInText } from "../shared/text-pii-patterns";
 
 /**
  * Elements from the last snapshot, indexed by the id handed to the planner.
@@ -547,49 +547,50 @@ function findAssociatedLabel(el: Element): HTMLElement | null {
 }
 
 /**
- * Find visible text regions matching regex patterns using TreeWalker.
- * Returns bounding boxes for matching text nodes.
+ * Find visible text regions carrying PII, using the SAME matchers the text
+ * channel tokenizes with (email, phone, checksum-validated IDs). This closes
+ * the two-channel gap: an email in plain text was tokenized for the model
+ * while remaining fully readable in the screenshot (observed live: PII in
+ * opened text files shipped unblurred in the audit's redacted pane).
+ *
+ * Every match gets Range-measured rectangles — one per wrapped line — and
+ * checksum failures are skipped exactly like the text channel skips them.
  */
 function findTextRegions(patterns: RegExp[]): SensitiveRegion[] {
+  void patterns; // superseded by matchPiiInText; kept for call-site stability
   const regions: SensitiveRegion[] = [];
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   let node: Node | null;
 
   while ((node = walker.nextNode())) {
     const text = node.textContent ?? "";
-    if (text.length < 8) continue; // Skip short text.
+    if (text.length < 6) continue; // shorter than the smallest match class
 
-    for (const pattern of patterns) {
-      const match = text.match(pattern);
-      if (match && match.index !== undefined) {
-        // ID-shaped numbers are not blacked out on regex alone: 12-digit
-        // lookalikes must pass Verhoeff and 16-digit ones must pass Luhn,
-        // otherwise order/reference numbers get masked as Aadhaar/cards.
-        const digits = match[0].replace(/\D/g, "");
-        if (digits.length === 12 && !isAadhaarNumber(digits)) continue;
-        if (digits.length === 16 && !isCardNumber(digits)) continue;
-
-        // Get the bounding box of the text node.
+    for (const match of matchPiiInText(text)) {
+      try {
         const range = document.createRange();
-        range.setStart(node, match.index);
-        range.setEnd(node, match.index + match[0].length);
-        const rect = range.getBoundingClientRect();
-        range.detach();
+        range.setStart(node, match.start);
+        range.setEnd(node, match.end);
+        // A wrapped span produces one rectangle per line: filling the union
+        // would cover half the paragraph (raidxAgent's spans.ts insight).
+        const rects = Array.from(range.getClientRects()).filter(
+          (r) => r.width > 0 && r.height > 0,
+        );
+        range.detach?.();
 
-        if (rect.width > 0 && rect.height > 0) {
-          // Only add if visible in viewport.
-          if (rect.top < innerHeight && rect.bottom > 0) {
-            regions.push({
-              x: Math.round(rect.left),
-              y: Math.round(rect.top),
-              width: Math.round(rect.width),
-              height: Math.round(rect.height),
-              kind: "id_text",
-              label: `ID number in text: ${match[0].slice(0, 8)}...`,
-            });
-          }
+        for (const rect of rects) {
+          if (rect.top >= innerHeight || rect.bottom <= 0) continue; // off-viewport
+          regions.push({
+            x: Math.round(rect.left),
+            y: Math.round(rect.top),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+            kind: `${match.kind}_text`,
+            label: `${match.label} in text`,
+          });
         }
-        break; // One match per text node is enough.
+      } catch {
+        // A detached or unusual node — skip this match, keep walking.
       }
     }
   }

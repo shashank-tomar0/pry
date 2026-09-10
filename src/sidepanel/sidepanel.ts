@@ -63,28 +63,33 @@ async function bootstrapVoice(): Promise<void> {
   // Mic button: hold-to-talk. Press to start, release to commit.
   // Listeners reference the module-level `voice` (not a captured instance),
   // so they stay correct across re-bootstraps — attach them only once.
-  if (micBtn && !micListenersAttached) {
-    micListenersAttached = true;
-    const press = async (ev: PointerEvent) => {
-      ev.preventDefault();
-      micBtn.setPointerCapture(ev.pointerId);
-      try {
-        await voice!.startListening();
-      } catch (err) {
-        emitLocalStatus(err instanceof Error ? err.message : String(err));
-      }
-    };
-    const release = async () => {
-      try {
-        await voice!.stopListening();
-      } catch {
-        voice!.cancel();
-      }
-    };
-    micBtn.addEventListener("pointerdown", (e) => void press(e));
-    micBtn.addEventListener("pointerup", () => void release());
-    micBtn.addEventListener("pointercancel", () => voice?.cancel());
-    // Fix: classList.remove overrides .hidden { display: none !important }
+  if (micBtn) {
+    if (!micListenersAttached) {
+      micListenersAttached = true;
+      const press = async (ev: PointerEvent) => {
+        ev.preventDefault();
+        micBtn.setPointerCapture(ev.pointerId);
+        try {
+          await voice!.startListening();
+        } catch (err) {
+          emitLocalStatus(err instanceof Error ? err.message : String(err));
+        }
+      };
+      const release = async () => {
+        try {
+          await voice!.stopListening();
+        } catch {
+          voice!.cancel();
+        }
+      };
+      micBtn.addEventListener("pointerdown", (e) => void press(e));
+      micBtn.addEventListener("pointerup", () => void release());
+      micBtn.addEventListener("pointercancel", () => voice?.cancel());
+    }
+    // Show the mic on EVERY bootstrap — the old code hid it at the top of
+    // this function and only re-showed it on first-ever attach, so a second
+    // settings save hid the mic for the rest of the session.
+    // classList.remove overrides .hidden { display: none !important }
     // (micBtn.hidden = false does NOT remove the CSS class)
     micBtn.classList.remove("hidden");
   }

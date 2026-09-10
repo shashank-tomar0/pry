@@ -1055,12 +1055,147 @@ body::after {
   border: 2px solid var(--color-ink);
   overflow: hidden;
   box-shadow: 2px 2px 0px var(--color-ink);
+  cursor: zoom-in;
+  background: var(--color-paper-2);
 }
 .screenshot-pair .shot img {
+  position: absolute;
+  inset: 0;
   width: 100%;
+  height: 100%;
   display: block;
-  object-fit: cover;
-  max-height: 100px;
+  object-fit: contain;
+}
+.screenshot-pair .shot .shot-overlay,
+.zoom-frame .zoom-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.screenshot-pair .shot .shot-overlay-mark,
+.zoom-frame .zoom-overlay-mark {
+  position: absolute;
+  border: 1px solid;
+  box-sizing: border-box;
+  opacity: 0.9;
+}
+.screenshot-pair .shot .shot-overlay-mark {
+  border-width: 1px;
+  outline: 1px dashed rgba(255, 255, 255, 0.65);
+  outline-offset: -2px;
+}
+.zoom-frame .zoom-overlay-mark {
+  border-width: 2px;
+  outline: 1px dashed rgba(255, 255, 255, 0.6);
+  outline-offset: -2px;
+}
+
+/* Re-OCR proof line in the audit. */
+.audit-verification { padding: 0 16px 10px; }
+.verify-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 2px solid var(--color-ink);
+  box-shadow: 2px 2px 0px var(--color-ink);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+}
+.verify-chip.ok { background: var(--color-teal); color: #052e2b; }
+.verify-chip.warn { background: #fdecec; color: #7f1d1d; border-color: #dc2626; }
+.verify-chip .verify-badge { letter-spacing: 0.08em; }
+.verify-chip .verify-summary { font-weight: 500; }
+.verify-meta {
+  margin-top: 3px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  color: var(--color-ink-mute);
+}
+.verify-leaks {
+  margin-top: 3px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  color: #b91c1c;
+}
+
+/* Zoom lightbox. */
+.zoom-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  background: rgba(10, 8, 5, 0.92);
+}
+.zoom-modal.hidden { display: none; }
+.zoom-backdrop { position: absolute; inset: 0; }
+.zoom-box {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 8px;
+}
+.zoom-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 0 8px;
+  z-index: 1;
+}
+.zoom-title {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--color-paper);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.zoom-toggle {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border: 1px solid var(--color-paper);
+  background: transparent;
+  color: var(--color-paper);
+  cursor: pointer;
+}
+.zoom-toggle:hover { background: var(--color-paper); color: var(--color-ink); }
+.zoom-body {
+  flex: 1;
+  overflow: auto;
+  border: 2px solid var(--color-paper);
+  background: #171310;
+}
+.zoom-frame {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+}
+.zoom-frame img {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  display: block;
+}
+.zoom-frame.zoom-one {
+  justify-content: flex-start;
+  width: max-content;
+  height: max-content;
+  min-width: 100%;
+  min-height: 100%;
+}
+.zoom-frame.zoom-one img {
+  max-width: none;
+  max-height: none;
 }
 .screenshot-pair .shot .shot-label {
   position: absolute;

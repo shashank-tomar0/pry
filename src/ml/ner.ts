@@ -40,8 +40,7 @@ async function getPipeline(): Promise<{ (t: string, o?: unknown): Promise<unknow
   return p;
 }
 
-/** ConLL labels worth redacting; MISC (events, products) is left alone. */
-const KEEP = new Set(["PER", "ORG", "LOC"]);
+import { keepLabel } from "../shared/ner-labels";
 
 /**
  * Detect person/organization/location spans in free text.
@@ -62,7 +61,7 @@ export async function detectSpans(text: string): Promise<NerSpan[]> {
         label: String(e.entity_group ?? "").toUpperCase(),
         score: Number(e.score ?? 0),
       }))
-      .filter((s) => s.text.length >= 3 && KEEP.has(s.label) && s.score > 0.5);
+      .filter((s) => s.text.length >= 3 && keepLabel(s.label) && s.score > 0.5);
   } catch {
     unavailable = true;
     return [];

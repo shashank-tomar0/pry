@@ -461,7 +461,7 @@ const MAX_AUDIT_ENTRIES = 10;
 function recordAuditEntry(data: {
   original?: string;
   redacted?: string;
-  detections: Array<{ kind: string; label: string; confidence: number }>;
+  detections: Array<{ kind: string; label: string; confidence: number; box?: { x: number; y: number; width: number; height: number } }>;
   tokens: Array<{ token: string; kind: string; sample?: string }>;
   redactedCount: number;
   verification?: VerificationResult;
@@ -480,7 +480,7 @@ function recordAuditEntry(data: {
 }
 
 function emitPrivacyAudit(): void {
-  const allDetections: Array<{ kind: string; label: string; confidence: number }> = [];
+  const allDetections: Array<{ kind: string; label: string; confidence: number; box?: { x: number; y: number; width: number; height: number } }> = [];
   const allTokens: Array<{ token: string; kind: string; sample?: string }> = [];
   let totalRedacted = 0;
 
@@ -491,6 +491,8 @@ function emitPrivacyAudit(): void {
   }
 
   // Take at most 5 screenshots for the audit (to keep the UI manageable).
+  // Each carries its OWN detections so the panel's proof overlays are drawn
+  // only on the frame they belong to — never bleeding boxes across frames.
   const screenshots = auditEntries
     .filter((e) => e.original || e.redacted)
     .slice(-5)
@@ -498,6 +500,7 @@ function emitPrivacyAudit(): void {
       original: e.original,
       redacted: e.redacted,
       timestamp: e.timestamp,
+      detections: e.detections,
     }));
 
   // Latest re-OCR verification result, shown as a proof badge in the audit.

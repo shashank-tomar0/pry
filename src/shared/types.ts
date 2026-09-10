@@ -171,11 +171,19 @@ export type AgentEvent =
           original?: string;
           redacted?: string;
           timestamp: number;
+          /** This frame's own detections — overlay proof, never another frame's. */
+          detections?: Array<{
+            kind: string;
+            label: string;
+            confidence: number;
+            box?: { x: number; y: number; width: number; height: number };
+          }>;
         }>;
         allDetections: Array<{
           kind: string;
           label: string;
           confidence: number;
+          box?: { x: number; y: number; width: number; height: number };
         }>;
         allTokens: Array<{ token: string; kind: string; sample?: string }>;
         totalRedacted: number;

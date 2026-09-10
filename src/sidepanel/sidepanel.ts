@@ -416,8 +416,13 @@ const KIND_EMOJI: Record<string, string> = {
 };
 
 function renderPrivacyAudit(audit: {
-  screenshots: Array<{ original?: string; redacted?: string; timestamp: number }>;
-  allDetections: Array<{ kind: string; label: string; confidence: number }>;
+  screenshots: Array<{
+    original?: string;
+    redacted?: string;
+    timestamp: number;
+    detections?: Array<{ kind: string; label: string; confidence: number; box?: { x: number; y: number; width: number; height: number } }>;
+  }>;
+  allDetections: Array<{ kind: string; label: string; confidence: number; box?: { x: number; y: number; width: number; height: number } }>;
   allTokens: Array<{ token: string; kind: string }>;
   totalRedacted: number;
   totalScreenshots: number;
@@ -451,26 +456,43 @@ function renderPrivacyAudit(audit: {
     </div>
   `;
 
-  // Screenshots before/after.
+  // Re-OCR proof line: the pixel-level verification of the shipped image.
+  const verificationEl = $("audit-verification");
+  if (audit.verification && audit.verification.regionsChecked > 0) {
+    const v = audit.verification;
+    const ok = v.verified;
+    const leaked = v.leakedPatterns.length > 0
+      ? `<div class="verify-leaks">${v.leakedPatterns.map(escapeHtml).join("<br/>")}</div>`
+      : "";
+    verificationEl.innerHTML = `
+      <div class="verify-chip ${ok ? "ok" : "warn"}">
+        <span class="verify-badge">${ok ? "✓ VERIFIED" : "⚠ WARNING"}</span>
+        <span class="verify-summary">${escapeHtml(v.summary)}</span>
+      </div>
+      <div class="verify-meta">re-OCR re-read the shipped image · ${v.regionsRedacted}/${v.regionsChecked} regions confirmed redacted · ${Math.round(v.confidence * 100)}% pixel confidence</div>
+      ${leaked}
+    `;
+  } else if (audit.verification) {
+    verificationEl.innerHTML = `<div class="verify-chip warn"><span class="verify-badge">⚠ WARNING</span><span class="verify-summary">${escapeHtml(audit.verification.summary)}</span></div>`;
+  } else {
+    verificationEl.innerHTML = "";
+  }
+
+  // Screenshots before/after — each is click-to-zoom, and the redacted shot
+  // carries box overlays so the exact redacted regions are visible proof.
   const screenshotsEl = $("audit-screenshots");
   if (audit.screenshots.length > 0) {
-    screenshotsEl.innerHTML = `<h4>Before / After Redaction</h4>`;
+    screenshotsEl.innerHTML = `<h4>Before / After Redaction <span class="detection-hint">— click any image to zoom</span></h4>`;
     for (const shot of audit.screenshots) {
       const pair = document.createElement("div");
       pair.className = "screenshot-pair";
       if (shot.original) {
-        pair.innerHTML += `
-          <div class="shot">
-            <img src="${shot.original}" alt="Original" />
-            <div class="shot-label">Original</div>
-          </div>`;
+        pair.appendChild(buildShot(shot.original, "Original — what was on screen", [], true));
       }
       if (shot.redacted) {
-        pair.innerHTML += `
-          <div class="shot">
-            <img src="${shot.redacted}" alt="Redacted (Shipped to Model)" />
-            <div class="shot-label">Redacted</div>
-          </div>`;
+        // Overlays for the redacted image: THIS frame's own 0-1 boxes, so the
+        // proof marker sits exactly on this frame's redactions.
+        pair.appendChild(buildShot(shot.redacted, "Redacted — what shipped to the model", shot.detections ?? [], false));
       }
       screenshotsEl.appendChild(pair);
     }
@@ -561,6 +583,153 @@ function appendAuditVerificationChip(audit: {
 
   transcriptEl.appendChild(chip);
   if (atBottom()) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+// ─── Audit screenshot: overlay + zoom ──────────────────────────────────────
+
+const OVERLAY_COLORS: Record<string, string> = {
+  face: "#f59e0b",
+  credential: "#14b8a6",
+  id_number: "#8b5cf6",
+  api_key: "#f97316",
+  password: "#ef4444",
+  credit_card: "#ef4444",
+  otp: "#ef4444",
+  pan_card: "#8b5cf6",
+  cvv: "#ef4444",
+  pii_text: "#ef4444",
+  email: "#ef4444",
+  phone: "#ef4444",
+  id_text: "#ef4444",
+  ner_text: "#3b82f6",
+};
+
+function overlayColor(kind: string): string {
+  return OVERLAY_COLORS[kind] ?? OVERLAY_COLORS[kind.split("_")[0]] ?? "#10b981";
+}
+
+/**
+ * One audit image: aspect-locked to the natural image ratio so box overlays
+ * align pixel-perfectly, click-to-zoom, and (for the redacted shot) colored
+ * proof markers drawn exactly where the offscreen doc redacted.
+ */
+function buildShot(
+  src: string,
+  label: string,
+  detections: Array<{ kind: string; box?: { x: number; y: number; width: number; height: number } }>,
+  showZoomHint: boolean,
+): HTMLElement {
+  const shot = document.createElement("div");
+  shot.className = "shot";
+  shot.setAttribute("data-zoom-src", src);
+  shot.setAttribute("data-zoom-title", label);
+  const img = document.createElement("img");
+  img.src = src;
+  img.alt = label;
+  img.loading = "lazy";
+  img.addEventListener("load", () => {
+    // Lock the container to the image's true aspect so the percentage
+    // overlay boxes map 1:1 onto the rendered pixels.
+    if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+      shot.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
+    }
+  });
+  const labelEl = document.createElement("div");
+  labelEl.className = "shot-label";
+  labelEl.textContent = label;
+  shot.appendChild(img);
+  shot.appendChild(labelEl);
+
+  // Proof overlays — only meaningful on the redacted (post-mask) image.
+  const withBoxes = detections.filter((d) => d.box);
+  if (withBoxes.length > 0) {
+    const overlay = document.createElement("div");
+    overlay.className = "shot-overlay";
+    for (const d of withBoxes) {
+      const b = d.box!;
+      const mark = document.createElement("div");
+      mark.className = "shot-overlay-mark";
+      mark.style.left = `${b.x * 100}%`;
+      mark.style.top = `${b.y * 100}%`;
+      mark.style.width = `${b.width * 100}%`;
+      mark.style.height = `${b.height * 100}%`;
+      mark.style.borderColor = overlayColor(d.kind);
+      mark.title = `${d.kind} — redacted here`;
+      overlay.appendChild(mark);
+    }
+    shot.appendChild(overlay);
+  }
+
+  if (showZoomHint) shot.classList.add("zoomable");
+  shot.addEventListener("click", () => openZoom(shot));
+  return shot;
+}
+
+let zoomFit = true;
+
+function openZoom(shot: HTMLElement): void {
+  const src = shot.getAttribute("data-zoom-src") ?? "";
+  const title = shot.getAttribute("data-zoom-title") ?? "";
+  const modal = $("zoom-modal");
+  const body = $("zoom-body");
+  if (!modal || !body || !src) return;
+  const zoomTitle = $("zoom-title");
+  if (zoomTitle) zoomTitle.textContent = title;
+  body.innerHTML = "";
+  zoomFit = true;
+
+  const img = document.createElement("img");
+  img.src = src;
+  img.alt = title;
+  const frame = document.createElement("div");
+  frame.className = "zoom-frame";
+  frame.appendChild(img);
+
+  // Same overlay proof, scaled to the zoomed image.
+  const overlay = shot.querySelector(".shot-overlay");
+  if (overlay) {
+    const clone = overlay.cloneNode(true) as HTMLElement;
+    clone.className = "zoom-overlay";
+    frame.appendChild(clone);
+  }
+  body.appendChild(frame);
+  applyZoomFit(frame, img);
+
+  modal.classList.remove("hidden");
+  img.addEventListener("load", () => applyZoomFit(frame, img));
+  body.dataset.zoomTitle = title;
+}
+
+function applyZoomFit(frame: HTMLElement, img: HTMLImageElement): void {
+  if (!zoomFit) {
+    frame.classList.add("zoom-one");
+    return;
+  }
+  frame.classList.remove("zoom-one");
+}
+
+function closeZoom(): void {
+  $("zoom-modal")?.classList.add("hidden");
+}
+
+function initZoomModal(): void {
+  $("zoom-close")?.addEventListener("click", closeZoom);
+  $("zoom-backdrop")?.addEventListener("click", closeZoom);
+  $("zoom-fit")?.addEventListener("click", () => {
+    zoomFit = true;
+    const frame = document.querySelector(".zoom-frame");
+    const img = document.querySelector(".zoom-frame img");
+    if (frame && img) applyZoomFit(frame as HTMLElement, img as HTMLImageElement);
+  });
+  $("zoom-one")?.addEventListener("click", () => {
+    zoomFit = false;
+    const frame = document.querySelector(".zoom-frame");
+    const img = document.querySelector(".zoom-frame img");
+    if (frame && img) applyZoomFit(frame as HTMLElement, img as HTMLImageElement);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("zoom-modal")?.classList.contains("hidden")) closeZoom();
+  });
 }
 
 // ─── Event Listener ────────────────────────────────────────────────────────
@@ -1326,12 +1495,17 @@ function renderWireLog(records: WireRecordView[]): void {
 $("btn-wire")?.addEventListener("click", () => setActivePanel("wire-panel"));
 $("wire-close")?.addEventListener("click", () => setActivePanel(null));
 
-// Global Escape key listener to close active drawer
+// Global Escape key listener to close active drawer (unless the zoom modal
+// is open — its own handler closes just the modal first).
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
+    if (!$("zoom-modal")?.classList.contains("hidden")) return;
     setActivePanel(null);
   }
 });
+
+// Zoom lightbox for audit images.
+initZoomModal();
 
 // ─── Quick Actions ─────────────────────────────────────────────────────────
 

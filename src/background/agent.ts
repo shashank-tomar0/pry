@@ -284,7 +284,7 @@ export interface AgentDeps {
   recordAudit?: (entry: {
     original?: string;
     redacted?: string;
-    detections: Array<{ kind: string; label: string; confidence: number }>;
+    detections: Array<{ kind: string; label: string; confidence: number; box?: { x: number; y: number; width: number; height: number } }>;
     tokens: Array<{ token: string; kind: string; sample?: string }>;
     redactedCount: number;
     verification?: VerificationResult;
@@ -625,6 +625,7 @@ export async function runTask(
           kind: d.kind,
           label: d.label,
           confidence: d.confidence,
+          box: d.box,
         }));
         const verification = processed.verification;
         noteVerification(verification);
@@ -1459,6 +1460,7 @@ ${freshRendered}`,
                   kind: d.kind,
                   label: d.label,
                   confidence: d.confidence,
+                  box: d.box,
                 }));
                 const verification = processed.verification;
                 noteVerification(verification);

@@ -25,8 +25,33 @@ export interface NerSpanInput {
 
 const LABEL_NAMES: Record<string, string> = {
   PER: "Person name",
+  PERSON: "Person name",
+  PERSON_NAME: "Person name",
+  NAME: "Person name",
   ORG: "Organization",
+  ORGANIZATION: "Organization",
+  ORGANISATION: "Organization",
+  COMPANY: "Organization",
   LOC: "Location",
+  LOCATION: "Location",
+  CITY: "Location",
+  ADDRESS: "Location",
+  EMAIL: "Email address",
+  EMAIL_ADDRESS: "Email address",
+  PHONE: "Phone number",
+  PHONE_NUMBER: "Phone number",
+  TELEPHONE: "Phone number",
+  MOBILE: "Phone number",
+  SSN: "SSN",
+  AADHAAR: "Aadhaar number",
+  PAN: "PAN card",
+  PASSPORT: "Passport number",
+  CREDIT_CARD: "Card number",
+  ACCOUNT_NUMBER: "Account number",
+  DOB: "Date of birth",
+  USERNAME: "Username",
+  PASSWORD: "Password",
+  IP_ADDRESS: "IP address",
 };
 
 export function fuseDetections(

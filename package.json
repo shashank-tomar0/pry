@@ -8,6 +8,7 @@
     "build": "node build.mjs",
     "dev": "node build.mjs --watch",
     "typecheck": "tsc --noEmit",
+    "fetch-models": "node scripts/fetch-models.mjs",
     "verify": "esbuild scripts/verify-pipeline.mjs --bundle --platform=node --format=esm --outfile=scripts/.verify-out.mjs && esbuild src/content/tripwire.ts --bundle --format=iife --platform=browser --target=chrome120 --outfile=scripts/.tripwire-iife.js && node scripts/.verify-out.mjs && node scripts/tripwire-test.mjs && node scripts/ocr-test.mjs"
   },
   "devDependencies": {

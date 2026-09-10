@@ -14,7 +14,7 @@
  */
 
 /** Pronunciation used for vault tokens in spoken output. */
-export const SPOKEN_REDACTED = "redacted";
+const SPOKEN_REDACTED = "redacted";
 
 /**
  * Transform assistant text into a speak-safe string.
@@ -95,7 +95,7 @@ export function bytesToBase64(bytes: Uint8Array): string {
  * injectable) so tests can assert the exact payload — model id, output
  * format, and the header that carries the key.
  */
-export const TTS_MODEL_FLASH = "eleven_flash_v2_5";
+const TTS_MODEL_FLASH = "eleven_flash_v2_5";
 export const TTS_OUTPUT_FORMAT = "pcm_16000"; // 16 kHz mono PCM for streaming playback
 
 export function ttsRequestBody(text: string): Record<string, unknown> {

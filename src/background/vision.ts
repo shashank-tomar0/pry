@@ -33,7 +33,7 @@ export interface VisionObservation {
 /** The model used when settings.vision.model is left blank. */
 export const VISION_DEFAULT_MODELS: Record<ProviderId, string> = {
   openai: "gpt-4o-mini",
-  groq: "llama-3.2-11b-vision-preview",
+  groq: "meta-llama/llama-4-scout-17b-16e-instruct",
   nvidia: "meta/llama-3.2-11b-vision-instruct",
   openrouter: "openai/gpt-4o-mini",
   ollama: "llama3.2-vision",

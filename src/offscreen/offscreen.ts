@@ -448,7 +448,7 @@ async function processScreenshot(
     // gated by the user's maskCredentials toggle. Soft input-field blur always
     // runs (a generic field the user types into is still sensitive), but when
     // masking is off we degrade to blur so the pixels are still protected.
-    if (solidText) {
+    if (solidText && maskCredentials) {
       // Solid black, zero information left: the span is exactly the PII.
       ctx.fillStyle = "#000000";
       ctx.fillRect(rx, ry, rw, rh);

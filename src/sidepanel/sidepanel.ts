@@ -17,16 +17,22 @@ const stopBtn = $("stop-btn");
 // .ttsEnabled. Until those are on, no Scribe WS, no Flash TTS, no mic usage.
 import type { VoiceController } from "./voice-controller";
 let voice: VoiceController | null = null;
-let voiceTtsCtx: AudioContext | null = null;
-let voiceTtsGain: GainNode | null = null;
 
 async function bootstrapVoice(): Promise<void> {
   const settings = (await send({ kind: "get-state" })) as { settings?: import("../shared/types").Settings } | undefined;
   const el = settings?.settings?.elevenlabs;
+  const micBtn = $<HTMLButtonElement>("mic-btn");
+
+  // Tear down any previous voice instance (e.g. when settings change live).
+  if (voice) {
+    voice.cancel();
+    voice = null;
+  }
+  if (micBtn) micBtn.classList.add("hidden");
+
   if (!el?.apiKey || !el.voiceId || (!el.sttEnabled && !el.ttsEnabled)) return;
 
   const { VoiceController } = await import("./voice-controller");
-  const micBtn = $<HTMLButtonElement>("mic-btn");
 
   voice = new VoiceController({
     apiKey: el.apiKey,
@@ -35,18 +41,9 @@ async function bootstrapVoice(): Promise<void> {
     setUserEntryText: (text) => {
       if (taskInput) taskInput.value = text;
     },
-    speakAssistantText: (text) => {
-      // TTS playback pipe: each chunk is scheduled on a single shared
-      // AudioContext so playback is continuous across chunks (no gap
-      // between the first frame and the rest).
-      if (!voiceTtsCtx) {
-        const Ctor = (window.AudioContext || (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext) as typeof AudioContext | undefined;
-        if (!Ctor) return;
-        voiceTtsCtx = new Ctor({ sampleRate: 16000 });
-        voiceTtsGain = voiceTtsCtx.createGain();
-        voiceTtsGain.gain.value = 1;
-        voiceTtsGain.connect(voiceTtsCtx.destination);
-      }
+    speakAssistantText: (_text) => {
+      // Audio playback is handled inside VoiceController.playAudioChunk.
+      // This callback is intentionally a no-op on the panel side.
     },
     callbacks: {
       onStateChange: (state) => {
@@ -80,7 +77,9 @@ async function bootstrapVoice(): Promise<void> {
     micBtn.addEventListener("pointerdown", (e) => void press(e));
     micBtn.addEventListener("pointerup", () => void release());
     micBtn.addEventListener("pointercancel", () => voice?.cancel());
-    micBtn.hidden = false;
+    // Fix: classList.remove overrides .hidden { display: none !important }
+    // (micBtn.hidden = false does NOT remove the CSS class)
+    micBtn.classList.remove("hidden");
   }
 }
 
@@ -89,13 +88,10 @@ async function bootstrapVoice(): Promise<void> {
  *  (console.warn alone is invisible mid-demo). */
 function emitLocalStatus(text: string): void {
   console.warn("[PRY voice]", text);
-  emit({
-    kind: "entry",
-    entry: {
-      id: `voice-${Date.now()}`,
-      role: "system",
-      text: `Voice: ${text}`,
-    },
+  render({
+    id: `voice-${Date.now()}`,
+    role: "system",
+    text: `Voice: ${text}`,
   });
 }
 
@@ -359,12 +355,7 @@ function render(entry: TranscriptEntry): void {
 
   rawTexts.set(entry.id, entry.text);
 
-  // Voice-out: speak a final assistant answer once it arrives. We gate on
-  // entry.role === "assistant" (not "step") so step-card narration lines
-  // stay silent unless we later want to read them out too.
-  if (entry.role === "assistant") {
-    void maybeSpeak(entry.text);
-  }
+
 
   if (entry.role === "step") {
     const glyph = node.querySelector(".glyph");
@@ -592,6 +583,18 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
 
     case "status":
       setRunning(event.running);
+      // Voice-out: speak the complete final answer when the task finishes.
+      // rawTexts holds the full concatenated text after all streaming patches
+      // are applied — this is the right moment, not the first 200-char chunk.
+      if (!event.running && voice) {
+        const lastAssistantId = [...nodes.entries()]
+          .reverse()
+          .find(([, node]) => node.classList.contains("assistant"))?.[0];
+        if (lastAssistantId) {
+          const fullText = rawTexts.get(lastAssistantId) ?? "";
+          if (fullText) void maybeSpeak(fullText);
+        }
+      }
       break;
 
     case "egress":
@@ -1056,6 +1059,12 @@ taskInput.addEventListener("keydown", (e) => {
 
 // Voice (ElevenLabs) — lazy bootstrap; no-op if user hasn't added an API key.
 void bootstrapVoice();
+// Re-bootstrap voice whenever the user saves options (key or toggles changed).
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && "settings" in changes) {
+    void bootstrapVoice();
+  }
+});
 // Auto-grow textarea
 taskInput.addEventListener("input", () => {
   taskInput.style.height = "auto";

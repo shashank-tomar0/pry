@@ -402,6 +402,35 @@
     </div>
 
     <div class="section">
+      <div class="section-title">ElevenLabs Voice</div>
+      <div class="section-subtitle">Voice task input (Scribe) and spoken narration (Flash v2.5). Off by default.</div>
+      <div class="field-row" style="margin-top: 8px;">
+        <div class="field-group" style="flex: 2;">
+          <label class="field-label">API Key</label>
+          <input type="password" class="field-input" id="elevenlabs-api-key" placeholder="xi-api-..." autocomplete="off" />
+        </div>
+        <div class="field-group" style="flex: 2;">
+          <label class="field-label">Voice ID</label>
+          <input type="text" class="field-input" id="elevenlabs-voice-id" placeholder="e.g. 21m00Tcm4TlvDq8ikWAM" />
+        </div>
+      </div>
+      <div class="field-row" style="margin-top: 8px;">
+        <div class="field-group">
+          <label class="field-label">Voice Task Input (Scribe)</label>
+          <div style="padding-top: 6px;">
+            <input type="checkbox" class="toggle" id="elevenlabs-stt-enabled" />
+          </div>
+        </div>
+        <div class="field-group">
+          <label class="field-label">Spoken Narration (Flash v2.5)</label>
+          <div style="padding-top: 6px;">
+            <input type="checkbox" class="toggle" id="elevenlabs-tts-enabled" />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
       <div class="section-title">Privacy Pipeline</div>
       <div class="privacy-grid" style="margin-top: 8px;">
         <div class="toggle-row">

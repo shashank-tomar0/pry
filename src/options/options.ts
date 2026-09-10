@@ -15,6 +15,12 @@ const modelList = $<HTMLDataListElement>("model-list");
 const modelStatus = $("model-status");
 const maxStepsEl = $<HTMLInputElement>("maxSteps");
 const confirmRiskyEl = $<HTMLInputElement>("confirmRisky");
+
+// ElevenLabs voice (hack branch).
+const elApiKeyEl = $<HTMLInputElement>("elevenlabs-api-key");
+const elVoiceIdEl = $<HTMLInputElement>("elevenlabs-voice-id");
+const elSttEl = $<HTMLInputElement>("elevenlabs-stt-enabled");
+const elTtsEl = $<HTMLInputElement>("elevenlabs-tts-enabled");
 const refreshBtn = $<HTMLButtonElement>("refresh-models");
 const savedEl = $("saved");
 const activeModelDisplay = $("active-model-display");
@@ -103,6 +109,12 @@ function renderAll(): void {
   // Agent config.
   maxStepsEl.value = String(settings.maxSteps);
   confirmRiskyEl.checked = settings.confirmRisky;
+
+  // ElevenLabs voice.
+  elApiKeyEl.value = settings.elevenlabs.apiKey;
+  elVoiceIdEl.value = settings.elevenlabs.voiceId;
+  elSttEl.checked = settings.elevenlabs.sttEnabled;
+  elTtsEl.checked = settings.elevenlabs.ttsEnabled;
 
   // Privacy.
   blurFacesEl.checked = settings.privacy.blurFaces;
@@ -252,6 +264,20 @@ $("save").addEventListener("click", async () => {
   captureFields();
   settings.maxSteps = Math.min(200, Math.max(5, Number(maxStepsEl.value) || 40));
   settings.confirmRisky = confirmRiskyEl.checked;
+
+  // ElevenLabs: enabling either voice feature without a key is silently
+  // a no-op (the side panel checks the flag + key together), but warn so
+  // users know nothing will happen.
+  settings.elevenlabs.apiKey = elApiKeyEl.value.trim();
+  settings.elevenlabs.voiceId = elVoiceIdEl.value.trim();
+  settings.elevenlabs.sttEnabled = elSttEl.checked;
+  settings.elevenlabs.ttsEnabled = elTtsEl.checked;
+  if ((settings.elevenlabs.sttEnabled || settings.elevenlabs.ttsEnabled)
+      && !settings.elevenlabs.apiKey) {
+    savedEl.className = "status-msg bad";
+    savedEl.textContent = "ElevenLabs voice is enabled but no API key was provided.";
+    return;
+  }
 
   // Ollama needs no API key.
   if (!settings.apiKeys[settings.provider] && settings.provider !== "ollama") {

@@ -11,6 +11,92 @@ const emptyEl = $("empty");
 const taskInput = $<HTMLTextAreaElement>("task-input");
 const runBtn = $("run-btn");
 const stopBtn = $("stop-btn");
+
+// ─── Voice (ElevenLabs, hack branch) ───────────────────────────────────────
+// The whole voice stack is feature-flagged on settings.elevenlabs.sttEnabled /
+// .ttsEnabled. Until those are on, no Scribe WS, no Flash TTS, no mic usage.
+import type { VoiceController } from "./voice-controller";
+let voice: VoiceController | null = null;
+let voiceTtsCtx: AudioContext | null = null;
+let voiceTtsGain: GainNode | null = null;
+
+async function bootstrapVoice(): Promise<void> {
+  const settings = (await send({ kind: "get-state" })) as { settings?: import("../shared/types").Settings } | undefined;
+  const el = settings?.settings?.elevenlabs;
+  if (!el?.apiKey || !el.voiceId || (!el.sttEnabled && !el.ttsEnabled)) return;
+
+  const { VoiceController } = await import("./voice-controller");
+  const micBtn = $<HTMLButtonElement>("mic-btn");
+
+  voice = new VoiceController({
+    apiKey: el.apiKey,
+    voiceId: el.voiceId,
+    submitTask: (task) => void submit(task),
+    setUserEntryText: (text) => {
+      if (taskInput) taskInput.value = text;
+    },
+    speakAssistantText: (text) => {
+      // TTS playback pipe: each chunk is scheduled on a single shared
+      // AudioContext so playback is continuous across chunks (no gap
+      // between the first frame and the rest).
+      if (!voiceTtsCtx) {
+        const Ctor = (window.AudioContext || (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext) as typeof AudioContext | undefined;
+        if (!Ctor) return;
+        voiceTtsCtx = new Ctor({ sampleRate: 16000 });
+        voiceTtsGain = voiceTtsCtx.createGain();
+        voiceTtsGain.gain.value = 1;
+        voiceTtsGain.connect(voiceTtsCtx.destination);
+      }
+    },
+    callbacks: {
+      onStateChange: (state) => {
+        if (micBtn) {
+          micBtn.dataset.state = state;
+          micBtn.classList.toggle("listening", state === "listening" || state === "connecting");
+        }
+      },
+      onError: (msg) => emitLocalStatus(msg),
+    },
+  });
+
+  // Mic button: hold-to-talk. Press to start, release to commit.
+  if (micBtn) {
+    const press = async (ev: PointerEvent) => {
+      ev.preventDefault();
+      micBtn.setPointerCapture(ev.pointerId);
+      try {
+        await voice!.startListening();
+      } catch (err) {
+        emitLocalStatus(err instanceof Error ? err.message : String(err));
+      }
+    };
+    const release = async () => {
+      try {
+        await voice!.stopListening();
+      } catch {
+        voice!.cancel();
+      }
+    };
+    micBtn.addEventListener("pointerdown", (e) => void press(e));
+    micBtn.addEventListener("pointerup", () => void release());
+    micBtn.addEventListener("pointercancel", () => voice?.cancel());
+    micBtn.hidden = false;
+  }
+}
+
+/** Local status line shown only for voice events; falls back silently. */
+function emitLocalStatus(text: string): void {
+  // We reuse the existing chat status pattern; voice errors are non-fatal.
+  console.warn("[PRY voice]", text);
+}
+
+/** Speak assistant text once a final answer arrives, gated on settings. */
+async function maybeSpeak(text: string): Promise<void> {
+  if (!voice) return;
+  const settings = (await send({ kind: "get-state" })) as { settings?: import("../shared/types").Settings } | undefined;
+  if (!settings?.settings?.elevenlabs?.ttsEnabled) return;
+  await voice.speak(text);
+}
 const statusDot = $("status-dot");
 const statusText = $("status-text");
 const confirmEl = $("confirm");
@@ -263,6 +349,13 @@ function render(entry: TranscriptEntry): void {
   }
 
   rawTexts.set(entry.id, entry.text);
+
+  // Voice-out: speak a final assistant answer once it arrives. We gate on
+  // entry.role === "assistant" (not "step") so step-card narration lines
+  // stay silent unless we later want to read them out too.
+  if (entry.role === "assistant") {
+    void maybeSpeak(entry.text);
+  }
 
   if (entry.role === "step") {
     const glyph = node.querySelector(".glyph");
@@ -952,6 +1045,8 @@ taskInput.addEventListener("keydown", (e) => {
   }
 });
 
+// Voice (ElevenLabs) — lazy bootstrap; no-op if user hasn't added an API key.
+void bootstrapVoice();
 // Auto-grow textarea
 taskInput.addEventListener("input", () => {
   taskInput.style.height = "auto";

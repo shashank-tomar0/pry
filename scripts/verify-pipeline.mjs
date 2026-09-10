@@ -1423,4 +1423,97 @@ ok("B7: javascript: and data: URIs refused",
 ok("B7: scheme-less input still allowed (normalized to https by normaliseUrl)",
   isNavigableUrl("example.com"));
 
+// ─── Scenario Y: ElevenLabs voice core (privacy-critical transforms) ───────
+console.log("\n=== Scenario Y: ElevenLabs voice-core privacy transforms ===\n");
+
+const {
+  speakSafeTransform,
+  containsVaultToken,
+  floatTo16BitPCM,
+  pcm16ToFloat32,
+  bytesToBase64,
+  ttsRequestBody,
+  TTS_OUTPUT_FORMAT,
+} = await import("../src/sidepanel/voice-core.ts");
+
+// Speak-safety: vault tokens MUST be replaced with "redacted" before TTS.
+ok("speakSafeTransform replaces CRED tokens with 'redacted'",
+  speakSafeTransform("Email sent to <CRED_1>.") === "Email sent to redacted.");
+ok("speakSafeTransform replaces multiple token kinds",
+  speakSafeTransform("From <PII_3> at <EMAIL_2>") === "From redacted at redacted");
+ok("speakSafeTransform strips markdown link syntax",
+  speakSafeTransform("See [privacy page](https://example.com) for details") === "See privacy page for details");
+ok("speakSafeTransform strips emphasis and heading noise",
+  speakSafeTransform("## Done.\n**bold** `code`") === "Done. bold code");
+ok("speakSafeTransform caps runaway output with an ellipsis",
+  speakSafeTransform("x".repeat(1000)).endsWith("…"));
+ok("speakSafeTransform preserves normal prose exactly",
+  speakSafeTransform("Sent successfully.") === "Sent successfully.");
+
+// The detector must trip on raw tokens so TTS can refuse to speak them.
+ok("containsVaultToken detects CRED", containsVaultToken("hi <CRED_1>"));
+ok("containsVaultToken detects EMAIL/ID/PII",
+  containsVaultToken("<EMAIL_9>") && containsVaultToken("<ID_3>") && containsVaultToken("<PII_42>"));
+ok("containsVaultToken is false on speak-safe output",
+  !containsVaultToken(speakSafeTransform("done <CRED_1>")));
+ok("containsVaultToken tolerates empty/null/undefined",
+  !containsVaultToken("") && !containsVaultToken(null) && !containsVaultToken(undefined));
+
+// PCM round-trip: Float32 -> PCM16 -> Float32 preserves sample values to
+// the quantisation step of the target format. The native value at sample
+// rate 16 kHz is Int16, so 0.5 -> ~16383/32767 (not exactly 0.5).
+const samples = new Float32Array([0, 0.5, -0.5, 1, -1]);
+const pcm = floatTo16BitPCM(samples);
+ok("PCM16 round-trip: 2 bytes per sample", pcm.byteLength === samples.length * 2);
+const back = pcm16ToFloat32(pcm);
+ok("PCM16 round-trip: zero preserved exactly", back[0] === 0);
+ok("PCM16 round-trip: positive peak round-trips", back[3] === 1);
+ok("PCM16 round-trip: negative peak round-trips", back[4] === -1);
+ok("PCM16 round-trip: 0.5 within ±1/32767", Math.abs(back[1] - 0.5) <= 1 / 32767);
+ok("PCM16 round-trip: -0.5 within ±1/32767", Math.abs(back[2] + 0.5) <= 1 / 32767);
+
+// Base64 round-trip.
+const b64 = bytesToBase64(new Uint8Array([0, 1, 2, 254, 255]));
+ok("bytesToBase64 round-trip",
+  atob(b64).split(",").map((c) => c.charCodeAt(0))
+    .every((v, i) => v === [0, 1, 2, 254, 255][i]));
+
+// TTS request body shape.
+const body = ttsRequestBody("hello");
+ok("ttsRequestBody uses Flash v2.5 and forwards text",
+  body.model_id === "eleven_flash_v2_5" && body.text === "hello");
+ok("TTS output format is PCM16 (matches AudioContext default)",
+  TTS_OUTPUT_FORMAT === "pcm_16000");
+
+// ─── Scenario Z: Scribe client wire shapes (pure functions only) ─────────────
+console.log("\n=== Scenario Z: Scribe client URL + token auth ===\n");
+
+const { mintScribeToken, scribeWebSocketUrl, micFrameToScribeBase64, SCRIBE_SAMPLE_RATE_HZ } =
+  await import("../src/sidepanel/scribe-client.ts");
+
+ok("Scribe sample rate is 16 kHz (PCM16)", SCRIBE_SAMPLE_RATE_HZ === 16000);
+ok("scribeWebSocketUrl carries token, model_id, audio_format, sample_rate",
+  (() => {
+    const u = new URL(scribeWebSocketUrl("tkn-123"));
+    return u.protocol === "wss:"
+      && u.host === "api.elevenlabs.io"
+      && u.searchParams.get("token") === "tkn-123"
+      && u.searchParams.get("model_id") === "scribe_v2_realtime"
+      && u.searchParams.get("audio_format") === "pcm_16000"
+      && u.searchParams.get("sample_rate") === "16000";
+  })());
+ok("micFrameToScribeBase64 returns base64-encoded PCM16 (2 bytes per sample)",
+  micFrameToScribeBase64(new Float32Array(64)).length > 0
+    && atob(micFrameToScribeBase64(new Float32Array(64))).length === 128);
+
+ok("mintScribeToken rejects empty key with a clear message",
+  (async () => {
+    try {
+      await mintScribeToken("");
+      return false;
+    } catch (e) {
+      return e instanceof Error && /API key is required/i.test(e.message);
+    }
+  })());
+
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

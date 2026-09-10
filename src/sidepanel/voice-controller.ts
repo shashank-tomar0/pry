@@ -47,8 +47,11 @@ export interface VoiceControllerConfig {
   submitTask: (task: string) => void;
   /** Replace the panel's user-entry line so partials render live. */
   setUserEntryText: (text: string) => void;
-  /** Streamed chat answer line spoken via TTS (sanitize already applied). */
-  speakAssistantText: (text: string) => void;
+  /**
+   * Optional callback when TTS playback starts for a chunk.
+   * Audio is scheduled internally via Web Audio; this is informational only.
+   */
+  speakAssistantText?: (text: string) => void;
   callbacks?: VoiceControllerCallbacks;
 }
 
@@ -59,6 +62,11 @@ export class VoiceController {
   private mediaStream: MediaStream | null = null;
   private audioCtx: AudioContext | null = null;
   private processor: ScriptProcessorNode | null = null;
+  private playbackAudioCtx: AudioContext | null = null;
+  private playbackGain: GainNode | null = null;
+  private nextPlaybackTime = 0;
+  private ttsAbort: AbortController | null = null;
+  private cancelListening = false;
   private state: "idle" | "connecting" | "listening" | "error" = "idle";
   private readonly config: VoiceControllerConfig;
   private callbacks: VoiceControllerCallbacks;
@@ -75,9 +83,15 @@ export class VoiceController {
   /** Begin hold-to-talk capture: opens mic, connects Scribe, streams audio. */
   async startListening(): Promise<void> {
     if (this.isListening) return;
+    this.stopSpeaking();
+    this.cancelListening = false;
     try {
       this.setState("connecting");
       const token = await mintScribeToken(this.config.apiKey);
+      if (this.cancelListening) {
+        this.cleanup();
+        return;
+      }
       this.scribe = new ScribeConnection({
         onPartial: (text) => {
           this.callbacks.onPartial?.(text);
@@ -99,6 +113,10 @@ export class VoiceController {
       this.mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1, sampleRate: SCRIBE_SAMPLE_RATE_HZ },
       });
+      if (this.cancelListening) {
+        this.cleanup();
+        return;
+      }
       const Ctor = (window.AudioContext || (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext) as typeof AudioContext | undefined;
       if (!Ctor) throw new Error("Web Audio API unavailable in this context.");
       this.audioCtx = new Ctor({ sampleRate: SCRIBE_SAMPLE_RATE_HZ });
@@ -127,11 +145,66 @@ export class VoiceController {
 
   /** Stop capture and commit the in-flight utterance. */
   async stopListening(): Promise<void> {
+    this.cancelListening = true;
     if (this.scribe) this.scribe.commit();
     // Give Scribe a beat to deliver the COMMITTED_TRANSCRIPT before we tear
     // down the mic; commit() returns immediately on the wire.
     await new Promise((r) => setTimeout(r, 350));
     this.cleanup();
+  }
+
+  private ensurePlaybackContext(): AudioContext | null {
+    if (!this.playbackAudioCtx || this.playbackAudioCtx.state === "closed") {
+      const Ctor = (window.AudioContext || (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext) as typeof AudioContext | undefined;
+      if (!Ctor) return null;
+      this.playbackAudioCtx = new Ctor({ sampleRate: SCRIBE_SAMPLE_RATE_HZ });
+      this.playbackGain = this.playbackAudioCtx.createGain();
+      this.playbackGain.gain.value = 1.0;
+      this.playbackGain.connect(this.playbackAudioCtx.destination);
+    }
+    if (this.playbackAudioCtx.state === "suspended") {
+      void this.playbackAudioCtx.resume();
+    }
+    return this.playbackAudioCtx;
+  }
+
+  private playAudioChunk(samples: Float32Array): void {
+    const ctx = this.ensurePlaybackContext();
+    if (!ctx || !this.playbackGain || samples.length === 0) return;
+    const buffer = ctx.createBuffer(1, samples.length, ctx.sampleRate);
+    buffer.getChannelData(0).set(samples);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(this.playbackGain);
+    const now = ctx.currentTime;
+    const start = Math.max(now, this.nextPlaybackTime);
+    source.start(start);
+    this.nextPlaybackTime = start + buffer.duration;
+  }
+
+  /** Stop any active or queued TTS speech immediately. */
+  stopSpeaking(): void {
+    if (this.ttsAbort) {
+      this.ttsAbort.abort();
+      this.ttsAbort = null;
+    }
+    if (this.playbackGain && this.playbackAudioCtx) {
+      try {
+        this.playbackGain.disconnect();
+      } catch {
+        // ignore
+      }
+      this.playbackGain = null;
+    }
+    if (this.playbackAudioCtx) {
+      try {
+        void this.playbackAudioCtx.close();
+      } catch {
+        // ignore
+      }
+      this.playbackAudioCtx = null;
+    }
+    this.nextPlaybackTime = 0;
   }
 
   /** Speak text via streaming TTS. Refuses any string containing a raw vault token. */
@@ -148,19 +221,49 @@ export class VoiceController {
       this.callbacks.onError?.("ElevenLabs voice id is required for TTS.");
       return;
     }
+    this.stopSpeaking();
+    const ctx = this.ensurePlaybackContext();
+    if (ctx) {
+      this.nextPlaybackTime = ctx.currentTime;
+    }
+    const abort = new AbortController();
+    this.ttsAbort = abort;
     try {
-      await streamTts(safe, this.config.voiceId, this.config.apiKey, {
-        onChunk: (samples) => this.config.speakAssistantText(""),
-        onError: (msg) => this.callbacks.onError?.(msg),
-      });
+      await streamTts(
+        safe,
+        this.config.voiceId,
+        this.config.apiKey,
+        {
+          onChunk: (samples) => {
+            if (!abort.signal.aborted) {
+              this.playAudioChunk(samples);
+              this.config.speakAssistantText?.(safe);
+            }
+          },
+          onError: (msg) => {
+            if (!abort.signal.aborted) {
+              this.callbacks.onError?.(msg);
+            }
+          },
+        },
+        abort.signal,
+      );
     } catch (err) {
-      this.callbacks.onError?.(err instanceof Error ? err.message : String(err));
+      if (!abort.signal.aborted) {
+        this.callbacks.onError?.(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (this.ttsAbort === abort) {
+        this.ttsAbort = null;
+      }
     }
   }
 
   /** Abort everything without committing (e.g. on user cancel). */
   cancel(): void {
+    this.cancelListening = true;
     this.cleanup();
+    this.stopSpeaking();
     this.config.setUserEntryText("");
   }
 

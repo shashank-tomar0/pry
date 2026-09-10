@@ -1606,7 +1606,7 @@ for (let i = 0; i < 30; i++) {
     totalChars: 100,
   });
 }
-const allRecords = wireLog.wireRecords();
+const allRecords = await wireLog.wireRecords();
 ok("wire log caps at 24 records", allRecords.length === 24, `got ${allRecords.length}`);
 ok("wire log keeps the NEWEST records after capping",
   allRecords[allRecords.length - 1].turn === 29 && allRecords[0].turn === 6);
@@ -1624,9 +1624,9 @@ wireLog.recordWire({
   leaked: [{ label: "Email address", sample: "ra•••@gmail.com" }],
   totalChars: 60,
 });
+const leakRecord = (await wireLog.wireRecords())[0];
 ok("leaked findings are preserved on the record (loud banner data)",
-  wireLog.wireRecords()[0].leaked.length === 1
-    && wireLog.wireRecords()[0].leaked[0].label === "Email address");
+  leakRecord.leaked.length === 1 && leakRecord.leaked[0].label === "Email address");
 
 // ── Tier-0 ML: fusion detector + ml settings migration ──────────────────────
 console.log("\n=== Scenario AC: fusion detector v2 + ml settings ===\n");
@@ -1678,5 +1678,27 @@ ok("ml settings default to enabled (degradation is automatic)",
 const mlMerged = normaliseSettings({ ml: { ner: false } });
 ok("ml settings merge preserves stored guard flag",
   mlMerged.ml.ner === false && mlMerged.ml.guard === true);
+
+// Wire-log persistence: MV3 suspends the service worker, wiping in-memory
+// state. recordWire writes through to chrome.storage so the audit survives.
+wireLog.clearWire();
+wireLog.recordWire({
+  turn: 3,
+  destination: "Groq demo",
+  systemChars: 50,
+  messages: [{ role: "user", text: "persist me" }],
+  tokens: [],
+  leaked: [],
+  totalChars: 60,
+});
+await new Promise((r) => setTimeout(r, 25)); // write-behind flush
+const persisted = (await chrome.storage.local.get("pry-wire-log"))["pry-wire-log"];
+ok("wire records persist to chrome.storage (survives SW suspension)",
+  Array.isArray(persisted) && persisted.length === 1
+    && persisted[0].messages[0].text === "persist me",
+  JSON.stringify(persisted));
+wireLog.clearWire();
+const wiped = (await chrome.storage.local.get("pry-wire-log"))["pry-wire-log"];
+ok("clearWire wipes persisted records", !wiped || wiped.length === 0);
 
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

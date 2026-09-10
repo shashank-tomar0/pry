@@ -853,8 +853,8 @@ chrome.runtime.onMessage.addListener(
         return false;
 
       case "get-wire-log":
-        sendResponse({ records: wireRecords() });
-        return false;
+        void wireRecords().then((records) => sendResponse({ records }));
+        return true;
 
       case "clear-wire-log":
         clearWire();

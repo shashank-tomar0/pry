@@ -52,7 +52,14 @@ export class TabController {
       // script is missing — inject once and retry. Timeouts are NOT retried
       // (the page genuinely did not answer) and bubble up as-is.
       const message = error instanceof Error ? error.message : String(error);
-      const missingScript = /Receiving end does not exist|Could not establish connection|No tab with id/i.test(message);
+      // A page that navigates mid-action destroys the old content script and
+      // closes the channel mid-response. The NEW page is about to be read
+      // anyway, so this is recoverable: inject on the fresh document and
+      // retry once instead of failing the whole run.
+      const navigationClosed = /message channel closed/i.test(message);
+      const missingScript =
+        /Receiving end does not exist|Could not establish connection|No tab with id/i.test(message)
+        || navigationClosed;
       if (!missingScript || message.startsWith("The page did not respond")) throw error;
       await this.inject();
       return await call();

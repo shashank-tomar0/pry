@@ -38,6 +38,7 @@ import { getLessons, matchLessons } from "./lessons";
 import { getTrajectories, matchTrajectories } from "./trajectories";
 import { piiKindFromOcrLabel } from "./reocr-verification";
 import { observeWithVision, VISION_SUPPORTED, VISION_DEFAULT_MODELS } from "./vision";
+import { recordWire, tokensIn, scanForLeaks } from "./wire-log";
 import {
   initLedger, recordSnapshot, recordDetections,
   recordAction as ledgerRecordAction,
@@ -922,6 +923,34 @@ export async function runTask(
       } catch {
         // Measurement is best-effort; the run continues regardless.
       }
+    }
+
+    // Wire log: record exactly what is about to be sent, and re-run the PII
+    // matchers over the outgoing payload. Anything in `leaked` reached the
+    // wire despite the pipeline — the log says so loudly instead of trusting
+    // the CI fixtures. Local planners are recorded too: "what did the model
+    // see" is the same question whether the model is local or remote.
+    try {
+      const rendered = messages.map((m) => {
+        if (m.role === "user") return { role: "user", text: m.content };
+        if (m.role === "assistant") {
+          const calls = m.toolCalls.map((c) => `${c.name}(${JSON.stringify(c.input)})`).join("; ");
+          return { role: "assistant", text: [m.text, calls].filter(Boolean).join(" ") };
+        }
+        return { role: "tool", text: m.results.map((r) => r.content).join("\n") };
+      });
+      const outgoing = rendered.map((r) => r.text).join("\n");
+      recordWire({
+        turn: step,
+        destination: planner.label,
+        systemChars: systemPrompt.length,
+        messages: rendered,
+        tokens: tokensIn(outgoing),
+        leaked: scanForLeaks(outgoing),
+        totalChars: systemPrompt.length + outgoing.length,
+      });
+    } catch {
+      // The wire log must never break the run it is auditing.
     }
 
     // One turn = one bounded planner call. Stalls (slow first token, dropped

@@ -9,6 +9,54 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Finds the element that actually scrolls.
+ *
+ * App shells (Gmail, Slack, X) pin the window at zero and scroll an inner
+ * container, so a bare `scrollBy` did nothing and the page reported itself as
+ * both at the top and at the bottom. Walking up from the element under the
+ * viewport's centre finds the same container the user's wheel would move.
+ */
+function findScroller(): HTMLElement | Element {
+  const doc = document.scrollingElement ?? document.documentElement;
+
+  const scrollable = (el: Element): boolean => {
+    if (!(el instanceof HTMLElement)) return false;
+    if (el.scrollHeight <= el.clientHeight + 4) return false;
+    const overflow = getComputedStyle(el).overflowY;
+    return overflow === "auto" || overflow === "scroll" || overflow === "overlay";
+  };
+
+  const start = document.elementFromPoint(
+    Math.floor(innerWidth / 2),
+    Math.floor(innerHeight / 2),
+  );
+  for (let el = start; el; el = el.parentElement) {
+    if (el === document.body || el === document.documentElement) break;
+    if (scrollable(el)) return el;
+  }
+
+  // Nothing under the centre scrolls; an app shell may still have one large
+  // scrolling panel elsewhere — take the biggest if it is worth having.
+  if (doc.scrollHeight <= doc.clientHeight + 4) {
+    let best: HTMLElement | undefined;
+    let bestArea = 0;
+    for (const el of Array.from(document.body.querySelectorAll<HTMLElement>("*"))) {
+      if (!scrollable(el)) continue;
+      const rect = el.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      if (area < innerWidth * innerHeight * 0.2) continue;
+      if (area > bestArea) {
+        bestArea = area;
+        best = el;
+      }
+    }
+    if (best) return best;
+  }
+
+  return doc;
+}
+
 function describe(el: Element): string {
   // A click detail of just "<button>" is undebuggable and untrustworthy for
   // the model — icon-only buttons have empty innerText, so fall back to the
@@ -255,13 +303,33 @@ export async function act(action: AgentAction): Promise<ActionResult> {
       case "scroll": {
         const direction = input.direction === "up" ? -1 : 1;
         const amount = typeof input.amount === "number" ? input.amount : innerHeight * 0.8;
-        scrollBy({ top: direction * amount, behavior: "instant" as ScrollBehavior });
-        // A scroll either moves the page immediately or never — keep the
-        // start window short, let lazy-loaded content extend the settle.
+        // Scroll the container that actually moves (document OR app shell).
+        // Reporting `moved` matters: a scroll that changed nothing must not
+        // be described as if it had.
+        const el = findScroller();
+        const doc = document.scrollingElement ?? document.documentElement;
+        const inner = el !== doc;
+        const before = inner ? (el as HTMLElement).scrollTop : scrollY;
+        if (inner) {
+          (el as HTMLElement).scrollTop = before + direction * amount;
+        } else {
+          scrollBy({ top: direction * amount, behavior: "instant" as ScrollBehavior });
+        }
         await settle({ start: 200, ceiling: 1200 });
-        const atBottom = scrollY + innerHeight >= document.body.scrollHeight - 4;
+        const after = inner ? (el as HTMLElement).scrollTop : scrollY;
+        const height = inner ? (el as HTMLElement).clientHeight : innerHeight;
+        const total = inner
+          ? (el as HTMLElement).scrollHeight
+          : Math.max(doc.scrollHeight, document.body.scrollHeight, innerHeight);
+        const moved = Math.abs(after - before) > 1;
+        if (!moved) {
+          return done(
+            `Scrolled but nothing moved — ${inner ? "this panel" : "the page"} is already at its ${direction === 1 ? "bottom" : "top"}. Use read_page to see the current content.`,
+          );
+        }
+        const atBottom = after + height >= total - 4;
         return done(
-          `Scrolled ${input.direction === "up" ? "up" : "down"}. Now at y=${Math.round(scrollY)}` +
+          `Scrolled ${direction === 1 ? "down" : "up"}${inner ? " (app panel)" : ""}. Now at y=${Math.round(after)}` +
             (atBottom ? " (bottom of page)." : "."),
         );
       }

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>PRY capture &amp; PII redaction fixture</title>
+<style>
+  body { font-family: Georgia, serif; max-width: 880px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }
+  h1 { font-size: 22px; border-bottom: 2px solid #1a1a1a; padding-bottom: 8px; }
+  h2 { font-size: 15px; text-transform: uppercase; letter-spacing: 0.08em; margin-top: 28px; }
+  .warn { background: #fde8e8; border: 1px solid #d0202e; padding: 10px 12px; font-size: 13px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; margin: 6px 0; }
+  .row label { min-width: 130px; font-size: 13px; }
+  .row input { flex: 1; min-width: 220px; padding: 4px 6px; font-size: 13px; }
+  .decoy { color: #555; font-size: 14px; }
+  .file-block { background: #f4f4f4; border: 1px solid #ccc; padding: 12px; font-family: Consolas, monospace; font-size: 13px; white-space: pre-wrap; }
+  .pass { color: #0a7d33; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>PRY capture &amp; PII redaction fixture</h1>
+<p class="warn">
+  Every value on this page is synthetic. Run a PRY task against it, then open
+  the privacy audit: every field below should appear tokenized in the model
+  context AND blurred or masked in the redacted screenshot — including the
+  plain-text section, which is the case that used to leak.
+</p>
+
+<h2>1. Form fields (input channel)</h2>
+<div class="row"><label>Password</label><input id="pw" type="password" autocomplete="current-password" value="hunter2-not-real" /></div>
+<div class="row"><label>OTP</label><input id="otp" autocomplete="one-time-code" inputmode="numeric" value="482913" /></div>
+<div class="row"><label>Card number</label><input id="ccnum" autocomplete="cc-number" value="4111 1111 1111 1111" /></div>
+<div class="row"><label>CVV</label><input id="cvv" autocomplete="cc-csc" value="737" /></div>
+<div class="row"><label>Email</label><input id="email" type="email" autocomplete="email" value="priya.sharma@example.in" /></div>
+<div class="row"><label>Phone</label><input id="tel" type="tel" autocomplete="tel" value="+91 98765 43210" /></div>
+<div class="row"><label>Address</label><input id="addr" autocomplete="address-line1" value="12 MG Road, Indiranagar" /></div>
+<div class="row"><label>Full name</label><input id="fullname" autocomplete="name" value="Priya Sharma" /></div>
+<div class="row"><label>Aadhaar</label><input id="aadhaar" name="aadhaar_no" value="2345 6789 0124" /></div>
+<div class="row"><label>PAN</label><input id="pan" name="pan_card" value="AAACR5055K" /></div>
+
+<h2>2. Plain text (the channel that used to leak)</h2>
+<p>
+  This paragraph is not an input field. Before the fix, an email like
+  rahul.sharma@gmail.com or a phone like +91 98765 43210 written here was
+  tokenized for the model but stayed readable in the screenshot.
+</p>
+<div class="file-block">invoice-2026.txt
+--------------------------------------------------
+Billed to:  Priya Sharma
+Email:      priya.sharma@example.in
+Phone:      +91 98765 43210
+Aadhaar:    2345 6789 0124
+PAN:        AAACR5055K
+Card:       4111 1111 1111 1111
+Amount:     Rs 12,499 (order ref 773409112233)
+--------------------------------------------------
+Thank you for your business.</div>
+
+<h2>3. Decoys (must NOT be redacted — no over-redaction)</h2>
+<p class="decoy">Order reference 987654321098 is a 12-digit number that fails the Verhoeff checksum — it is an order id, not an Aadhaar.</p>
+<p class="decoy">The card-shaped string 4111 1111 1111 1112 fails Luhn and must stay visible.</p>
+<p class="decoy">Timestamps like 1789027858822 and hex hashes d447d02a42efc9 must never be flagged.</p>
+<p class="decoy">Plain prose: The quick brown fox jumps over the lazy dog near the riverbank.</p>
+<p class="pass">Expected result after a PRY run: values in sections 1 and 2 are tokenized in the model context and masked/blurred in the redacted screenshot; section 3 stays readable, with any checksum-rejected lookalikes counted as measured false positives.</p>
+
+<button type="button" id="fake-confirm">Confirm payment</button>
+</body>
+</html>

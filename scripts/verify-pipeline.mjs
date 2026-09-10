@@ -1572,4 +1572,60 @@ ok("match positions are exact and ordered",
   positioned.every((m) => m.start < m.end && m.end <= "email foo.bar@x.co here".length)
     && positioned[0].start === 6);
 
+// ─── Scenario AB: wire log — the runtime leak re-scan ──────────────────────
+console.log("\n=== Scenario AB: wire log records and runtime leak scan ===\n");
+
+const wireLog = await import("../src/background/wire-log.ts");
+
+// Token syntax is the sanitized form and must never count as a leak.
+ok("tokensIn finds and dedupes tokens",
+  JSON.stringify(wireLog.tokensIn("to <CRED_1> from <CRED_1> and <ID_2>")) === '["<CRED_1>","<ID_2>"]',
+  JSON.stringify(wireLog.tokensIn("to <CRED_1> from <CRED_1> and <ID_2>")));
+ok("scanForLeaks: pure token payload has NO leaks",
+  wireLog.scanForLeaks("Email sent to <CRED_1>. From <PII_3> at <ID_2>. totalChars 400").length === 0,
+  JSON.stringify(wireLog.scanForLeaks("Email sent to <CRED_1>. From <PII_3> at <ID_2>.")));
+ok("scanForLeaks: a real email that survived IS a leak, masked",
+  (() => {
+    const leaks = wireLog.scanForLeaks("sent to rahul.sharma@gmail.com ok");
+    return leaks.length === 1 && leaks[0].label === "Email address"
+      && !leaks[0].sample.includes("rahul.sharma");
+  })(),
+  JSON.stringify(wireLog.scanForLeaks("sent to rahul.sharma@gmail.com ok")));
+ok("scanForLeaks: empty payload is clean", wireLog.scanForLeaks("").length === 0);
+
+// Record + cap behavior.
+wireLog.clearWire();
+for (let i = 0; i < 30; i++) {
+  wireLog.recordWire({
+    turn: i,
+    destination: `provider-${i}`,
+    systemChars: 100,
+    messages: [{ role: "user", text: `turn ${i} clean message` }],
+    tokens: [],
+    leaked: [],
+    totalChars: 100,
+  });
+}
+const allRecords = wireLog.wireRecords();
+ok("wire log caps at 24 records", allRecords.length === 24, `got ${allRecords.length}`);
+ok("wire log keeps the NEWEST records after capping",
+  allRecords[allRecords.length - 1].turn === 29 && allRecords[0].turn === 6);
+ok("recordWire assigns ids and timestamps",
+  allRecords[0].id.startsWith("w") && allRecords[0].at > 0);
+
+// A leak recorded at send time is preserved in the record (the loud banner).
+wireLog.clearWire();
+wireLog.recordWire({
+  turn: 1,
+  destination: "Groq demo",
+  systemChars: 50,
+  messages: [{ role: "user", text: "clean" }],
+  tokens: [],
+  leaked: [{ label: "Email address", sample: "ra•••@gmail.com" }],
+  totalChars: 60,
+});
+ok("leaked findings are preserved on the record (loud banner data)",
+  wireLog.wireRecords()[0].leaked.length === 1
+    && wireLog.wireRecords()[0].leaked[0].label === "Email address");
+
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

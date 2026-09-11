@@ -5,7 +5,7 @@
  * onto an OffscreenCanvas, honoring devicePixelRatio and avoiding header repetition.
  */
 
-import type { PageMetrics } from "../content/fullpage";
+import type { PageMetrics } from "../shared/types";
 
 const CAPTURE_INTERVAL_MS = 500;
 const MAX_IMAGE_HEIGHT = 16000;
@@ -44,13 +44,16 @@ export async function captureAndStitchFullPage(
   tabId: number,
   windowId: number,
 ): Promise<StitchResult | null> {
+  // Ensure the target tab is active in its window so captureVisibleTab captures it
+  await chrome.tabs.update(tabId, { active: true }).catch(() => null);
+
   // 1. Initialize full-page mode in content script
   const startMetrics = await sendTab<PageMetrics>(tabId, { kind: "fullpage-begin" });
   if (!startMetrics) return null;
 
   const { pageWidth, pageHeight, viewportHeight, dpr } = startMetrics;
-  const canvasWidth = Math.round(pageWidth * dpr);
-  const canvasHeight = Math.min(MAX_IMAGE_HEIGHT, Math.round(pageHeight * dpr));
+  const canvasWidth = Math.max(1, Math.round(pageWidth * dpr));
+  const canvasHeight = Math.max(1, Math.min(MAX_IMAGE_HEIGHT, Math.round(pageHeight * dpr)));
 
   const canvas = new OffscreenCanvas(canvasWidth, canvasHeight);
   const ctx = canvas.getContext("2d", { willReadFrequently: true });

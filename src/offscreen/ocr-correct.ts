@@ -132,26 +132,26 @@ export function correctOcrText(text: string): { correctedText: string; correctio
   let updated = text;
 
   // 1. Scan for potential Aadhaar numbers (e.g. 12 alnum/digits separated or grouped)
-  const aadhaarRegex = /\b([0-9A-Za-z]{4}[\s-][0-9A-Za-z]{4}[\s-][0-9A-Za-z]{4})\b/g;
+  const aadhaarRegex = /\b([0-9A-Za-z]{4}[\s-]?[0-9A-Za-z]{4}[\s-]?[0-9A-Za-z]{4})\b/g;
   for (const m of text.matchAll(aadhaarRegex)) {
     const corrected = correctDigitSequence(m[1], "aadhaar");
     if (corrected) {
       const formatted = `${corrected.slice(0, 4)} ${corrected.slice(4, 8)} ${corrected.slice(8)}`;
       if (formatted !== m[1]) {
-        updated = updated.replace(m[1], formatted);
+        updated = updated.split(m[1]).join(formatted);
         corrections.push({ original: m[1], corrected: formatted, kind: "aadhaar", confidence: 0.98 });
       }
     }
   }
 
   // 2. Scan for potential Cards (16 alnum grouped)
-  const cardRegex = /\b([0-9A-Za-z]{4}[\s-][0-9A-Za-z]{4}[\s-][0-9A-Za-z]{4}[\s-][0-9A-Za-z]{4})\b/g;
+  const cardRegex = /\b([0-9A-Za-z]{4}[\s-]?[0-9A-Za-z]{4}[\s-]?[0-9A-Za-z]{4}[\s-]?[0-9A-Za-z]{4})\b/g;
   for (const m of text.matchAll(cardRegex)) {
     const corrected = correctDigitSequence(m[1], "card");
     if (corrected) {
       const formatted = `${corrected.slice(0, 4)} ${corrected.slice(4, 8)} ${corrected.slice(8, 12)} ${corrected.slice(12)}`;
       if (formatted !== m[1]) {
-        updated = updated.replace(m[1], formatted);
+        updated = updated.split(m[1]).join(formatted);
         corrections.push({ original: m[1], corrected: formatted, kind: "card", confidence: 0.98 });
       }
     }

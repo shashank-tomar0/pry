@@ -132,6 +132,7 @@ interface SensitiveRegion {
   height: number;
   kind: string;
   label: string;
+  value?: string;
 }
 
 // ─── Skin-Color Face Detection ──────────────────────────────────────────────
@@ -479,7 +480,7 @@ async function processScreenshot(
       ctx.lineWidth = Math.max(1, Math.round(scale));
       ctx.strokeRect(rx, ry, rw, rh);
 
-      const surrogateText = getSyntheticSurrogate(region.kind || region.label);
+      const surrogateText = getSyntheticSurrogate(region.kind || region.label, region.value);
       ctx.fillStyle = "#0f172a";
       ctx.font = `600 ${Math.max(9, Math.round(Math.min(rh * 0.45, 12 * scale)))}px system-ui, -apple-system, sans-serif`;
       ctx.textBaseline = "middle";

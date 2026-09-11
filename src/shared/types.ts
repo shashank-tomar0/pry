@@ -264,7 +264,8 @@ export type PanelCommand =
       helpful: boolean;
     }
   | { kind: "capture-fullpage"; tabId: number }
-  | { kind: "inspect-tab"; tabId: number; fullPage?: boolean };
+  | { kind: "inspect-tab"; tabId: number; fullPage?: boolean }
+  | { kind: "export-ledger" };
 
 export interface Settings {
   provider: ProviderId;
@@ -420,4 +421,50 @@ export function normaliseSettings(stored: unknown): Settings {
   if (raw.model && !raw.models) settings.models.anthropic = raw.model;
 
   return settings;
+}
+
+export interface PageMetrics {
+  scrollX: number;
+  scrollY: number;
+  pageWidth: number;
+  pageHeight: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  dpr: number;
+  stickyHidden: number;
+}
+
+export interface InspectData {
+  tab: { id?: number; title?: string; url?: string };
+  original: string;
+  redacted: string;
+  width: number;
+  height: number;
+  tiles: number;
+  detections: Array<{
+    kind: string;
+    label: string;
+    confidence: number;
+    box?: { x: number; y: number; width: number; height: number };
+  }>;
+  redactedCount: number;
+  processingTimeMs: number;
+  verification?: {
+    verified: boolean;
+    confidence: number;
+    summary: string;
+    checkedAt: number;
+  };
+  vault: Array<{
+    token: string;
+    kind: string;
+    original: string;
+    createdAt: number;
+  }>;
+  snapshot?: {
+    elements?: PageElement[];
+    text?: string;
+    title?: string;
+    url?: string;
+  } | null;
 }

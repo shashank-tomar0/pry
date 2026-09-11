@@ -13,6 +13,7 @@
 import type { ContentRequest, ActionResult } from "../shared/types";
 import { act } from "./act";
 import { snapshot, getSensitiveRegions, locateSpans } from "./perceive";
+import { beginFullPageCapture, scrollToY, restoreFullPageCapture } from "./fullpage";
 
 chrome.runtime.onMessage.addListener(
   (request: ContentRequest, _sender, sendResponse: (r: unknown) => void) => {
@@ -65,6 +66,21 @@ chrome.runtime.onMessage.addListener(
           sensitiveRegions: locateSpans((request as { spans?: string[] }).spans ?? []),
           dpr: window.devicePixelRatio || 1,
         });
+        return false;
+
+      case "fullpage-begin":
+        sendResponse(beginFullPageCapture());
+        return false;
+
+      case "fullpage-scroll":
+        scrollToY(request.y, request.hideSticky)
+          .then(sendResponse)
+          .catch(() => sendResponse(null));
+        return true;
+
+      case "fullpage-restore":
+        restoreFullPageCapture();
+        sendResponse({ ok: true });
         return false;
 
       case "capture-and-act":

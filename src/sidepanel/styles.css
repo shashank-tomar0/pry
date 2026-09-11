@@ -1179,6 +1179,13 @@ body::after {
   align-items: flex-start;
   justify-content: center;
 }
+.zoom-inner {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  max-height: 100%;
+}
+.zoom-inner img,
 .zoom-frame img {
   max-width: 100%;
   max-height: 100%;
@@ -1193,6 +1200,7 @@ body::after {
   min-width: 100%;
   min-height: 100%;
 }
+.zoom-frame.zoom-one .zoom-inner,
 .zoom-frame.zoom-one img {
   max-width: none;
   max-height: none;

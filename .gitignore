@@ -1,6 +1,13 @@
 node_modules/
 dist/
 *.log
+
+# Large model binaries (download via: node scripts/fetch-models.mjs)
+models/ner/onnx/
+models/guard/
+
+# Large build artifacts
+landing/*.zip
 .DS_Store
 .rocketride/
 

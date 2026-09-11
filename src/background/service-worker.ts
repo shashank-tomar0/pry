@@ -889,6 +889,114 @@ chrome.runtime.onMessage.addListener(
         sendResponse({ ok: true });
         return false;
 
+      case "capture-fullpage":
+        void (async () => {
+          const tabId = command.tabId;
+          const tab = tabId ? await chrome.tabs.get(tabId).catch(() => null) : null;
+          if (!tab || !tab.windowId) {
+            sendResponse({ ok: false, error: "Tab not found" });
+            return;
+          }
+          const { captureAndStitchFullPage } = await import("./stitch");
+          const result = await captureAndStitchFullPage(tab.id!, tab.windowId);
+          sendResponse({ ok: Boolean(result), result });
+        })();
+        return true;
+
+      case "inspect-tab":
+        void (async () => {
+          const tabId = command.tabId;
+          const fullPage = Boolean(command.fullPage);
+          const tab = tabId ? await chrome.tabs.get(tabId).catch(() => null) : null;
+          if (!tab || !tab.windowId) {
+            sendResponse({ ok: false, error: "Tab not found" });
+            return;
+          }
+
+          try {
+            // 1. Capture snapshot via content script
+            const snapshot = await chrome.tabs.sendMessage(tabId, { kind: "snapshot" }).catch(() => null);
+
+            // 2. Capture screenshot (fullpage or viewport)
+            let rawDataUrl: string | null = null;
+            let width = 0;
+            let height = 0;
+            let tilesCount = 1;
+
+            if (fullPage) {
+              const { captureAndStitchFullPage } = await import("./stitch");
+              const stitchRes = await captureAndStitchFullPage(tabId, tab.windowId);
+              if (stitchRes) {
+                rawDataUrl = stitchRes.dataUrl;
+                width = stitchRes.width;
+                height = stitchRes.height;
+                tilesCount = stitchRes.tiles;
+              }
+            }
+
+            if (!rawDataUrl) {
+              const cap = await captureVisibleTab(tabId);
+              if (cap) {
+                rawDataUrl = cap.dataUrl;
+                width = cap.width;
+                height = cap.height;
+              }
+            }
+
+            if (!rawDataUrl) {
+              sendResponse({ ok: false, error: "Failed to capture tab screenshot." });
+              return;
+            }
+
+            // 3. Sensitive regions & DPR
+            const sensitiveData = await getSensitiveRegions(tabId);
+            const dpr = sensitiveData?.dpr ?? 1;
+            const sensitiveRegions = sensitiveData?.regions ?? [];
+
+            // 4. Run through privacy pipeline
+            const settings = await loadSettings();
+            const processed = await processScreenshot(
+              rawDataUrl,
+              width,
+              height,
+              sensitiveRegions,
+              dpr,
+              {
+                blurFaces: settings.privacy.blurFaces,
+                maskCredentials: settings.privacy.maskCredentials,
+                showRedactionLabels: settings.privacy.showRedactionLabels,
+              },
+            );
+
+            // 5. Query vault entries from tokenizer
+            const vaultEntries = tokenizer.getEntries();
+
+            sendResponse({
+              ok: true,
+              result: {
+                tab: { id: tab.id, title: tab.title, url: tab.url },
+                original: rawDataUrl,
+                redacted: processed.redactedDataUrl,
+                width,
+                height,
+                tiles: tilesCount,
+                detections: processed.detections,
+                redactedCount: processed.redactedCount,
+                processingTimeMs: processed.processingTimeMs,
+                verification: processed.verification,
+                vault: vaultEntries,
+                snapshot,
+              },
+            });
+          } catch (err) {
+            sendResponse({
+              ok: false,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        })();
+        return true;
+
       default:
         return false;
     }

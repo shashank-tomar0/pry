@@ -497,7 +497,7 @@ function renderPrivacyAudit(audit: {
       if (shot.redacted) {
         // Overlays for the redacted image: THIS frame's own 0-1 boxes, so the
         // proof marker sits exactly on this frame's redactions.
-        pair.appendChild(buildShot(shot.redacted, "Redacted — what shipped to the model", shot.detections ?? [], false));
+        pair.appendChild(buildShot(shot.redacted, "Redacted — what shipped to the model", shot.detections ?? [], true));
       }
       screenshotsEl.appendChild(pair);
     }
@@ -606,6 +606,7 @@ const OVERLAY_COLORS: Record<string, string> = {
   email: "#ef4444",
   phone: "#ef4444",
   id_text: "#ef4444",
+  name_text: "#8b5cf6",
   ner_text: "#3b82f6",
 };
 
@@ -629,16 +630,17 @@ function buildShot(
   shot.setAttribute("data-zoom-src", src);
   shot.setAttribute("data-zoom-title", label);
   const img = document.createElement("img");
-  img.src = src;
-  img.alt = label;
-  img.loading = "lazy";
-  img.addEventListener("load", () => {
-    // Lock the container to the image's true aspect so the percentage
-    // overlay boxes map 1:1 onto the rendered pixels.
+  const updateAspect = () => {
     if (img.naturalWidth > 0 && img.naturalHeight > 0) {
       shot.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
     }
-  });
+  };
+  img.addEventListener("load", updateAspect);
+  img.src = src;
+  img.alt = label;
+  img.loading = "lazy";
+  if (img.complete) updateAspect();
+
   const labelEl = document.createElement("div");
   labelEl.className = "shot-label";
   labelEl.textContent = label;
@@ -686,17 +688,23 @@ function openZoom(shot: HTMLElement): void {
   const img = document.createElement("img");
   img.src = src;
   img.alt = title;
+
   const frame = document.createElement("div");
   frame.className = "zoom-frame";
-  frame.appendChild(img);
+
+  // Wrap tightly so the overlay sits 1:1 on the image pixels, not the window
+  const inner = document.createElement("div");
+  inner.className = "zoom-inner";
+  inner.appendChild(img);
 
   // Same overlay proof, scaled to the zoomed image.
   const overlay = shot.querySelector(".shot-overlay");
   if (overlay) {
     const clone = overlay.cloneNode(true) as HTMLElement;
     clone.className = "zoom-overlay";
-    frame.appendChild(clone);
+    inner.appendChild(clone);
   }
+  frame.appendChild(inner);
   body.appendChild(frame);
   applyZoomFit(frame, img);
 
@@ -1285,6 +1293,11 @@ $("new-task-btn").addEventListener("click", () => {
 
 // Settings
 $("btn-settings").addEventListener("click", () => chrome.runtime.openOptionsPage());
+
+// Deep Privacy Inspector tab
+$("btn-inspector")?.addEventListener("click", () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL("inspector.html") });
+});
 
 // ─── History Panel ──────────────────────────────────────────────────────
 

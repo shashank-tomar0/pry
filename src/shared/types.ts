@@ -110,7 +110,10 @@ export type ContentRequest =
   | { kind: "capture-screenshot" }
   | { kind: "capture-and-act"; action: AgentAction }
   | { kind: "get-sensitive-regions" }
-  | { kind: "locate-spans"; spans: string[] };
+  | { kind: "locate-spans"; spans: string[] }
+  | { kind: "fullpage-begin" }
+  | { kind: "fullpage-scroll"; y: number; hideSticky: boolean }
+  | { kind: "fullpage-restore" };
 
 /** A rendered entry in the side panel transcript. */
 export interface TranscriptEntry {
@@ -259,7 +262,9 @@ export type PanelCommand =
       experienceId: string;
       /** True = the run satisfied the user; false = it did not. */
       helpful: boolean;
-    };
+    }
+  | { kind: "capture-fullpage"; tabId: number }
+  | { kind: "inspect-tab"; tabId: number; fullPage?: boolean };
 
 export interface Settings {
   provider: ProviderId;
@@ -271,6 +276,8 @@ export interface Settings {
   maxSteps: number;
   /** Ask before click/type on anything that looks irreversible. */
   confirmRisky: boolean;
+  /** Full-page scroll stitching capture for whole-document privacy inspection. */
+  fullPageCapture?: boolean;
   /**
    * Optional VLM vision: after each page change, the REDACTED screenshot is
    * sent to a vision-capable model (same provider key as the planner) and its
@@ -348,6 +355,7 @@ export const DEFAULT_SETTINGS: Settings = {
   },
   maxSteps: 40,
   confirmRisky: true,
+  fullPageCapture: false,
   vision: {
     enabled: false,
     model: "",
@@ -394,6 +402,7 @@ export function normaliseSettings(stored: unknown): Settings {
   const settings: Settings = {
     ...DEFAULT_SETTINGS,
     ...raw,
+    fullPageCapture: raw.fullPageCapture ?? DEFAULT_SETTINGS.fullPageCapture,
     apiKeys: { ...DEFAULT_SETTINGS.apiKeys, ...(raw.apiKeys ?? {}) },
     models: { ...DEFAULT_SETTINGS.models, ...(raw.models ?? {}) },
     vision: {

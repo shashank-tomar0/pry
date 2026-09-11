@@ -34,6 +34,8 @@ await cp("src/sidepanel/styles.css", "dist/styles.css");
 await cp("src/assets/fonts", "dist/fonts", { recursive: true });
 await cp("src/options/index.html", "dist/options.html");
 await cp("src/offscreen/index.html", "dist/offscreen.html");
+await cp("src/inspector/index.html", "dist/inspector.html");
+await cp("src/inspector/inspector.css", "dist/inspector.css");
 await cp("icons", "dist/icons", { recursive: true });
 
 // Copy model files if they exist.
@@ -114,6 +116,7 @@ const builds = [
       "service-worker": "src/background/service-worker.ts",
       sidepanel: "src/sidepanel/sidepanel.ts",
       options: "src/options/options.ts",
+      inspector: "src/inspector/inspector.ts",
       "offscreen/offscreen": "src/offscreen/offscreen.ts",
     },
   },

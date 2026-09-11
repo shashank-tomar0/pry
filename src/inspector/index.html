@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PRY — Deep Privacy Inspector</title>
+    <link rel="stylesheet" href="fonts/fonts.css" />
+    <link rel="stylesheet" href="inspector.css" />
+  </head>
+  <body class="inspector">
+    <header class="bar">
+      <div class="brand">
+        <span class="brand-title">PRY — DEEP PRIVACY INSPECTOR</span>
+        <span class="brand-sub">FORENSIC REDACTION &amp; RESIDUAL AUDIT</span>
+      </div>
+      <div class="bar-actions">
+        <select id="tab-picker" title="Tab to inspect"></select>
+        <label class="toggle-wrap" title="Capture and stitch the whole scrollable page">
+          <input type="checkbox" class="toggle" id="full-page" />
+          <span>Whole page</span>
+        </label>
+        <button id="scan" class="btn btn-primary">Scan Tab</button>
+        <button id="clear-wire" class="btn btn-secondary" title="Clear wire log">Clear Wire</button>
+      </div>
+    </header>
+
+    <p class="notice">
+      Capture &rarr; detect PII (regex + checksum + ML NER) &rarr; tokenize text &rarr; burn pixels (BlazeFace + solid text blackboxing) &rarr; adversarial re-OCR verify. Nothing here is sent to a remote model — this is what <em>would</em> cross the wire.
+    </p>
+
+    <div id="status" class="status"></div>
+
+    <section id="residual-banner" class="residual hidden"></section>
+    <section id="summary" class="summary hidden"></section>
+
+    <div class="split">
+      <section class="pane">
+        <div class="pane-head">
+          <h2>Screenshot Verification</h2>
+          <div class="switch" id="shot-switch">
+            <button data-view="redacted" aria-pressed="true">Redacted</button>
+            <button data-view="original" aria-pressed="false">Original</button>
+          </div>
+        </div>
+        <div class="shot-wrap">
+          <canvas id="shot"></canvas>
+          <p id="shot-note" class="hint"></p>
+        </div>
+      </section>
+
+      <section class="pane">
+        <div class="pane-head">
+          <h2>Token Vault</h2>
+          <span class="hint" id="vault-note"></span>
+        </div>
+        <div id="vault" class="vault"></div>
+      </section>
+    </div>
+
+    <div class="split">
+      <section class="pane">
+        <div class="pane-head">
+          <h2>Detected Findings</h2>
+          <div class="filters" id="filters"></div>
+        </div>
+        <div id="findings" class="findings"></div>
+      </section>
+
+      <section class="pane">
+        <div class="pane-head">
+          <h2>DOM Text Sent to Planner</h2>
+          <div class="switch" id="text-switch">
+            <button data-view="after" aria-pressed="true">Sanitized</button>
+            <button data-view="before" aria-pressed="false">Raw</button>
+          </div>
+        </div>
+        <div id="textview" class="textview"></div>
+      </section>
+    </div>
+
+    <section class="pane full">
+      <div class="pane-head">
+        <h2>Sanitized Page Elements</h2>
+        <span class="hint" id="tree-stats"></span>
+      </div>
+      <div id="tree" class="tree"></div>
+    </section>
+
+    <script type="module" src="inspector.js"></script>
+  </body>
+</html>

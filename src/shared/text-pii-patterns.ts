@@ -17,7 +17,7 @@
 import { isAadhaarNumber, isCardNumber } from "./checksums";
 
 export interface TextPiiMatch {
-  kind: "email" | "phone" | "id_text";
+  kind: "email" | "phone" | "id_text" | "name_text";
   label: string;
   start: number;
   end: number;
@@ -29,6 +29,12 @@ const EMAIL_RE = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
 // internal separator ("98765 43210" / "98765-43210" / contiguous). Bounded so
 // a 12-digit Aadhaar fragment cannot be eaten as a phone.
 const PHONE_RE = /(?<!\d)(?:\+91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?!\d)/g;
+
+/** Honorific followed by capitalised name (Mr. John Doe, Dr. Jane Smith, etc.) */
+const HONORIFIC_NAME_RE = /\b(?:Mr\.|Mrs\.|Ms\.|Miss|Dr\.|Prof\.|Shri|Smt\.)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}\b/g;
+
+/** Cue phrase followed by name (Name: John Doe, Patient: Jane Smith, etc.) */
+const CUE_NAME_RE = /\b(?:Name|Patient|Customer|Employee|Cardholder|Account\s+Holder)\s*:\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b/gi;
 
 /** Checksum-validated ID shapes (formatted or raw where unambiguous). */
 const ID_SHAPES: Array<{ re: RegExp; label: string; validate: (v: string) => boolean }> = [
@@ -60,7 +66,14 @@ export function matchPiiInText(text: string): TextPiiMatch[] {
 
   collect(EMAIL_RE, "email", "Email address");
   collect(PHONE_RE, "phone", "Phone number");
+  collect(HONORIFIC_NAME_RE, "name_text", "Person name");
   for (const shape of ID_SHAPES) collect(shape.re, "id_text", shape.label, shape.validate);
+
+  for (const m of text.matchAll(CUE_NAME_RE)) {
+    if (m.index === undefined || !m[1]) continue;
+    const nameStart = m.index + m[0].indexOf(m[1]);
+    matches.push({ kind: "name_text", label: "Person name", start: nameStart, end: nameStart + m[1].length, value: m[1] });
+  }
 
   // Drop matches fully contained inside an earlier, longer match (the
   // formatted-Aadhaar-inside-a-card-number case). Sorted so containment is

@@ -15,6 +15,7 @@ const modelList = $<HTMLDataListElement>("model-list");
 const modelStatus = $("model-status");
 const maxStepsEl = $<HTMLInputElement>("maxSteps");
 const confirmRiskyEl = $<HTMLInputElement>("confirmRisky");
+const fullPageCaptureEl = $<HTMLInputElement>("fullPageCapture");
 
 // ElevenLabs voice (hack branch).
 const elApiKeyEl = $<HTMLInputElement>("elevenlabs-api-key");
@@ -113,6 +114,7 @@ function renderAll(): void {
   // Agent config.
   maxStepsEl.value = String(settings.maxSteps);
   confirmRiskyEl.checked = settings.confirmRisky;
+  fullPageCaptureEl.checked = Boolean(settings.fullPageCapture);
 
   // ElevenLabs voice.
   elApiKeyEl.value = settings.elevenlabs.apiKey;
@@ -272,6 +274,7 @@ $("save").addEventListener("click", async () => {
   captureFields();
   settings.maxSteps = Math.min(200, Math.max(5, Number(maxStepsEl.value) || 40));
   settings.confirmRisky = confirmRiskyEl.checked;
+  settings.fullPageCapture = fullPageCaptureEl.checked;
 
   // ElevenLabs: enabling either voice feature without a key is silently
   // a no-op (the side panel checks the flag + key together), but warn so
@@ -280,6 +283,16 @@ $("save").addEventListener("click", async () => {
   settings.elevenlabs.voiceId = elVoiceIdEl.value.trim() || "21m00Tcm4TlvDq8ikWAM";
   settings.elevenlabs.sttEnabled = elSttEl.checked;
   settings.elevenlabs.ttsEnabled = elTtsEl.checked;
+
+  // UX: If user provides an ElevenLabs API key but hasn't toggled voice,
+  // auto-enable both STT and TTS so the microphone button appears immediately.
+  if (settings.elevenlabs.apiKey && !settings.elevenlabs.sttEnabled && !settings.elevenlabs.ttsEnabled) {
+    settings.elevenlabs.sttEnabled = true;
+    settings.elevenlabs.ttsEnabled = true;
+    elSttEl.checked = true;
+    elTtsEl.checked = true;
+  }
+
   settings.ml.ner = mlNerEl.checked;
   settings.ml.guard = mlGuardEl.checked;
   if ((settings.elevenlabs.sttEnabled || settings.elevenlabs.ttsEnabled)

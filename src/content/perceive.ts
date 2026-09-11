@@ -391,6 +391,8 @@ export interface SensitiveRegion {
   kind: string;
   /** Human-readable label. */
   label: string;
+  /** Raw text/input value for deterministic Format-Preserving Encryption surrogacy. */
+  value?: string;
 }
 
 /**
@@ -413,6 +415,7 @@ export function getSensitiveRegions(): SensitiveRegion[] {
 
     processedElements.add(el);
     const kind = getSensitiveKind(el);
+    const val = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? (el.value || undefined) : undefined;
     regions.push({
       x: Math.round(rect.left),
       y: Math.round(rect.top),
@@ -420,6 +423,7 @@ export function getSensitiveRegions(): SensitiveRegion[] {
       height: Math.round(rect.height),
       kind,
       label: getSensitiveLabel(el, kind),
+      value: val,
     });
 
     // Also redact the associated label.
@@ -457,6 +461,7 @@ export function getSensitiveRegions(): SensitiveRegion[] {
     if (name.includes("search") || name === "q" || placeholder.includes("search") || role === "searchbox") continue;
 
     processedElements.add(el);
+    const val = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? (el.value || undefined) : undefined;
     regions.push({
       x: Math.round(rect.left),
       y: Math.round(rect.top),
@@ -464,6 +469,7 @@ export function getSensitiveRegions(): SensitiveRegion[] {
       height: Math.round(rect.height),
       kind: "input_field",
       label: getSensitiveLabel(el, "input_field"),
+      value: val,
     });
   }
 
@@ -593,6 +599,7 @@ export function locateSpans(spans: string[]): SensitiveRegion[] {
               height: Math.round(rect.height),
               kind: "ner_text",
               label: `NER: ${span.slice(0, 24)}`,
+              value: span,
             });
           }
         } catch {
@@ -704,6 +711,7 @@ function findTextRegions(): SensitiveRegion[] {
             height: Math.round(rect.height),
             kind: `${match.kind}_text`,
             label: `${match.label} in text`,
+            value: match.value,
           });
         }
       } catch {

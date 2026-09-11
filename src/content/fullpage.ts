@@ -14,24 +14,16 @@ let hiddenSticky: HiddenElement[] = [];
 let initialScroll: { x: number; y: number } | undefined;
 let initialScrollBehavior: string | undefined;
 
-export interface PageMetrics {
-  scrollX: number;
-  scrollY: number;
-  pageWidth: number;
-  pageHeight: number;
-  viewportWidth: number;
-  viewportHeight: number;
-  dpr: number;
-  stickyHidden: number;
-}
+import type { PageMetrics } from "../shared/types";
+export type { PageMetrics };
 
 export function getPageMetrics(): PageMetrics {
   const doc = document.documentElement;
   return {
     scrollX: Math.round(window.scrollX),
     scrollY: Math.round(window.scrollY),
-    pageWidth: Math.max(doc.scrollWidth, document.body.scrollWidth, window.innerWidth),
-    pageHeight: Math.max(doc.scrollHeight, document.body.scrollHeight, window.innerHeight),
+    pageWidth: Math.max(doc.scrollWidth, document.body ? document.body.scrollWidth : 0, window.innerWidth),
+    pageHeight: Math.max(doc.scrollHeight, document.body ? document.body.scrollHeight : 0, window.innerHeight),
     viewportWidth: window.innerWidth,
     viewportHeight: window.innerHeight,
     dpr: window.devicePixelRatio || 1,
@@ -48,6 +40,7 @@ export function beginFullPageCapture(): PageMetrics {
 }
 
 function findStickyElements(): HTMLElement[] {
+  if (!document.body) return [];
   const elements: HTMLElement[] = [];
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
   let node: Node | null;

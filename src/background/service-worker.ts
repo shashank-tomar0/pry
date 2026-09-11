@@ -402,12 +402,35 @@ async function getSensitiveRegions(tabId: number): Promise<{
 export async function captureAndProcessScreenshot(
   tabId: number,
   privacy: Settings["privacy"],
+  fullPage?: boolean,
 ): Promise<{
   original: string;
   processed: ProcessedScreenshotResult;
 } | null> {
-  const captured = await captureVisibleTab(tabId);
-  if (!captured) return null;
+  let rawDataUrl: string | null = null;
+  let width = 0;
+  let height = 0;
+
+  if (fullPage) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab && tab.windowId) {
+      const { captureAndStitchFullPage } = await import("./stitch");
+      const stitchRes = await captureAndStitchFullPage(tabId, tab.windowId);
+      if (stitchRes) {
+        rawDataUrl = stitchRes.dataUrl;
+        width = stitchRes.width;
+        height = stitchRes.height;
+      }
+    }
+  }
+
+  if (!rawDataUrl) {
+    const captured = await captureVisibleTab(tabId);
+    if (!captured) return null;
+    rawDataUrl = captured.dataUrl;
+    width = captured.width;
+    height = captured.height;
+  }
 
   // Sensitive regions + DPR come from the SAME tab we captured.
   const sensitiveData = await getSensitiveRegions(tabId);
@@ -428,17 +451,17 @@ export async function captureAndProcessScreenshot(
   const dpr = sensitiveData?.dpr ?? 1;
   const sensitiveRegions = sensitiveData?.regions ?? [];
 
-  console.log(`[PRY] Screenshot (tab ${tabId}): ${captured.width}x${captured.height} @ ${dpr}x DPR, ${sensitiveRegions.length} sensitive regions found`);
+  console.log(`[PRY] Screenshot (tab ${tabId}): ${width}x${height} @ ${dpr}x DPR, ${sensitiveRegions.length} sensitive regions found`);
 
   const processed = await processScreenshot(
-    captured.dataUrl, captured.width, captured.height, sensitiveRegions, dpr,
+    rawDataUrl, width, height, sensitiveRegions, dpr,
     {
       blurFaces: privacy.blurFaces,
       maskCredentials: privacy.maskCredentials,
       showRedactionLabels: privacy.showRedactionLabels,
     },
   );
-  return { original: captured.dataUrl, processed };
+  return { original: rawDataUrl, processed };
 }
 
 // ─── Privacy Audit Collector ────────────────────────────────────────────────
@@ -552,7 +575,7 @@ async function start(task: string, tabId: number): Promise<void> {
       // Bind the privacy toggles at run start so offscreen redaction honors
       // the user's settings rather than always running with defaults.
       captureScreenshot: (id) =>
-        captureAndProcessScreenshot(id, settings.privacy),
+        captureAndProcessScreenshot(id, settings.privacy, settings.fullPageCapture),
       recordAudit: recordAuditEntry,
       history: conversationMemory,
     });
@@ -848,6 +871,14 @@ chrome.runtime.onMessage.addListener(
         })();
         return true;
 
+      case "export-ledger":
+        void (async () => {
+          const { exportLedger } = await import("./privacy-ledger");
+          const json = await exportLedger();
+          sendResponse({ ok: true, json });
+        })();
+        return true;
+
       case "record-outcome": {
         void (async () => {
           const { updateExperienceOutcome } = await import("./experience-memory");
@@ -915,7 +946,10 @@ chrome.runtime.onMessage.addListener(
 
           try {
             // 1. Capture snapshot via content script
-            const snapshot = await chrome.tabs.sendMessage(tabId, { kind: "snapshot" }).catch(() => null);
+            const snapshotRes = await chrome.tabs.sendMessage(tabId, { kind: "snapshot" }).catch(() => null);
+            const snapshot = snapshotRes && typeof snapshotRes === "object" && "snapshot" in snapshotRes
+              ? (snapshotRes as any).snapshot
+              : snapshotRes;
 
             // 2. Capture screenshot (fullpage or viewport)
             let rawDataUrl: string | null = null;
@@ -968,7 +1002,16 @@ chrome.runtime.onMessage.addListener(
               },
             );
 
-            // 5. Query vault entries from tokenizer
+            // 5. Run tokenization pass so vault and tokens are populated
+            let tokenizedSnapshot = snapshot;
+            if (snapshot && processed.detections.length > 0) {
+              const tokenized = tokenizer.tokenizeDetections(snapshot, processed.detections);
+              tokenizedSnapshot = tokenizer.redactVaultValuesInSnapshot({
+                ...snapshot,
+                text: tokenized.text,
+                elements: tokenized.elements,
+              });
+            }
             const vaultEntries = tokenizer.getEntries();
 
             sendResponse({
@@ -985,7 +1028,7 @@ chrome.runtime.onMessage.addListener(
                 processingTimeMs: processed.processingTimeMs,
                 verification: processed.verification,
                 vault: vaultEntries,
-                snapshot,
+                snapshot: tokenizedSnapshot,
               },
             });
           } catch (err) {

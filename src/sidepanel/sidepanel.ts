@@ -1110,7 +1110,12 @@ async function loadLedger(): Promise<void> {
   const chainLabel = ls.chainValid ? "INTACT" : "TAMPERED";
 
   ledgerEl.innerHTML = `
-    <h4>Privacy Ledger</h4>
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+      <h4>Privacy Ledger</h4>
+      <button class="btn btn-sm" id="btn-export-ledger" title="Download certified Merkle DAG audit proof as JSON" style="font-size: 11px; padding: 2px 8px; cursor: pointer;">
+        📜 Export Proof
+      </button>
+    </div>
     <div class="ledger-summary">
       <div class="ledger-stat">
         <span class="number">${ls.totalEntries}</span>
@@ -1138,6 +1143,18 @@ async function loadLedger(): Promise<void> {
       </div>
     </div>
   `;
+
+  $("btn-export-ledger")?.addEventListener("click", async () => {
+    const res = (await send({ kind: "export-ledger" })) as { ok: boolean; json?: string };
+    if (!res?.ok || !res?.json) return;
+    const blob = new Blob([res.json], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `pry-audit-proof-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  });
 }
 
 // ─── Confirm Dialog ────────────────────────────────────────────────────────

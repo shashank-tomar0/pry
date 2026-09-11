@@ -1,5 +1,5 @@
 /**
- * PRY — Standalone Deep Privacy Inspector
+ * PRY - Standalone Deep Privacy Inspector
  *
  * Provides whole-page and viewport-level inspection across all browser tabs:
  * - Redacted vs Original screenshot comparison with bounding boxes
@@ -87,8 +87,8 @@ function escape(text: string): string {
 }
 
 function maskValue(val: string): string {
-  if (val.length <= 4) return "••••";
-  return val.slice(0, 2) + "••••" + val.slice(-2);
+  if (val.length <= 4) return "****";
+  return val.slice(0, 2) + "****" + val.slice(-2);
 }
 
 async function loadTabs(): Promise<void> {
@@ -105,7 +105,7 @@ async function loadTabs(): Promise<void> {
     } catch {
       /* extension pages & file: urls */
     }
-    option.textContent = `${tab.title || "untitled"} — ${host}`;
+    option.textContent = `${tab.title || "untitled"} - ${host}`;
     tabPicker.appendChild(option);
   }
   if (tabPicker.options.length === 0) {
@@ -141,9 +141,9 @@ async function drawShot(): Promise<void> {
   const coverage = currentData.tiles > 1 ? `full-page (${currentData.tiles} tiles stitched)` : "viewport";
 
   if (shotView === "redacted") {
-    shotNote.textContent = `${image.naturalWidth}x${image.naturalHeight}px · ${kb} KB · ${coverage} · ${currentData.redactedCount} regions masked. Shipped to planner.`;
+    shotNote.textContent = `${image.naturalWidth}x${image.naturalHeight}px - ${kb} KB - ${coverage} - ${currentData.redactedCount} regions masked. Shipped to planner.`;
   } else {
-    shotNote.textContent = `${image.naturalWidth}x${image.naturalHeight}px · ${kb} KB · ${coverage} · Raw un-redacted capture (NEVER leaves device). Outlines mark detection boxes.`;
+    shotNote.textContent = `${image.naturalWidth}x${image.naturalHeight}px - ${kb} KB - ${coverage} - Raw un-redacted capture (NEVER leaves device). Outlines mark detection boxes.`;
 
     // Draw detection boxes on original
     currentData.detections.forEach((det, idx) => {
@@ -283,7 +283,16 @@ function renderFindings(): void {
     row.addEventListener("click", () => {
       activeDetectionIndex = activeDetectionIndex === idx ? null : idx;
       renderFindings();
-      if (shotView === "original") void drawShot();
+      if (shotView !== "original") {
+        shotView = "original";
+        const origBtn = document.querySelector<HTMLButtonElement>("#shot-switch button[data-view='original']");
+        if (origBtn) {
+          for (const sib of document.querySelectorAll("#shot-switch button")) {
+            sib.setAttribute("aria-pressed", String(sib === origBtn));
+          }
+        }
+      }
+      void drawShot();
     });
     findingsEl.appendChild(row);
   });
@@ -370,7 +379,7 @@ async function scan(): Promise<void> {
     await drawShot();
 
     setStatus(
-      `? Scanned ${currentData.tab.title || "tab"} — ${currentData.detections.length} detections, ${
+      `? Scanned ${currentData.tab.title || "tab"} - ${currentData.detections.length} detections, ${
         currentData.redactedCount
       } masked in ${currentData.processingTimeMs}ms.`,
     );

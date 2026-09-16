@@ -29,9 +29,11 @@ any screenshot or page text reaches an AI model.
 >   moment, inside your browser.
 > - **Checksum-gated validation** — Verhoeff (Aadhaar) and Luhn (cards) kill
 >   regex false positives, so lookalike order numbers are never over-redacted.
-> - **Screenshot redaction with proof** — sensitive screen regions are masked or
->   blurred on-device, then the exact shipped image is re-OCR'd locally to verify
->   zero PII remains readable in the pixels.
+> - **Screenshot redaction with proof** — faces are destroyed with an opaque mask
+>   (never a reversible blur) and sensitive fields are masked or inpainted with
+>   synthetic surrogates on-device, then the exact shipped image is re-OCR'd
+>   locally; if anything is still readable, the frame is rebuilt opaque and
+>   re-verified before it can reach a model.
 > - **Egress tripwire** — the page's own requests are watched for PII-shaped
 >   leaks; intercepts are aggregated into one live EGRESS WATCH entry with a
 >   per-request radar log.
@@ -105,9 +107,14 @@ after launch (recipe in `docs/launch-kit.md` §A6).
 
 ## Pre-submission checklist
 
-1. `npm run verify` passes (223 assertions) and `npm run build` is clean.
-2. `publish/pry-agent-1.0.0.zip` contains the full `dist/` contents (see
-   `docs/launch-kit.md` §A2 for the packaging recipe).
+1. `npm run verify` passes (324 pipeline + 27 tripwire + 2 OCR assertions) and
+   `npm run build` is clean.
+2. `publish/pry-agent-1.0.0.zip` contains the full `dist/` contents — 80 entries,
+   including `models/ner/onnx/model_quantized.onnx` and
+   `models/blazeface/face_detection_short_range.tflite`. It is uploaded as a
+   GitHub Release asset and is deliberately NOT committed to the repo (see
+   `docs/launch-kit.md` → "Ship the downloadable build"); the landing button
+   points at `…/releases/latest/download/pry-agent-1.0.0.zip`.
 3. `dist/` loaded unpacked: toolbar icon (logo), side panel opens, a real task
    runs end-to-end.
 4. `icons/` contains the brand icon at 16/32/48/128 — all replaced, none left

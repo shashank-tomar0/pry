@@ -4872,7 +4872,12 @@
       <a class="nav-cta" href="privacy.html">
         <span>privacy</span><b>↗</b>
       </a>
-      <a class="nav-cta" href="pry-agent-1.0.0.zip" download="pry-agent-1.0.0.zip" style="background:#e23829; border-color:#e23829; color:#fff;">
+      <!-- Release asset, not a committed zip: the full build is ~125 MB (over
+           GitHub's 100 MB per-file limit) and a committed copy goes stale
+           silently — this button served a 26-entry zip with no model weights
+           in it. `npm run package` builds publish/pry-agent-1.0.0.zip; upload
+           it to a release with that exact asset name. -->
+      <a class="nav-cta" href="https://github.com/shashank-tomar0/pry/releases/latest/download/pry-agent-1.0.0.zip" download="pry-agent-1.0.0.zip" style="background:#e23829; border-color:#e23829; color:#fff;">
         <span>download zip</span><b>↓</b>
       </a>
     </div>
@@ -5500,7 +5505,7 @@ npm install && npm run build</pre>
         install: 'git clone https://github.com/shashank-tomar0/pry.git\ncd pry\nnpm install && npm run build',
         claude: '1. Open chrome://extensions/\n2. Enable Developer Mode\n3. Click "Load unpacked"\n4. Select the dist folder',
         codex: 'ollama pull qwen2.5:1.5b\nollama run qwen2.5:1.5b',
-        mcp: 'Direct ZIP URL:\nhttps://github.com/shashank-tomar0/pry/raw/main/landing/pry-agent-1.0.0.zip',
+        mcp: 'Direct ZIP URL:\nhttps://github.com/shashank-tomar0/pry/releases/latest/download/pry-agent-1.0.0.zip',
       };
       const out = document.querySelector("#command");
       document.querySelectorAll(".code-tab").forEach((t) =>

@@ -6,8 +6,15 @@ dist/
 models/ner/onnx/
 models/guard/
 
-# Large build artifacts
+# Large build artifacts.
+# Extension zips are NOT committed: the full build is ~125 MB, which is over
+# GitHub's 100 MB per-file limit, and a committed copy silently goes stale
+# (the landing page spent weeks serving a 26-entry zip with no models in it).
+# `npm run package` writes publish/pry-agent-1.0.0.zip; upload it as a GitHub
+# Release asset and let the landing button link to the release URL.
 landing/*.zip
+publish/*.zip
+/pry-agent-1.0.0.zip
 .DS_Store
 .rocketride/
 

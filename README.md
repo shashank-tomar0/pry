@@ -25,12 +25,12 @@ Developed for Smart India Hackathon 2026, Problem Statement 26171: *On-Device Vi
   - [5.2 Quantized BERT Token Classification (ONNX Runtime Web)](#52-quantized-bert-token-classification-onnx-runtime-web)
   - [5.3 Tesseract.js WebAssembly LSTM Engine (Adversarial Auditor)](#53-tesseractjs-webassembly-lstm-engine-adversarial-auditor)
   - [5.4 ElevenLabs Scribe Realtime and Flash v2.5](#54-elevenlabs-scribe-realtime-and-flash-v25)
-  - [5.5 Remote Multimodal Planner (NVIDIA NIM / Llama-3.3-70B)](#55-remote-multimodal-planner-nvidia-nim--llama-33-70b)
+  - [5.5 Remote Multimodal Planner (NVIDIA NIM)](#55-remote-multimodal-planner-nvidia-nim)
   - [5.6 Architectural Assessment: GLiNER Model Integration](#56-architectural-assessment-gliner-model-integration)
 - [6. Mathematical and Cryptographic Specifications](#6-mathematical-and-cryptographic-specifications)
-  - [6.1 Format-Preserving Encryption (NIST SP 800-38G FF3-1)](#61-format-preserving-encryption-nist-sp-800-38g-ff3-1)
+  - [6.1 Format-Preserving Surrogate Generation (hash-derived, not FF3-1)](#61-format-preserving-surrogate-generation-hash-derived-not-ff3-1)
   - [6.2 Mathematical Checksum Verification (Luhn and Verhoeff Algorithms)](#62-mathematical-checksum-verification-luhn-and-verhoeff-algorithms)
-  - [6.3 2D Gaussian Image Convolution Kernel](#63-2d-gaussian-image-convolution-kernel)
+  - [6.3 Visual Redaction Tiers and the Reversibility Test](#63-visual-redaction-tiers-and-the-reversibility-test)
   - [6.4 Immutable Merkle Directed Acyclic Graph (DAG) Ledger](#64-immutable-merkle-directed-acyclic-graph-dag-ledger)
 - [7. Outbound Egress Tripwire and Security Invariants](#7-outbound-egress-tripwire-and-security-invariants)
   - [7.1 Deny-by-Default Interception Architecture](#71-deny-by-default-interception-architecture)
@@ -55,11 +55,11 @@ Autonomous web agents require visual perception and DOM structural data to inter
 PRY establishes a local security boundary within the client runtime. It executes an on-device perception engine combining DOM heuristics with neural computer vision models running via WebGPU and WebAssembly SIMD.
 
 Key capabilities of PRY include:
-- Client-side redaction of faces, government IDs, biometric data, credentials, and payment records.
-- Generation of synthetic, format-preserving surrogates (NIST SP 800-38G FF3-1) with valid Luhn and Verhoeff checksums to preserve downstream model reasoning without exposing raw secrets.
-- Mathematical Gaussian convolution obfuscation across sensitive coordinates.
-- On-device adversarial OCR verification that actively tests blurred regions and elevates incomplete redactions to zero-entropy opaque fills.
-- Cryptographic Merkle DAG ledger that generates downloadable SHA-256 inclusion proofs verifying that redactions occurred before network transmission.
+- Client-side redaction of detected faces, government IDs, biometric data, credentials, and payment records.
+- Deterministic format-preserving surrogates: the replacement keeps the original's length, character classes, and checksum validity (Luhn for cards, Verhoeff for Aadhaar), so downstream validation and model reasoning survive the swap. The generator is a hash-derived, Feistel-style digit mapping — **not** a NIST SP 800-38G FF3-1 cipher (see §6.1).
+- Irreversible destruction of detected faces: the region is overwritten with an opaque fill. Deliberately NOT a blur — blur is a recoverable low-pass filter. Detection is best-effort across three local channels (BlazeFace, Chrome's shape detector, and a skin-colour pass that exists specifically to catch the thumbnail-sized faces a short-range model misses). The guarantee is irreversibility of what is detected; it is not a claim of complete detection.
+- On-device adversarial OCR verification of the exact bytes that ship: every redacted region is re-read from the post-JPEG frame, and the frame is rebuilt with those regions destroyed if any readable character survives. The proof covers the regions PRY redacted — it is not evidence that it detected everything on the page.
+- Tamper-evident SHA-256 ledger with an exportable Merkle root and full leaf list (`audit-proof.json`), verifying that the recorded redactions occurred in order before transmission.
 - Pre-flight egress tripwire intercepting unauthorized external network transmissions.
 
 ---
@@ -76,8 +76,8 @@ This transmission introduces serious security vulnerabilities:
 
 ### 2.2 Threat Vectors Addressed
 PRY defends against four distinct threat vectors:
-- **Threat Vector 1: Cloud Eavesdropping and Provider Breach.** Compromise of external model providers cannot expose user secrets because payloads contain only synthetic surrogates and blurred imagery.
-- **Threat Vector 2: Super-Resolution De-Blurring Attacks.** Simple pixelation or weak blur filters can be reversed using deep convolutional neural networks. PRY validates every redaction using an adversarial LSTM OCR engine.
+- **Threat Vector 1: Cloud Eavesdropping and Provider Breach.** Compromise of external model providers cannot expose user secrets because payloads contain only synthetic surrogates and opaque, zero-entropy masks. No original pixel of a redacted region is transmitted, so there is nothing in the payload to reconstruct.
+- **Threat Vector 2: Super-Resolution De-Blurring Attacks.** Simple pixelation and weak blur filters are recoverable: super-resolution deanonymization reconstructs Gaussian-blurred faces, and deconvolution inverts a known blur kernel. PRY therefore does not rely on blur for biometric identifiers. Faces are destroyed with an opaque fill, and any soft-tier region that the adversarial OCR auditor can still read is escalated to an opaque fill before the image ships.
 - **Threat Vector 3: Broken Agent Reasoning via Brittle Masking.** Replacing an account number with `[REDACTED]` breaks client-side form validation and confuses model reasoning. PRY produces synthetically valid, format-preserving numbers.
 - **Threat Vector 4: Unverifiable Compliance.** Organizations cannot prove to regulatory bodies that PII was withheld from external models. PRY outputs an immutable, mathematically verifiable Merkle audit DAG.
 
@@ -104,8 +104,8 @@ flowchart TD
 
         subgraph BackgroundSW["Service Worker (Event-Driven Core)"]
             Controller["Coordinator State Machine"]
-            Vault["Ephemeral RAM Vault\n- AES-GCM Encrypted Map"]
-            FPE["FPE Engine\n- NIST FF3-1\n- Luhn / Verhoeff Checksums"]
+            Vault["Token Map (service-worker RAM)\n- Plain Map, no encryption"]
+            FPE["Surrogate Engine\n- Format-preserving (unkeyed)\n- Luhn / Verhoeff Checksums"]
             Merkle["Merkle Audit Engine\n- SHA-256 DAG Computation"]
             Tripwire["Egress Tripwire\n- Outbound Payload Interceptor"]
         end
@@ -114,7 +114,7 @@ flowchart TD
             Canvas["Offscreen Canvas Target"]
             BlazeFace["MediaPipe BlazeFace\n- WebGPU Acceleration\n- Wasm SIMD Fallback"]
             BERT["Quantized BERT NER\n- ONNX Runtime Wasm"]
-            Convolution["Gaussian Convolution\n- 11x11 Discretized Kernel"]
+            Convolution["Redaction Engine\n- Opaque Destroy\n- Surrogate Inpaint\n- Box-Filter (soft tier)"]
             AdversarialOCR["Tesseract.js Wasm\n- Adversarial LSTM Re-OCR"]
         end
 
@@ -126,7 +126,7 @@ flowchart TD
     end
 
     subgraph ExternalCloud["External Cloud Endpoints"]
-        InferenceAPI["Remote Multimodal Planner\n- NVIDIA NIM (Llama-3.3-70B)"]
+        InferenceAPI["Remote Multimodal Planner\n- NVIDIA NIM (nemotron-3.5-lightning)"]
         VoiceAPI["ElevenLabs Realtime Audio\n- PCM16 Streaming"]
     end
 
@@ -152,14 +152,14 @@ flowchart TD
 
 ### 3.1 Manifest V3 Architectural Topology
 - **Content Scripts:** Execute within an Isolated World. They have read-only inspection access to the host page DOM but run in an isolated JavaScript namespace, preventing webpage scripts from tampering with PRY internal state.
-- **Service Worker:** The event-driven central coordinator. Manages communication across tabs, runs format-preserving encryption, maintains the ephemeral secret vault, builds the Merkle audit tree, and enforces outbound network tripwires.
-- **Offscreen Document:** Service workers in Manifest V3 do not have access to the DOM or the HTML5 Canvas API. PRY instantiates a dedicated offscreen document (`offscreen.html`) with hardware-accelerated WebGPU and WebAssembly capabilities to perform all computer vision, convolution filtering, and adversarial OCR operations.
+- **Service Worker:** The event-driven central coordinator. Manages communication across tabs, generates format-preserving surrogates, maintains the in-memory token map, builds the Merkle audit tree, and enforces outbound network tripwires.
+- **Offscreen Document:** Service workers in Manifest V3 do not have access to the DOM or the HTML5 Canvas API. PRY instantiates a dedicated offscreen document (`offscreen/index.html`) with hardware-accelerated WebGPU and WebAssembly capabilities to perform all computer vision, convolution filtering, and adversarial OCR operations.
 
 ### 3.2 Component Process Boundaries
 The extension maintains explicit process isolation:
 - No raw image data is stored in persistent extension storage (`chrome.storage.local`).
 - All bitmap representations reside in ephemeral offscreen memory and are garbage-collected immediately following redaction.
-- Secrets stored in the Vault reside exclusively in memory and are discarded upon tab closure.
+- Token↔value mappings live only in the service worker's heap: never written to `chrome.storage`, and cleared when the worker is torn down (§7.2). Not encrypted, not partitioned per tab.
 
 ---
 
@@ -191,19 +191,19 @@ sequenceDiagram
     end
 
     SW->>SW: Fuse Coordinates via Intersection-over-Union (IoU)
-    SW->>SW: Compute NIST FF3-1 Synthetic Surrogates (Store Plaintext in RAM Vault)
-    SW->>OS: Dispatch Redaction Coordinates for Gaussian Convolution
-    OS->>OS: Apply 11x11 Convolution Kernel (sigma = 3.5)
-    OS->>OS: Run Adversarial LSTM OCR on Blurred Regions
-    alt Residual Text Detected (Confidence > 60%)
-        OS->>OS: Elevate Region to Solid Mask (#000000)
+    SW->>SW: Compute Format-Preserving Surrogates (Plaintext Kept in the In-Memory Token Map)
+    SW->>OS: Dispatch Redaction Coordinates
+    OS->>OS: Faces -> Opaque Destroy; Text PII -> Solid Mask; Fields -> Surrogate / Soft Blur
+    OS->>OS: Run Adversarial LSTM OCR Over the Redacted Regions
+    alt Any Readable PII Survives
+        OS->>OS: Rebuild Frame From Original: Every Region Opaque (#000000), Re-encode, Re-verify
     end
     OS->>SW: Return Sanitized Image Data URL
     SW->>SW: Append Leaf to SHA-256 Merkle Ledger
     SW->>SW: Evaluate Egress Tripwire Policy
     SW->>LLM: Transmit Redacted Image and Synthetic Context
     LLM->>SW: Return Structured Action Plan
-    SW->>SW: Swap Synthetic Surrogates with True Values from Vault
+    SW->>SW: Swap Synthetic Surrogates with True Values from the Token Map
     SW->>CS: Execute Physical Action on DOM
 ```
 
@@ -245,22 +245,23 @@ PRY embeds all perceptual machine learning models locally. Zero perceptual infer
 
 ### 5.3 Tesseract.js WebAssembly LSTM Engine (Adversarial Auditor)
 - **Model Architecture:** Integer-quantized Long Short-Term Memory (LSTM) recurrent neural network compiled to WebAssembly.
-- **Functional Role:** Automated adversarial red-team auditor.
+- **Functional Role:** Automated adversarial red-team auditor that both detects and REMEDIATES weak redactions.
 - **Operational Logic:**
-  1. Gaussian convolution is applied to a target bounding box.
-  2. The redacted sub-canvas is fed into Tesseract.js.
-  3. If recognized alphanumeric text returns a recognition confidence score exceeding 60%, the blur filter is marked as insecure.
-  4. The region is immediately overwritten with an opaque, zero-entropy solid black rectangle (`#000000`).
+  1. Each redacted region is cropped from the EXACT bytes that will be shipped (the post-JPEG image) and composited into one strip.
+  2. Tesseract.js re-reads that strip. Scanning only the pipeline's own redacted crops is what keeps the check honest: PII legitimately visible elsewhere on the page (an email in an inbox row) is not a leak.
+  3. If any PII pattern still reads out of a region, the auditor does not merely warn. The whole frame is rebuilt from the untouched original pixels with every region destroyed (`#000000`), re-encoded, and re-verified.
+  4. Only the rebuilt image is allowed to reach the model, so a proven-insufficient redaction cannot ship.
+- **Pixel-level companion check:** independently of OCR, each region is compared against its pre-redaction pixels. Faces must come back near-uniformly opaque; a merely "changed" face region fails, because a change is not the same as irreversibility.
 
 ### 5.4 ElevenLabs Scribe Realtime and Flash v2.5
 - **Speech-to-Text (STT):** Custom Web Audio API pipeline sampling microphone input at 16,000 Hz in single-channel linear PCM16 format. Audio frames (250 ms) are streamed over WebSocket directly to the ElevenLabs Scribe endpoint.
 - **Text-to-Speech (TTS):** Generates low-latency operational audio responses via ElevenLabs Flash v2.5.
 - **Vocal Privacy Boundary:** All outgoing text is sanitized by `speakSafeTransform()`. Vault tokens (such as `<CRED_1>` or synthetic credit card numbers) are stripped, preventing accidental vocalization of secrets over speakers.
 
-### 5.5 Remote Multimodal Planner (NVIDIA NIM / Llama-3.3-70B)
-- **Model:** `meta/llama-3.3-70b-instruct` accessed through the NVIDIA NIM API.
+### 5.5 Remote Multimodal Planner (NVIDIA NIM)
+- **Model:** provider-configurable; the shipped default is `nvidia/nemotron-3.5-lightning-30b-a3b` through the NVIDIA NIM API (see `src/shared/models.ts`).
 - **Operational Role:** Consumes sanitized screenshots and synthetic DOM context, outputting structured JSON action plans (clicks, keystrokes, form submissions).
-- **Zero-Trust Guarantee:** NVIDIA NIM never receives original visual or textual PII. Payloads contain strictly synthetic surrogates and blurred imagery.
+- **Zero-Trust Intent:** the planner receives tokenized text and, when vision is enabled, the post-redaction frame rather than the raw one. This is a policy the pipeline enforces, not a proof: detectors have the failure modes listed in §6.5, so treat "no PII reached the model" as conditional on those detectors firing. Vision is off by default.
 
 ### 5.6 Architectural Assessment: GLiNER Model Integration
 An analysis of integrating GLiNER (Generalist and Lightweight Model for Named Entity Recognition) was conducted for the V2 roadmap:
@@ -280,7 +281,7 @@ flowchart TD
         RawAadhaar["12-Digit Aadhaar: 3123 4567 8901"]
     end
 
-    subgraph FPEEngine["NIST SP 800-38G FF3-1 Engine"]
+    subgraph FPEEngine["Surrogate Engine (format-preserving)"]
         Feistel["Balanced Feistel Network (8 Rounds)"]
         AESKey["256-Bit Ephemeral Symmetric Key"]
         Tweak["64-Bit Domain Tweak"]
@@ -306,13 +307,14 @@ flowchart TD
     VerhoeffCheck --> SynthAadhaar
 ```
 
-### 6.1 Format-Preserving Encryption (NIST SP 800-38G FF3-1)
-Traditional redaction replaces structured strings with constant markers (e.g., `<CARD_NUMBER>`). This corrupts form validation logic and degrades LLM reasoning. PRY utilizes Format-Preserving Encryption over an integer alphabet:
+### 6.1 Format-Preserving Surrogate Generation (hash-derived, not FF3-1)
+Traditional redaction replaces structured strings with constant markers (e.g., `<CARD_NUMBER>`). This corrupts form validation logic and degrades LLM reasoning. PRY therefore keeps the FORMAT and substitutes the value:
 
 - Let the character alphabet be $\Sigma = \{0, 1, \dots, 9\}$ with radix $r = 10$.
-- For an input numerical sequence $X$ of length $n$, the ciphertext $Y = \text{FF3-1}(K, T, X)$ satisfies:
+- For an input numerical sequence $X$ of length $n$, the surrogate $Y$ satisfies:
   $$\text{length}(Y) = \text{length}(X) \quad \text{and} \quad Y \in \Sigma^n$$
-- The encryption operates via an 8-round balanced Feistel network using an ephemeral 256-bit AES key $K$ and a 64-bit tweak $T$.
+- **What the implementation actually is.** `src/background/surrogates.ts` derives each surrogate digit from an FNV-1a digest of the raw value and recomputes the trailing checksum (Luhn / Verhoeff), preserving length, the card BIN prefix, and a synthetic Aadhaar prefix. It is deterministic pseudonymization with no key: not an 8-round AES Feistel FF3-1 cipher.
+- **Why that distinction is stated here rather than glossed.** Because the mapping is unkeyed, anyone who can see a surrogate can brute-force the small digit space (a card body is ≤ 11 unknown digits) offline and recover the original. Surrogates ship to a vision model when VLM vision is enabled, so this is a real, narrow weakness rather than a naming quibble. Replacing the generator with a keyed FF3-1 (WebCrypto AES as the round function) is on the roadmap; until then, prefer the opaque mask path for anything that must not be recoverable.
 
 ### 6.2 Mathematical Checksum Verification (Luhn and Verhoeff Algorithms)
 Synthetic credentials generated by PRY must pass client-side validation logic without revealing genuine identity details:
@@ -328,10 +330,24 @@ Synthetic credentials generated by PRY must pass client-side validation logic wi
   $$c_{12} = \text{inv}\left(\sum_{i=1}^{11} d(c_i, p(i, \dots))\right)$$
   PRY applies the standard multiplication table $d(j, k)$, permutation matrix $p(i, j)$, and inversion table $\text{inv}(j)$ to ensure synthetic 12-digit Aadhaar values pass UIDAI-compliant verification checks.
 
-### 6.3 2D Gaussian Image Convolution Kernel
-Visual redaction applies continuous two-dimensional Gaussian convolution rather than naive pixelation:
-$$G(x, y) = \frac{1}{2\pi\sigma^2} \exp\left(-\frac{x^2 + y^2}{2\sigma^2}\right)$$
-PRY evaluates this over a discretized $11 \times 11$ matrix with standard deviation $\sigma = 3.5$. This removes high-frequency edge gradients while preserving the macroscopic structure of the page for the vision model.
+### 6.3 Visual Redaction Tiers and the Reversibility Test
+
+PRY does not use one redaction for everything, because the tiers have different reversibility properties. Each region is assigned by kind:
+
+| Tier | Applied to | Mechanism | Reversible? |
+| :--- | :--- | :--- | :--- |
+| **Opaque destroy** | Faces; PII spans in page text | Entire region overwritten with `#000000` | No — zero original pixels survive |
+| **Surrogate inpaint** | Confirmed credential / ID fields | Region cleared and repainted with a synthetic, checksum-valid value | No — original pixels are discarded, not filtered |
+| **Soft box filter** | Generic input fields, credential labels | Separable sliding-window box average (radius 6, capped at 40) | Weak by design, and accepted only for non-identifying regions |
+
+Two properties matter more than the filter itself:
+
+- **Separability and cost.** The soft tier is implemented as two 1-D sliding-window passes (horizontal then vertical) over an `ImageData` buffer, so cost is $O(w \cdot h)$ independent of radius. It is computed with an explicit window rather than `ctx.filter = "blur(…)"`, which silently no-ops on some Chrome builds and would leave a region untouched while appearing to redact it.
+- **Reversibility is tested, not assumed.** A box average is a low-pass operation and is invertible in principle given the kernel, so the soft tier is never the last word. Faces are excluded from it entirely (blur is the known-recoverable case for biometric identifiers), and `verifyRegions()` rejects any face region that is merely altered rather than near-uniformly opaque. If OCR reads anything out of a soft region, the frame is rebuilt with every region opaque and re-verified before shipping.
+
+**What the proof covers.** `verifyRegions()` answers exactly one question: *are the regions PRY chose to redact actually unrecoverable in the bytes that ship?* It cannot answer whether PRY chose the right regions — a face no channel detected, or an email no pattern matched, is invisible to it. Those are different guarantees, and the panel's badge now says so: a green frame means "everything redacted here is opaque", not "this frame contains no PII". Detection completeness is bounded by the three face channels, the regex/checksum matchers, and the on-device NER model, each with the failure modes documented in §6.5. Treat the badge as necessary, never sufficient.
+
+The verifier's own pixel sampling uses a row-phase-offset stride rather than a fixed one: a stride that shares a factor with the content's period (a fixed stride of 4 over an alternating two-tone pattern) lands on a single phase and reads as perfectly flat, which would declare a region blank and skip its redaction.
 
 ### 6.4 Immutable Merkle Directed Acyclic Graph (DAG) Ledger
 Every perception and redaction cycle produces a cryptographic leaf digest:
@@ -340,7 +356,21 @@ $$L_i = \text{SHA256}(\text{Timestamp} \parallel \text{TabId} \parallel \text{SH
 Leaves are aggregated into a binary Merkle tree:
 $$N_{\text{parent}} = \text{SHA256}(N_{\text{left}} \parallel N_{\text{right}})$$
 
-The resulting Merkle Root $R$ is exported within `audit-proof.json`. An external auditor can verify the inclusion proof of any leaf $L_i$ against root $R$ in $O(\log N)$ operations without requiring access to the underlying images.
+The resulting Merkle Root $R$ is exported within `audit-proof.json` together with every leaf's hash and the full entry list. **Exported today:** root + leaves, so an auditor recomputes $R$ from the leaves in $O(N)$ and detects any edited or reordered entry. **Not exported yet:** per-leaf sibling paths, so there is no $O(\log N)$ inclusion proof to hand a single leaf to a third party — that is a roadmap item, not a current capability.
+
+### 6.5 Detection Coverage and Known Gaps
+
+PRY's redaction is only as good as its detection, so the bounds are stated here rather than left for a judge to discover. Every row is a real limitation of the shipped code, not a hypothetical.
+
+| Channel | Covers | Known failure modes |
+| :--- | :--- | :--- |
+| **Regex + checksum matchers** (`pii-detector.ts`, `text-pii-patterns.ts`) | Emails, Indian phone numbers, Aadhaar (Verhoeff-validated), PAN, IFSC, SSN, card numbers (Luhn-validated), honorific/cue-phrase names, API keys and JWTs | Anything unstructured: plain names without a cue phrase, street addresses, dates of birth, medical terms, account balances. Lookalikes that fail a checksum are deliberately NOT redacted (measured as a false-positive signal instead). |
+| **Contextual analysis** (`contextual-pii.ts`) | Values in fields whose own label marks them sensitive | Needs a readable label; a bare "Account number" box on an icon-only form is not covered. |
+| **On-device NER** (token classification, `ml/ner.ts`) | Person names, organizations, locations in page prose, any casing | Bounded to 12 spans per page and to the labels in `ner-labels.ts`; the model is ~104 MB and quantized, so recall on rare or non-Latin names is imperfect; a page whose text is longer than the snapshot budget (`MAX_TEXT` = 2000 chars) is scored only on the visible main-content region. |
+| **Face channels** (BlazeFace → Chrome shape detector → skin colour, `offscreen.ts`) | Faces in the captured frame, down to roughly 28 px | The model channels run first and the skin-colour pass is now a SUPPLEMENT rather than a fallback: a single BlazeFace hit used to skip it entirely, which is how a page with one large portrait and a grid of thumbnails destroyed the portrait and shipped every thumbnail face. Short-range BlazeFace still misses small faces on its own, the skin-colour heuristic can miss unusual lighting and add false positives on photos, and supplementary additions are capped at 8 per frame so a photo wall cannot blot the page. A separate DOM channel marks `img[alt~=profile|avatar|photo]` and similar as `kind: "face"`; that matches URL/alt text, so it misses most modern avatars (YouTube's `yt3.ggpht.com` images carry neither word). **There is no biometric completeness guarantee** — a missed face is not detected, and the re-OCR verifier does not look for faces at all. |
+| **Text-PII pixel boxes** (`perceive.ts#locateSpans` / `findTextRegions`) | Only text the DOM exposes as text nodes and that is on screen when the frame is captured | Scan is capped (1.5 s, 8 000 nodes, 200 regions) and skips off-viewport matches, so a very heavy page redacts what it reaches before the budget, not everything. |
+| **Images and canvas-rendered text** | *Nothing* | Text painted inside an image, a `<canvas>` (PDF viewers, Google Docs), or a video frame is invisible to every detector. The re-OCR pass re-reads the regions PRY already redacted; it does not sweep the frame for un-detected PII. A photographed ID card on a page therefore ships readable, and the panel will honestly report zero detections for it. Whole-frame OCR triage and a VLM sanity pass are roadmap items. |
+| **Region collection failure** | — | If the page's main thread does not answer within the bounded round trip, text PII for that frame is NOT redacted (faces still are). The run emits an explicit warning entry naming the reason instead of silently shipping the frame. |
 
 ---
 
@@ -359,7 +389,7 @@ stateDiagram-v2
     ScanVerhoeff --> CheckSurrogate: Verhoeff Valid
 
     CheckSurrogate --> PayloadClean: Value is Known Synthetic Surrogate
-    CheckSurrogate --> TripwireTripped: Value Matches Raw PII in Vault
+    CheckSurrogate --> TripwireTripped: Value Matches Raw PII Held for This Run
 
     PayloadClean --> AllowTransmission: Forward to External Cloud
     TripwireTripped --> AbortTransmission: Network Socket Terminated
@@ -373,9 +403,8 @@ The Egress Tripwire (`src/background/tripwire.ts`) operates as an egress securit
 - If an unmasked credential is detected, the transmission is blocked and an audit alert is recorded in the Merkle ledger.
 
 ### 7.2 Ephemeral Secret Vault Management
-- Mappings between real values and synthetic surrogates are held exclusively in RAM within `src/background/vault.ts`.
-- All stored secrets are encrypted in-memory using ephemeral AES-GCM keys.
-- When an active browser tab is closed or the user session ends, the associated vault partition is purged and overwritten.
+- Token↔value mappings are held in RAM only, inside the service worker's tokenizer vault (`src/background/tokenizer.ts`). Nothing about a vault entry is written to `chrome.storage`.
+- **These values are not encrypted at rest in memory, and the vault is not partitioned or purged per tab.** They live in a plain `Map` for the life of the service worker, which is what makes tokenization fast enough to run per snapshot; MV3 tearing the worker down is what eventually clears them. An AES-GCM vault with per-tab partitioning is on the roadmap — until then, treat an active service worker's memory as the trust boundary.
 
 ---
 
@@ -384,8 +413,8 @@ The Egress Tripwire (`src/background/tripwire.ts`) operates as an egress securit
 PRY provides a visual verification utility accessible via the extension interface:
 - **Side-by-Side Verification:** Displays the raw viewport canvas adjacent to the sanitized canvas.
 - **Bounding Box Overlay:** Outlines detected PII regions with color-coded classification tags (e.g., green for faces, blue for cards, purple for Aadhaar).
-- **Surrogate Mapping Inspector:** Allows users to select any redacted area to verify the generated synthetic surrogate and confirm that original values remain within local memory.
-- **Proof Generation:** Provides a direct interface to trigger and download the certified Merkle DAG audit proof (`audit-proof.json`).
+- **Vault Inspector:** Lists the active token↔value mappings the running service worker holds, so a reviewer can confirm that original values exist only in local memory and that every detector value became a token.
+- **Proof Generation:** Exports the audit proof document (`audit-proof.json`): the SHA-256 hash chain, chain-validity verdict, Merkle root, and every leaf entry.
 
 ---
 
@@ -395,12 +424,12 @@ PRY provides a visual verification utility accessible via the extension interfac
 | :--- | :--- | :--- |
 | **Architectural Model** | Cloud-centric proxy architecture | Fully client-side Zero-Trust Chrome extension (Manifest V3) |
 | **Visual Processing Perimeter** | Transmits uncompressed raw screen captures to external servers | Captures, inspects, and sanitizes viewports entirely in client RAM |
-| **Face Redaction Engine** | Dependent on external cloud vision APIs | Local MediaPipe BlazeFace executing in 6 ms via WebGPU |
-| **Surrogate Integrity** | Static string masking (e.g., `<REDACTED>`) | NIST SP 800-38G FF3-1 with valid Luhn and Verhoeff checksums |
-| **Cryptographic Accountability** | Ephemeral server-side text logs | Immutable client-side SHA-256 Merkle DAG with exportable proofs |
-| **Adversarial Verification** | Assumes visual blur filters are secure | Active LSTM OCR adversarial auditor with solid mask fallback |
+| **Face Redaction Engine** | Dependent on external cloud vision APIs | Local MediaPipe BlazeFace (WebGPU delegate when available) fused with a skin-colour pass, opaque fill on every detected face |
+| **Surrogate Integrity** | Static string masking (e.g., `<REDACTED>`) | Deterministic format-preserving surrogates with valid Luhn and Verhoeff checksums (hash-derived; a keyed FF3-1 cipher is roadmap, see §6.1) |
+| **Cryptographic Accountability** | Ephemeral server-side text logs | Client-side SHA-256 hash chain plus a Merkle root over the exported leaves |
+| **Adversarial Verification** | Assumes visual blur filters are secure | Tesseract re-OCR of the shipped bytes over the redacted regions, with an opaque-mask rebuild as the remediation |
 | **Voice Streaming Pipeline** | Standard HTTP REST / Audio upload | 16 kHz raw PCM16 streaming over WebSocket with token suppression |
-| **Memory Security Guarantee** | Session data cached on remote infrastructure | Ephemeral in-memory vault purged upon tab closure |
+| **Memory Security Guarantee** | Session data cached on remote infrastructure | Token map held only in service-worker memory — never persisted, cleared on worker teardown (§7.2) |
 | **Outbound Defense Layer** | Relies on LLM system prompt instructions | Deterministic Tripwire Interceptor blocks unauthorized socket traffic |
 | **Full-Page Capability** | Single viewport capture | Automated scroll-and-stitch engine with coordinate re-mapping |
 
@@ -415,46 +444,67 @@ pry/
 ├── package.json               # Package configuration and dependencies
 ├── tsconfig.json              # TypeScript strict compilation configuration
 ├── src/
-│   ├── background/            # Background service worker coordination
-│   │   ├── service-worker.ts  # State coordinator and message router
-│   │   ├── tripwire.ts        # Egress payload inspection interceptor
-│   │   ├── surrogates.ts      # NIST FF3-1 and Luhn/Verhoeff generators
-│   │   ├── privacy-ledger.ts  # SHA-256 Merkle DAG calculation engine
-│   │   ├── stitch.ts          # Viewport scroll and stitch coordinator
-│   │   ├── planner.ts         # NVIDIA NIM / Remote inference interface
-│   │   └── vault.ts           # Ephemeral client-side secret mapping
+│   ├── background/            # Service worker: agent loop, policy, memory
+│   │   ├── service-worker.ts  # Router, run state, capture + redaction path
+│   │   ├── agent.ts           # Planner loop, turn budgets, Tier-0 orchestration
+│   │   ├── providers/         # NVIDIA NIM, OpenAI, Anthropic, Groq, Ollama adapters
+│   │   ├── executor.ts        # Tool dispatch (navigate, click, type, read, extract)
+│   │   ├── detector-v2.ts     # Fusion of regex, contextual, NER and ML spans
+│   │   ├── tokenizer.ts       # In-memory token map — nothing is persisted
+│   │   ├── surrogates.ts      # Format-preserving (hash-derived) + Luhn/Verhoeff generators
+│   │   ├── privacy-ledger.ts  # SHA-256 hash chain and Merkle root over audit entries
+│   │   ├── reocr-verification.ts # Re-OCR of shipped bytes; escalates to opaque rebuild
+│   │   ├── ml-bridge.ts       # Routes model requests into the offscreen document
+│   │   ├── tripwire-aggregator.ts # Collects MAIN-world egress events for the ledger
+│   │   ├── vision.ts          # Optional VLM caption of the redacted frame (egress-metered)
+│   │   ├── wire-log.ts        # Per-turn egress log rendered in the side panel
+│   │   └── stitch.ts          # Viewport scroll and stitch coordinator
 │   ├── content/               # Webpage runtime interaction layer
 │   │   ├── content.ts         # Isolated world bootstrap and listeners
-│   │   ├── perceive.ts        # DOM tree inspection and regex mesh
+│   │   ├── perceive.ts        # DOM tree inspection, region scan, regex mesh
+│   │   ├── act.ts             # Click / type / scroll primitives
+│   │   ├── tripwire.ts        # MAIN-world fetch/XHR/WebSocket interceptor
 │   │   ├── fullpage.ts        # Window height and scroll calculation
-│   │   └── overlay.ts         # Local user feedback overlays
+│   │   └── settle.ts          # Post-action DOM stability wait
 │   ├── offscreen/             # Isolated WebAssembly / WebGPU environment
-│   │   ├── offscreen.html     # Hardware-accelerated canvas context
-│   │   ├── offscreen.ts       # Canvas rasterizer and convolution pipeline
-│   │   ├── ocr.ts             # Tesseract.js LSTM adversarial verifier
-│   │   ├── ocr-correct.ts     # Levenshtein OCR text post-processing
-│   │   └── ner.ts             # ONNX Runtime Web zero-shot classification
+│   │   ├── index.html         # Hardware-accelerated canvas context
+│   │   ├── offscreen.ts       # Face channels, rasterizer, convolution pipeline
+│   │   ├── ocr.ts             # Tesseract.js adversarial verifier
+│   │   └── ocr-correct.ts     # Levenshtein OCR text post-processing
+│   ├── ml/                    # On-device models, executed off the main thread
+│   │   ├── ner.ts             # Token-classification NER (transformers.js / ONNX)
+│   │   ├── guard.ts           # Injection-guard loader (no checkpoint bundled — §6.5)
+│   │   └── env.ts             # ONNX Runtime and WASM asset paths
 │   ├── sidepanel/             # User interaction panel
-│   │   ├── sidepanel.html     # Agent interface and status dashboard
-│   │   ├── sidepanel.ts       # ElevenLabs STT/TTS coordination
-│   │   └── voice.ts           # 16 kHz PCM16 Web Audio WebSocket client
+│   │   ├── index.html         # Agent interface and status dashboard
+│   │   ├── sidepanel.ts       # Event rendering, audit view, settings gate
+│   │   ├── voice-controller.ts # Push-to-talk state machine
+│   │   ├── scribe-client.ts   # ElevenLabs Scribe STT (single-use token)
+│   │   └── tts-client.ts      # ElevenLabs premade-voice TTS
 │   ├── inspector/             # Deep inspection utility
-│   │   ├── inspector.html     # Split-canvas visual inspection interface
+│   │   ├── index.html         # Split-canvas visual inspection interface
 │   │   └── inspector.ts       # Before/after verification renderer
-│   └── shared/                # Universal types and constants
+│   ├── options/               # Settings page: provider, keys, privacy toggles
+│   └── shared/                # Pure, headlessly-tested policy and protocol code
 │       ├── types.ts           # Protocol message interfaces
-│       ├── constants.ts       # Regex tables, thresholds, model configs
+│       ├── models.ts          # Model catalogue, thresholds, provider defaults
+│       ├── text-pii-patterns.ts # Regex tables for the text channel
+│       ├── face-regions.ts    # Face-channel fusion policy
+│       ├── region-mapping.ts  # Region → image coordinate transform
 │       └── checksums.ts       # Luhn and Verhoeff validation functions
 ├── models/                    # Bundled on-device machine learning models
 │   ├── blazeface/             # MediaPipe BlazeFace TFLite weights
 │   └── ner/                   # Quantized ONNX token classification models
-└── test/                      # Verification test suite (311 automated tests)
-    ├── tripwire.test.ts       # Egress data leakage unit tests
-    ├── perception.test.ts     # DOM matching and perception tests
-    ├── surrogates.test.ts     # Luhn, Verhoeff, and FF3-1 tests
-    ├── ledger.test.ts         # Merkle root and proof calculation tests
-    ├── ocr.test.ts            # Adversarial OCR pipeline tests
-    └── pages/                 # Local test fixtures (pii-fixture.html)
+├── scripts/                   # Verification suite + model tooling (see npm run verify)
+│   ├── verify-pipeline.mjs    # End-to-end assertions over the real shipped modules
+│   ├── tripwire-test.mjs      # MAIN-world egress tripwire assertions
+│   ├── ocr-test.mjs           # Renders a card, redacts it, asserts OCR cannot recover it
+│   ├── eval-ner.mjs           # Runs the bundled NER weights and scores the spans
+│   ├── eval-guard.mjs         # Gates any candidate injection-guard checkpoint on recall + FP rate
+│   ├── package.mjs            # Builds the distributable zip (upload it as a Release asset)
+│   └── fetch-models.mjs       # Downloads model weights (HF token optional)
+└── test/                      # Local fixtures only (test/pages/pii-fixture.html)
+    └── pages/                 # Static pages used for manual / OCR testing
 ```
 
 ---
@@ -471,7 +521,7 @@ Execute the comprehensive test harness:
 ```bash
 npm run verify
 ```
-*Expected Output:* All 311 automated tests pass cleanly across perception, tripwire, surrogates, and ledger verification.
+*Expected Output:* All assertions pass cleanly — 331 pipeline + 27 tripwire + 2 OCR — covering detection, tokenization, redaction, face-channel fusion, region→image mapping, planner turn policy, ledger, and Scribe wire shapes.
 
 ### 11.3 Production Build Process
 Compile the TypeScript source files and assemble production bundles:
@@ -490,7 +540,18 @@ npm run build
 ### 11.4 Browser Deployment
 1. Open Google Chrome and navigate to `chrome://extensions/`.
 2. Enable **Developer mode** using the toggle in the upper right corner.
-3. Click **Load unpacked**.
+3. Click **Load unpacked**. Load `dist/` (never `src/`) and reload the extension
+after every build — the side panel caches its bundle, and a stale bundle is what
+produces "my fix isn't there" reports.
+
+### 11.5 Packaged build (release artifact)
+`node scripts/package.mjs` writes `publish/pry-agent-1.0.0.zip` (~125 MB: the
+model weights and wasm runtimes are included, because a build without them has no
+on-device NER, no face model, and no OCR verifier). It is **not** committed — it
+exceeds GitHub's 100 MB per-file limit — and it is published as a GitHub Release
+asset that the landing page's download button points at. Verify an artifact by
+listing its entries (80, including `models/ner/onnx/model_quantized.onnx`), not by
+its filename.
 4. Select the root directory containing `manifest.json` and the compiled `dist/` directory.
 5. Access the extension via the Chrome toolbar or sidepanel.
 

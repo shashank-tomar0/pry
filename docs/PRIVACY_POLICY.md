@@ -29,9 +29,15 @@ transmitted**:
 - **Screenshots.** When visual perception is enabled, PRY captures the visible
   tab, detects sensitive regions (credential fields, faces, ID-like text), and
   redacts them — blurred, masked, or replaced with synthetic surrogates — all in
-  an offscreen document on your machine. The redacted image is then re-OCR'd
-  locally (bundled Tesseract) to verify no PII remains readable in the pixels.
-  **Raw screenshots are never sent to any server.**
+  an offscreen document on your machine. Each redacted region is then re-OCR'd
+  locally (bundled Tesseract) from the exact image bytes that would ship, and the
+  frame is rebuilt with opaque fill if any character inside a redacted region is
+  still readable. This proves the redactions held; it is not a scan of the whole
+  frame, so PII that no detector found (for example text inside a photo, a PDF
+  canvas, or a video frame) is not covered by it. **Raw screenshots are never
+  sent to any server.** Screenshots are captured for the local audit panel even
+  when visual perception is off; only the redacted frame is ever sent, and only
+  when you enable a vision model.
 - **PII detection results.** Detected values (card numbers, Aadhaar, PAN, emails,
   phone numbers, API keys, etc.) are replaced with opaque vault tokens
   (`<CRED_1>`, `<ID_2>`) held in memory. Raw values exist only in your browser's

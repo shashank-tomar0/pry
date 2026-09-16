@@ -1,7 +1,7 @@
 // Package dist/ contents into a Chrome Web Store upload zip.
 // Deterministic: fixed DOS timestamps, forward-slash paths, deflate compression.
 import { deflateRawSync, crc32 } from "node:zlib";
-import { readFile, readdir, writeFile, rename, mkdir, copyFile } from "node:fs/promises";
+import { readFile, readdir, writeFile, rename, mkdir } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -105,8 +105,24 @@ await mkdir(join(ROOT, "publish"), { recursive: true });
 const tmp = OUT + ".tmp";
 await writeFile(tmp, archive);
 await rename(tmp, OUT);
-await copyFile(OUT, join(ROOT, "landing", "pry-agent-1.0.0-chrome.zip"));
 
+// This used to ALSO copy the archive into landing/, which is why the landing
+// page's download button looked maintained while it served a different, stale
+// file for weeks (26 entries, no model weights, no MediaPipe, no ONNX Runtime).
+// The zip is not committed any more, so the only copy is the one to upload:
+// publish/pry-agent-1.0.0.zip -> a GitHub Release asset of the same name.
+
+const mb = (archive.length / 1024 / 1024).toFixed(2);
+console.log(`packaged ${entries.length} files -> ${OUT} (${mb} MB)`);
 console.log(
-  `packaged ${entries.length} files -> ${OUT} (${(archive.length / 1024 / 1024).toFixed(2)} MB)`,
+  "\nNext: upload it as a release asset (the landing button links to the latest release):\n" +
+  "  gh release create v1.0.0 publish/pry-agent-1.0.0.zip --title \"PRY 1.0.0\" --notes \"...\"\n" +
+  "  # or: gh release upload <tag> publish/pry-agent-1.0.0.zip --clobber\n" +
+  "The asset filename must stay pry-agent-1.0.0.zip — the page URL ends in it.",
 );
+if (archive.length > 100 * 1024 * 1024) {
+  console.log(
+    `\nNote: ${mb} MB exceeds GitHub's 100 MB per-file limit, which is exactly why this\n` +
+    "artifact is NOT committed to the repo — keep it as a release asset.",
+  );
+}

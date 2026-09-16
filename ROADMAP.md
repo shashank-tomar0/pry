@@ -112,7 +112,9 @@ The server (`server/vlm.ts`) already supports Anthropic/OpenAI vision. But it's 
 **Problem:** We only detect faces. Signatures, QR codes, and scanned IDs are not detected.
 
 **Fix:** Add template matching or lightweight CNN for:
-- QR code detection (QR.js can detect, then blur the region)
+- QR code detection (QR.js can detect, then destroy the region opaquely — QR
+  payloads are their own identifier, so a blur here has the same weakness as a
+  blurred face)
 - Signature detection (edge detection + connected components)
 
 #### 10. URL Sanitization
@@ -183,11 +185,78 @@ Unlock paths (pick when a real eval can gate it):
 - **Port GLiNER's head into transformers.js** (upstream contribution) — then
   GLiNER-small (DeBERTa-small, ~25 MB q8) becomes the on-device PII brain.
 
+## Irreversible Face Redaction (landed)
+
+Faces used to be Gaussian-blurred. Blur is a low-pass filter, and super-
+resolution deanonymization inverts it (arXiv 2506.12344 concludes blur should
+not be used for face anonymization) — which made PRY's own Threat Vector 2 a
+critique of PRY. Now:
+
+- **Faces are destroyed**, not blurred: the region (expanded 15% past the
+detector box, so the jaw and hairline go too) is overwritten with an opaque
+`#000000` fill. No original pixel survives to be deconvolved.
+- **The verifier enforces it.** `verifyRegions()` has a `DESTROYED_KINDS` rule
+that rejects a face region which is merely *altered*; it must be near-uniformly
+opaque (>= 90% covered). A future edit that reintroduces blur fails the check
+rather than silently weakening the guarantee. The soft blur tier still exists
+for non-identifying fields and is unchanged.
+- **The adversarial auditor remediates.** When re-OCR reads PII out of any
+soft-tier region, the auditor rebuilds the frame from the untouched original
+pixels with *every* region opaque, re-encodes, and re-verifies — the escalated
+image is what ships. The code now does what the docs always claimed.
+- **Sampling can no longer hide content.** The verifier's pixel sampling uses a
+row-phase-offset stride; a fixed stride that shares a factor with a region's
+content period used to read periodic detail as a flat, "blank" region and skip
+its redaction entirely.
+
+To finish the story on the pixel side: signature and QR regions need the same
+opaque treatment, and the audit view should distinguish "destroyed" from
+"surrogate" from "soft-filtered" regions per frame.
+
+## Known gaps found by the 2026-09-17 claim-vs-code audit
+
+These are the places where something the project says and something the project
+does still disagree. They are ordered by how likely a judge is to catch them.
+
+1. **PII inside images is not detected at all.** Text painted into a photo, a
+   `<canvas>` (PDF viewer, Google Docs), or a video frame is invisible to every
+   detector, and the re-OCR pass only re-reads regions that were already
+   redacted. A photographed ID card ships readable and the audit honestly shows
+   zero detections for it. Fix: a whole-frame OCR triage pass (Tesseract, on a
+   downscaled frame) that turns un-detected text into redaction candidates, plus
+   a roadmap VLM sanity check.
+2. **Surrogates are unkeyed.** The format-preserving mapping is a hash-derived
+   Feistel-style construction, not FF3-1: anyone who sees a surrogate can
+   brute-force the original over its digit space, and surrogates do ship when
+   VLM vision is on. Fix: keyed FF3-1 with WebCrypto AES as the round function
+   (needs an async surrogate path in the offscreen paint loop).
+3. **Merkle inclusion paths are not exported.** `audit-proof.json` carries the
+   root plus every leaf, so an auditor can recompute the root in O(N) and detect
+   any edit — but there is no O(log N) sibling path for a single leaf.
+4. **The vault is plain RAM, not encrypted or partitioned.** Token mappings live
+   in a `Map` for the service worker's lifetime. AES-GCM at rest in memory and
+   per-tab partitioning are the intended design.
+5. **Face detection has no completeness guarantee.** BlazeFace is a short-range
+   detector; the skin-colour pass that compensates is a colour heuristic, and
+   supplementary additions are capped so a photo wall cannot blot the page. A
+   missed face is silently missed, and the re-OCR verifier does not look for
+   faces. Fix: a whole-frame face sweep at a second scale, and reporting the
+   detector's channel mix per frame so a judge can see which channel fired.
+6. **Text-PII pixel coverage is budget-bounded.** Region collection stops at
+   1.5 s / 8 000 nodes / 200 regions and skips off-viewport matches, so a very
+   heavy page redacts what it can reach, not everything. The on-screen receipt
+   and the audit should say "budget reached" when that happens.
+7. **Signature and QR regions** still need the opaque treatment (a QR code is a
+   payload that survives any soft filter).
+8. **The audit view should distinguish** destroyed / surrogate / soft-filtered
+   regions per frame, so "redacted" cannot be misread as "irreversibly".
+
 ## What Judges Will See
 
 When all features are built:
 
-1. **Privacy pipeline**: Every screenshot shows face blur + credential masking
+1. **Privacy pipeline**: Every screenshot shows opaque face destruction (not blur)
+   + credential masking
 2. **Token vault**: Sensitive values replaced with `<CRED_1>`, `<ORG_3>`
 3. **Visual model**: Agent understands screen content (form/email/banking)
 4. **Validation**: Agent rejects malicious commands from injected content

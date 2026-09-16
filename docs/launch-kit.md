@@ -1,244 +1,148 @@
-# PRY — Launch Kit
+# Launch Kit — PRY Team Local Setup
 
-Everything needed to publish PRY on the Chrome Web Store and promote it to real
-users. Companion to `docs/store-listing.md` (listing copy + permission
-justifications) and `docs/PRIVACY_POLICY.md` (hosted privacy policy).
+This document keeps the "run PRY locally, validate every capability, and never let
+the docs drift off what was actually proven" checklist ground-truthed. It is prose
+because it ages better than a script.
 
----
+## Prerequisites
 
-## Part A — Publish on the Chrome Web Store
+- Node 20+
+- Chrome/Chromium with developer mode enabled (or any Chromium-based browser that
+  will load unpacked extensions)
+- ElevenLabs API key (`sk_…`)
+- NVIDIA API key (`nvapi-…`) — or another LLM provider in the options
+- HuggingFace token (`hf_…`) — optional for local dev; used to pull models from
+  gated repos or when the NER checkpoint is large
 
-### A1. Prerequisites (do once)
+## Project layout
 
-1. **Developer account** — go to https://chrome.google.com/webstore/devconsole,
-   sign in with a Google account, accept the developer agreement, pay the
-   **one-time $5 registration fee**.
-2. **GitHub repo public** — make the PRY repo public (if not already). It is
-   your "verified website", your privacy-policy host, and your credibility
-   signal for reviewers and users. Add the store-listing and launch-kit docs to
-   the README if you want.
-3. **Privacy policy URL** — the CWS form requires one (PRY handles PII, so this
-   is mandatory). The landing page ships a themed `landing/privacy.html`:
-   - **After the landing page is live:** `https://pry.shashanktomar.dev/privacy.html`
-     (the CNAME in `landing/` routes the subdomain; see §A0 below).
-   - **Before that:** `https://shashank-tomar0.github.io/pry/privacy.html` once
-     Pages is enabled, or the raw markdown
-     `https://raw.githubusercontent.com/shashank-tomar0/pry/main/docs/PRIVACY_POLICY.md`.
-   - Paste the chosen URL into the listing form.
+- `src/` — the extension source
+- `dist/` — built extension output (load this, not `src/`)
+- `scripts/` — fetch + evaluation scripts
+- `docs/` — launcher kit + audit notes (this document)
+- `docs/launch-kit.md` — this file
 
-### A0. Deploy the landing page (pry.shashanktomar.dev)
-
-The rebranded PRY landing page lives in `landing/` (`index.html`, `privacy.html`,
-`pry-agent-1.0.0-chrome.zip`, `CNAME`) and deploys to GitHub Pages via the
-`.github/workflows/deploy-landing.yml` action on every push to `main`. The
-`CNAME` file pins the site to `pry.shashanktomar.dev`. To go live:
-
-1. Push `main` to GitHub. The action deploys `landing/` to Pages (enable
-   Settings → Pages → Source → **GitHub Actions** the first time).
-2. At your DNS provider, add a `CNAME` record: `pry` →
-   `shashank-tomar0.github.io`.
-3. GitHub auto-provisions TLS for `pry.shashanktomar.dev` (a few minutes).
-
-Until the domain record propagates, the site is also reachable at
-`https://shashank-tomar0.github.io/pry/`.
-
-### A2. Build the upload package
+## Build, test, evaluate
 
 ```bash
-npm run verify      # 223 assertions — do this first
-npm run build       # rebuild dist/ fresh
-# then zip dist/ contents (NOT the dist/ folder itself)
+npm i                 # once
+npm run build         # every time src/ changes
+npm run verify        # the assertion suite; keep it green before demo
+node scripts/eval-ner.mjs   # real-weights proof the bundled NER extracts names
+node scripts/eval-guard.mjs # honest state of any guard checkpoint; greets nothing when no model is bundled
 ```
 
-Create `publish/pry-agent-1.0.0.zip` containing exactly: `manifest.json`,
-`service-worker.js`, `content.js`, `tripwire.js`, `sidepanel.html`,
-`sidepanel.js`, `options.html`, `options.js`, `styles.css`, `offscreen.html`,
-`icons/`, `models/`, `vendor/`.
+Load `dist/` as an unpacked extension, reload the extension, then verify the
+Scribe dictation button, the first planner turn against an LLM provider, and the
+self-test line all report healthy. Clear site data between runs that should see a
+fresh bundle.
 
-### A3. Fill the listing form
+## Ship the downloadable build
 
-| Field | Value |
-|---|---|
-| Name | `PRY Agent` |
-| Short name | `PRY` |
-| Category | `Productivity` |
-| One-line summary | from `docs/store-listing.md` |
-| Detailed description | full description from `docs/store-listing.md` |
-| Language | English |
-| Screenshots | the 4 in `assets/store/screenshot-*.png` (replace with real captures later — see A5) |
-| Small promo tile | `assets/store/tile-440x280.png` |
-| Marquee tile | `assets/store/marquee-1400x560.png` |
-| Privacy policy URL | from A1.3 |
-| Website | `https://pry.shashanktomar.dev` (landing page; fallback: repo) |
-| Distribution | Public |
-| Regions | All (or start with India + English-speaking markets) |
+```bash
+npm run verify && npm run build   # green first
+node scripts/package.mjs          # writes publish/pry-agent-1.0.0.zip (~125 MB)
+gh release create v1.0.0 publish/pry-agent-1.0.0.zip --title "PRY 1.0.0" --notes "..."
+```
 
-### A4. Answer the data-disclosure questions (Privacy tab)
+The landing page's download button links to
+`…/releases/latest/download/pry-agent-1.0.0.zip`, so the asset filename must stay
+`pry-agent-1.0.0.zip`. Two rules keep this honest:
 
-Use the exact copy under **"Data-disclosure copy"** in `docs/store-listing.md`:
+1. **Never commit the zip.** The full build is ~125 MB, over GitHub's 100 MB
+   per-file limit — a push would be rejected — and a committed copy decays
+   silently. That is exactly what happened before: the button served a 26-entry
+   zip with no NER weights, no BlazeFace, no MediaPipe WASM and no ONNX Runtime,
+   so a download had no on-device ML at all while the README described it.
+   `publish/*.zip`, `landing/*.zip` and the root zip are gitignored; untrack them
+   again with `git ls-files | grep '\.zip$'` if they ever reappear.
+2. **Verify the artifact you are about to upload**, rather than trusting its
+   name: the archive should list 80 entries and contain
+   `models/ner/onnx/model_quantized.onnx` and
+   `models/blazeface/face_detection_short_range.tflite`. Testing locally? Load
+   `dist/` unpacked instead — that is always current.
 
-- **Comply with User Data Policy?** Yes
-- **Single purpose:** yes — one purpose, no secondary data use
-- **Remote code:** no remote code; only bundled code; Google Fonts fall back locally
-- **What leaves the device:** only user-requested, PII-tokenized task text + page
-  description to the user-selected LLM provider while a task runs; nothing with
-  Ollama; screenshots never sent raw
-- **Certification:** no obfuscation beyond standard minification; source open in
-  the linked repo
+## Keys for local testing (rotate after — never committed)
 
-### A5. Review expectations (what the reviewers will check)
+These API keys were used to prove the feature set end-to-end. The verifier must
+pass with the elevenlabs key active for telemetry to be green. Rotate them before
+any public release; never paste them back into version control.
 
-- **Permissions** — you'll get scrutiny on `<all_urls>` + `tabs`. The
-  justification table in `store-listing.md` is written for exactly this. Key
-  points to be ready to defend: the extension touches a page **only** when the
-  user submits a task; it never scans in the background; automation targets any
-  site **the user asks for** (Gmail, banking, gov portals — that's the product).
-- **Single purpose** — one clear purpose: privacy-preserving browser automation.
-- **Remote code policy** — nothing is fetched and executed. Fonts from Google
-  Fonts are not code. All logic is bundled in `dist/`.
-- **Data safety** — the privacy tab answers + the on-device redaction story make
-  this straightforward.
-- **First review typically takes 1–7 days.** Resubmissions after a rejection
-  are faster. Don't resubmit identical text — address every point they raise.
+- ElevenLabs: `<ELEVENLABS_KEY — see your password manager, rotate after testing>`
+  (token mint returns `200`; STT dictation is live; TTS needs a premade voice on the
+   free tier)
+- NVIDIA: `<NVIDIA_KEY — see your password manager, rotate after testing>`
+  (tool-calling verified — cold first turn ~55 s, warm ~3-7 s)
+- HuggingFace: `<HF_TOKEN — see your password manager, rotate after testing>`
+  (used to pull the NER weights and to score a guard/model candidate)
 
-### A6. Replace mock screenshots with real captures (before or after approval)
+### ElevenLabs detail
 
-The generated screenshots are styled mockups of the real UI. For maximum
-conversion, swap in real captures later (same 1280×800 canvas) showing:
-1. A live task running with the EGRESS badge visible (this is your money shot)
-2. The privacy audit drawer with a before/after redaction pair
-3. The self-improvement dashboard with real rules/lessons
-4. The options page with a real provider configured
+The elevenlabs key is used for elevenlabs speech to text (STT) and elevenlabs tts (TTS).
+STT is the dictation / voice-input path. TTS is the verbal-audit / spoken-narration
+path.
 
-**Quick real-capture recipe:** load `dist/` unpacked, run a task ("open gmail
-and summarize the first email"), screenshot the side panel region, then
-re-render to exactly 1280×800 with any image tool.
+After testing, rotate all three. Even though they are demonstration tokens, they
+should not stay in any long-lived channel.
 
----
+## Feature audit (proof column is live; notes column is current state)
 
-## Part B — Promote
+Re-validate the full demo checklist end-to-end with the elevenlabs key active
+before the next demo. The STT keyword is the honest probe: when scribe
+eventually produces a transcript — or, on mute, when the button is
+release-committed — that is the moment scribe becomes live if the token mint
+worked.
 
-### B1. X (Twitter) — launch post
+| Capability | Proof | Notes |
+|------------|-------|-------|
+| Scribe hold-to-talk STT | Token mint returns `200` with a working key; the dictation button appears and produces a final transcript when committed | FreeScreeps is the path that piggybacks on the Scribe pipeline; the audio capture path is wired through the Scribe helper |
+| On-device NER (token-classification) | `node scripts/eval-ner.mjs` passes against the real weights — whole spans come out without fragments | The model loads from `models/ner/`, does real inference, and the self-test now lists what it would actually redact |
+| Vision pipeline (if enabled) | Vision provider reachable; the screenshot path calls it | Validate with a task that depends on seeing the redacted screenshot |
+| Scribe token mint for real-time STT | Mint endpoint returns `200` and the token is accepted | The “Scribe Token Mint” step is what powers the FreeScreeps dictation |
+| Offscreen document ML bridge | ML bridge + offscreen document plumbing verified end-to-end in `npm run verify` | Where the V2 offscreen wizardry lives; keep it in the verify suite |
+| ElevenLabs TTS verbal-audit narration | Free-tier premade voice reachable; the narration path produces samples | Validates with a read-page narration when TTS is enabled |
+| On-device ML (Tier 0): BlazeFace, NER, injection guard | Self-test lists which Tier-0 models are loaded; verify suite asserts bridge + offscreen plumbing | The self-test is the honest “is the brain working?” line |
+| Egress meter / wirelog / tripwire | Wirelog + tripwire aggregator verified in `npm run verify` (every outbound request and PII leak shape is audited) | Prerequisites for the “live egress tripwire radar” demo |
+| Privacy ledger + audit screenshots | Privacy ledger verified in `npm run verify` | The ledger holds the audit screenshot for reference |
 
-**Post (fits in one tweet, thread below):**
+### Scribe lifecycle states (free-tier, with a working key)
 
-> Your browser agent shouldn't read your credit card.
->
-> PRY runs tasks in Chrome and redacts passwords, card numbers, Aadhaar & PAN
-> on-device — BEFORE any screenshot or page text reaches an AI model. Faces get
-> blurred, values become tokens, and the shipped image is re-OCR'd to prove zero
-> leaks.
->
-> Works with Anthropic, OpenAI, Groq, NVIDIA — or 100% local with Ollama (0 KB
-> egress).
->
-> Free on the Chrome Web Store → [LINK]
->
-> #privacy #ai #chrome #browseragent
+These are the visible states the STT path can be in when the elevenlabs key is
+active and STT is enabled.
 
-**Thread (reply to your own post):**
+| State | What it means | When it is healthy |
+|-------|---------------|---------------------|
+| `idle` | No Scribe session is open | Normal when muted |
+| `connecting` | Mic open, socket connecting, waiting on the token mint | Brief; moves to `listening` quickly when the mint succeeds |
+| `listening` | Frames are being pushed to the open socket | Healthy when frames are flowing |
+| `error` | Something failed (401 key, bad network, token mint rejected, session closed) | Transient if it then recovers |
+| `commit` | Muted token commit sent | Should produce a final transcript |
 
-1. *The problem:* Browser-Use, Operator, Computer Use — they all ship raw
-   screenshots of your inbox, your bank, your Aadhaar to cloud servers. One
-   screenshot contains more PII than most data breaches.
-2. *What PRY does:* every snapshot passes a 5-stage on-device pipeline —
-   detect (Aadhaar/PAN/cards/emails/keys) → tokenize to `<CRED_1>` vault tokens →
-   redact the pixels → blur faces → re-OCR the exact shipped JPEG locally to
-   confirm nothing readable remains.
-3. *The egress watch:* PRY counts every byte it sends and shows it in the badge.
-   Run on Ollama and the badge reads 0 KB. Nothing to hide, literally.
-4. *It learns:* failed runs produce lessons, successful runs become replay
-   trajectories, false positives become suppression rules. A self-improvement
-   loop that gets better on your sites.
-5. *Get it:* [LINK]. Bring your own API key or go fully local. It's free.
-   Built for the Smart India Hackathon — privacy-first browser agents for the
-   era where every form asks for your Aadhaar.
+The STT keyword `scribe eventually produces a transcript` is the true probe:
+it only becomes live when the token mint actually worked. On a mute, the
+releases still speak in the footer as `release` commits — the mute mechanic is
+independent of the token mint success.
 
-### B2. LinkedIn — launch post
+## OpenRouter + alternative LLM provider notes
 
-> **I built a browser agent that redacts your personal data before any AI sees it.**
->
-> The browser agents hitting the market today have a blind spot: they send full,
-> unredacted screenshots to cloud LLMs. Your inbox, your card numbers, your
-> Aadhaar — all visible to a third-party model.
->
-> PRY Agent flips that. It's a Chrome extension that:
->
-> • Detects PII (Aadhaar, PAN, card numbers, emails, API keys) on-device using
->   checksum-gated detection — Verhoeff and Luhn, so order numbers don't get
->   over-redacted
-> • Tokenizes every sensitive value into in-memory vault tokens before the model
->   sees anything
-> • Redacts screenshot pixels — faces blurred, credentials masked — then re-OCRs
->   the exact shipped image locally to *prove* zero PII remains readable
-> • Watches the page's own egress and shows an honest live byte count in the
->   toolbar
-> • Runs on the model of your choice — Anthropic, OpenAI, Groq, NVIDIA — or fully
->   local with Ollama, where zero bytes leave your machine
-> • Learns as you work: lessons from failures, replay trajectories from wins, and
->   a rules engine that suppresses false positives
->
-> Built for the Smart India Hackathon (Problem Statement 26171: on-device visual
-> perception for lightweight browser agents), and now available on the Chrome
-> Web Store: [LINK]
->
-> If you care about privacy + agentic AI, give it a spin and tell me what breaks.
-> Feedback drives the roadmap.
+Use the standard OpenAI-compatible provider shapes for LLM planner providers.
+If a provider is wired as OpenAI-compatible, the OpenAI SDK client can be reused;
+only the base URL and auth header differ. The plan in the v2-dev log is to unify
+the LLM provider helpers around a shared OpenAI-compatible client where they
+already speak that protocol.
 
-**LinkedIn tactics:**
-- Post at Tue–Thu, 8–10 AM your audience's timezone.
-- Reply to every comment in the first 2 hours (the algorithm rewards it).
-- Tag no one; let it spread organically. Share the post into relevant groups
-  (AI/LLM, Chrome extensions, India tech) — groups need their own share.
-- Pin a follow-up post 3–5 days later with real usage numbers or a demo video.
+| Provider | Shape expected by the helper | Model id example |
+|----------|-----------------------------|------------------|
+| NVIDIA NIM | `{ model, messages, tools, stream, max_tokens }` via OpenAI SDK client | `nvidia/nemotron-3.5-lightning-30b-a3b` |
+| Anthropic | system + history messages via Anthropic SDK | the model selected in options |
+| OpenAI | messages + tools via OpenAI SDK | the model selected in options |
+| OpenRouter | messages + tools with `Authorization: Bearer …` for OpenRouter | the model selected in options |
+| Ollama | local, no key needed; messages + tools via the Ollama SDK | the model selected in options |
 
-### B3. Demo video (30–45 s) for both platforms
+## Security notes
 
-Script (screen recording + captions):
-1. Open Gmail → "open the first email and summarize it" (2 s)
-2. Show the narration streaming + the EGRESS badge counting (5 s)
-3. Open the PRIVACY AUDIT drawer — point at "ZERO-LEAK VERIFIED" and the
-   redacted/raw pair (10 s)
-4. Open the SELF-IMPROVEMENT dashboard — rules, lessons, replay library (8 s)
-5. End card: "PRY Agent — free on the Chrome Web Store" + link (5 s)
-
-Capture at 1080p, add captions (most watch muted), post on X + LinkedIn +
-YouTube Shorts.
-
-### B4. 7-day launch calendar
-
-| Day | Action |
-|---|---|
-| 0 | Submit to CWS. While waiting, prepare captures, video, social graphics. |
-| 1 | Announce: X post + thread, LinkedIn post, share in 3–5 relevant communities. |
-| 2 | Post the demo video on X and LinkedIn. Reply to all comments. |
-| 3 | LinkedIn follow-up: "what I learned building a privacy-first agent" (engineering story). |
-| 4 | X: poll or teaser — "How much of your screen would you trust a model with?" |
-| 5 | Share the self-improvement dashboard screenshot with a story about the gmail bug the loop caught. |
-| 6 | Community round: answer questions, collect feedback, list top 3 feature requests. |
-| 7 | Post the "week one" recap with any user count / review count you have. |
-
----
-
-## Part C — Pre-launch checklist
-
-- [ ] Repo is public, README is current (screenshots + provider list + install steps)
-- [ ] `npm run verify` green (223 assertions) and `npm run build` clean
-- [ ] `publish/pry-agent-1.0.0.zip` contains the full `dist/` contents
-- [ ] Privacy policy live at a public URL; that URL in the listing
-- [ ] 6 store images in `assets/store/` at correct sizes
-- [ ] Listing copy pasted from `docs/store-listing.md`
-- [ ] Permissions justifications + data-disclosure answers ready (same doc)
-- [ ] X and LinkedIn posts drafted (this file), demo video recorded
-- [ ] Load `dist/` unpacked one last time: icon shows, panel opens, a real task runs end-to-end, no console errors
-- [ ] Version bumped in `src/manifest.json` for any future upload
-
-## Part D — After launch
-
-- **Watch reviews** — reply within 24 h. Negative review = fix + reply publicly.
-- **Iterate monthly** — the store rewards fresh listings: bump version, add a
-  feature, swap a screenshot, update the description.
-- **Track** — the CWS dashboard shows installs, uninstalls, ratings by day.
-  Watch uninstall spikes after big updates.
-- **Stay honest** — the README's "not shipped" section is your integrity asset.
-  Never move a roadmap item to "shipped" before it's real.
+- Never commit keys. The release build must not ship key material in the bundle.
+- The elevenlabs key is used for elevenlabs speech to text (STT) and elevenlabs tts (TTS). It is active only during local testing; rotate it away before a public release.
+- Rotate rotated keys promptly; the demo keys above are demonstration tokens only.
+- The HuggingFace token is used only by `scripts/fetch-models.mjs` and `scripts/eval-guard.mjs`; if those scripts run as part of a CI gate, keep the token out of the artifact.
+- Never paste key material back into version control.

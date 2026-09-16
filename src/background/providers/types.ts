@@ -52,6 +52,13 @@ export interface PlannerRequest {
   signal: AbortSignal;
   /** Called with each prose delta so the panel can stream. */
   onText: (delta: string) => void;
+  /**
+   * Called with each chain-of-thought delta when the provider streams one
+   * (reasoning models). Never displayed verbatim — its arrival is the
+   * liveness proof that drives the planner-wait ticker, so a cold-start turn
+   * reads as "the model is reasoning", not as a frozen panel.
+   */
+  onThought?: (delta: string) => void;
 }
 
 export interface Planner {

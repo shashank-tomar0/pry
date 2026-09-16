@@ -7,9 +7,12 @@
  * (the JPEG produced by the offscreen canvas) and asserts one of:
  *
  *   1. The region is now a solid black mask (credentials / ID numbers), or
- *   2. The region's pixels were substantially altered (blurred faces/labels),
+ *   2. A DESTROYED region (faces) is near-uniformly opaque — merely altered is
+ *      not enough, because a blur is recoverable and this check exists to
+ *      enforce irreversibility rather than to accept any visible change, or
+ *   3. The region's pixels were substantially altered (soft blur-tier fields),
  *      or
- *   3. The original region contained no content at all (nothing to leak).
+ *   4. The original region contained no content at all (nothing to leak).
  *
  * This is the "prove it works" feature that makes PRY demonstrably
  * different from other privacy tools that just claim to redact.
@@ -107,16 +110,34 @@ function clampRegion(
   return { x: rx, y: ry, width: right - rx, height: bottom - ry };
 }
 
-/** Fraction (0-1) of sampled pixels in a region that are near-black. */
-export function solidBlackRatio(img: PixelImage, x: number, y: number, width: number, height: number): number {
-  const region = clampRegion(img, x, y, width, height);
+/**
+ * Fraction (0-1) of sampled pixels in a region that are near-black.
+ *
+ * `inset` shrinks the measured rectangle before sampling. The verifier uses a
+ * small inset when proving that a destroyed region is opaque: a mask's own
+ * boundary rings under JPEG (the encoder's high-frequency response to a hard
+ * black edge), so a handful of edge pixels read as non-black even though the
+ * redaction is complete. Measuring the interior avoids failing a correct
+ * redaction for an artifact of the mask itself. It cannot mask a real leak —
+ * a blurred or untouched region is non-black throughout, interior included.
+ */
+export function solidBlackRatio(
+  img: PixelImage,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  inset: number = 0,
+): number {
+  const region = clampRegion(img, x + inset, y + inset, width - inset * 2, height - inset * 2)
+    ?? clampRegion(img, x, y, width, height);
   if (!region) return 0;
 
   let blackPixels = 0;
   let total = 0;
-  // Sample every 4th pixel for speed.
-  for (let py = region.y; py < region.y + region.height; py += 4) {
-    for (let px = region.x; px < region.x + region.width; px += 4) {
+  // Row-phase-offset stride (see regionVariance).
+  for (let py = region.y, row = 0; py < region.y + region.height; py += 3, row++) {
+    for (let px = region.x + (row % 3); px < region.x + region.width; px += 3) {
       const idx = (py * img.width + px) * 4;
       const r = img.data[idx];
       const g = img.data[idx + 1];
@@ -145,8 +166,11 @@ export function regionDiffScore(
 
   let totalDiff = 0;
   let count = 0;
-  for (let py = region.y; py < region.y + region.height; py += 4) {
-    for (let px = region.x; px < region.x + region.width; px += 4) {
+  // Row-phase-offset stride (see regionVariance): a fixed stride aliases
+  // periodic content, and here that would score an unredacted region as fully
+  // changed — a false PASS for a privacy check.
+  for (let py = region.y, row = 0; py < region.y + region.height; py += 3, row++) {
+    for (let px = region.x + (row % 3); px < region.x + region.width; px += 3) {
       const oi = (py * original.width + px) * 4;
       const ri = (py * redacted.width + px) * 4;
       // Guard against mismatched buffers.
@@ -215,8 +239,8 @@ export function regionChangedFraction(
 
   let changed = 0;
   let count = 0;
-  for (let py = region.y; py < region.y + region.height; py += 3) {
-    for (let px = region.x; px < region.x + region.width; px += 3) {
+  for (let py = region.y, row = 0; py < region.y + region.height; py += 3, row++) {
+    for (let px = region.x + (row % 3); px < region.x + region.width; px += 3) {
       const oi = (py * original.width + px) * 4;
       const ri = (py * redacted.width + px) * 4;
       if (ri + 2 >= redacted.data.length || oi + 2 >= original.data.length) continue;
@@ -231,12 +255,33 @@ export function regionChangedFraction(
 }
 
 /** Kinds whose redaction is a blur rather than a solid mask. */
-const BLUR_KINDS = new Set(["input_field", "credential_label", "face", "credential"]);
+const BLUR_KINDS = new Set(["input_field", "credential_label", "credential"]);
+
+/**
+ * Kinds whose redaction must be IRREVERSIBLE, not merely altered.
+ *
+ * Faces live here. A blurred face is still the face: super-resolution
+ * deanonymization inverts a Gaussian blur given the kernel, which is the very
+ * attack PRY's threat model names. Accepting "pixels changed" for these kinds
+ * would let a reverting edit to the offscreen pipeline silently weaken the
+ * guarantee again, so the verifier demands near-total opaque coverage.
+ */
+const DESTROYED_KINDS = new Set(["face"]);
+/** Fraction of the region that must be near-black for a destroyed region. */
+const DESTROYED_BLACK_RATIO = 0.9;
 
 /**
  * Variance of luminance inside a region. Uniform regions (blank fields, solid
  * backgrounds) have variance near 0; regions containing text or a face have
  * high variance. Used to decide whether a region held content worth leaking.
+ *
+ * Sampling note: a fixed stride that is a multiple of the content's period
+ * aliases it away. Striding 4 on both axes over an alternating two-tone
+ * pattern (exactly what fine photo detail or a dithered fill looks like) lands
+ * on a single phase and reads as PERFECTLY FLAT — which would declare the
+ * region blank, skip its redaction, and silently drop the protection. A stride
+ * of 3 with a per-row phase offset keeps the phase rotating so periodic
+ * content cannot hide from the check that decides whether it needs redacting.
  */
 export function regionVariance(img: PixelImage, x: number, y: number, width: number, height: number): number {
   const region = clampRegion(img, x, y, width, height);
@@ -245,8 +290,8 @@ export function regionVariance(img: PixelImage, x: number, y: number, width: num
   let sum = 0;
   let sumSq = 0;
   let count = 0;
-  for (let py = region.y; py < region.y + region.height; py += 4) {
-    for (let px = region.x; px < region.x + region.width; px += 4) {
+  for (let py = region.y, row = 0; py < region.y + region.height; py += 3, row++) {
+    for (let px = region.x + (row % 3); px < region.x + region.width; px += 3) {
       const idx = (py * img.width + px) * 4;
       const gray = (img.data[idx] + img.data[idx + 1] + img.data[idx + 2]) / 3;
       sum += gray;
@@ -269,6 +314,7 @@ export function regionVariance(img: PixelImage, x: number, y: number, width: num
  *   - the original region was blank (variance below threshold → nothing to
  *     leak, e.g. an empty input field blurred over a white page), or
  *   - it is now a solid black mask, or
+ *   - it is a DESTROYED kind (face) and is now near-uniformly opaque, or
  *   - its pixels changed substantially (blur/overlay actually applied).
  *
  * Regions that fail are reported in `leakedPatterns` with a reason.
@@ -291,6 +337,11 @@ export function verifyRegions(
     regionsChecked++;
 
     const blackRatio = solidBlackRatio(redacted, region.x, region.y, region.width, region.height);
+    // Same measurement over the region's interior, for the opacity proof below.
+    const interiorInset = Math.max(1, Math.round(Math.min(region.width, region.height) * 0.08));
+    const interiorBlackRatio = solidBlackRatio(
+      redacted, region.x, region.y, region.width, region.height, interiorInset,
+    );
 
     if (original) {
       const origVariance = regionVariance(original, region.x, region.y, region.width, region.height);
@@ -304,6 +355,23 @@ export function verifyRegions(
       // Solid black mask → content covered.
       if (blackRatio > 0.5) {
         regionsRedacted++;
+        continue;
+      }
+      // Destroyed kinds require PROOF of irreversibility, checked before the
+      // loose "pixels changed" rule below — otherwise a regression back to
+      // blur (which changes plenty of pixels) would still verify.
+      if (DESTROYED_KINDS.has(region.kind)) {
+        // Interior measurement: prove the fill itself, not the JPEG ringing at
+        // its edge. A blur/touch-up regression leaves the interior non-black.
+        if (interiorBlackRatio >= DESTROYED_BLACK_RATIO) {
+          regionsRedacted++;
+          continue;
+        }
+        leakedPatterns.push(
+          `"${region.label}" (${region.kind}) at ${region.x},${region.y} is not opaque ` +
+          `(only ${Math.round(interiorBlackRatio * 100)}% of the interior covered) — a ` +
+          `reversible redaction, recoverable by super-resolution deanonymization.`,
+        );
         continue;
       }
       // Pixels substantially altered → blur/overlay applied.
@@ -343,9 +411,15 @@ export function verifyRegions(
   const verified = regionsChecked === 0 || regionsRedacted === regionsChecked;
   const confidence = regionsChecked > 0 ? regionsRedacted / regionsChecked : 1;
 
+  // Scope the claim to what was actually measured. This check re-reads the
+  // pixels of the regions the pipeline REDACTED; it cannot see a face the face
+  // detector never found or an email the text channel never matched. Saying
+  // "zero PII leakage" here asserted completeness from a coverage-of-known-
+  // regions proof, which is how a frame with un-detected names on screen could
+  // still display a green "ZERO-LEAK VERIFIED" badge.
   const summary = verified
-    ? `VERIFIED: ${regionsRedacted}/${regionsChecked} sensitive regions confirmed redacted. Zero PII leakage.`
-    : `WARNING: ${regionsRedacted}/${regionsChecked} regions confirmed redacted; ${regionsChecked - regionsRedacted} may still contain sensitive content.`;
+    ? `VERIFIED: ${regionsRedacted}/${regionsChecked} redacted regions confirmed opaque in the shipped image (covers regions PRY detected, not detection completeness).`
+    : `WARNING: ${regionsRedacted}/${regionsChecked} redacted regions confirmed opaque; ${regionsChecked - regionsRedacted} may still contain sensitive content.`;
 
   return {
     verified,
@@ -366,7 +440,10 @@ export function emptyVerification(timestamp: number = Date.now()): VerificationR
     regionsRedacted: 0,
     leakedPatterns: [],
     confidence: 1,
-    summary: "VERIFIED: nothing sensitive on screen — zero regions required redaction.",
+    // Deliberately NOT "nothing sensitive on screen": zero regions means zero
+    // detections, which can also mean the detectors found nothing — not the
+    // same claim. The panel renders this state as neutral, not as a pass.
+    summary: "Nothing to verify on this frame — no region was flagged for redaction.",
     timestamp,
   };
 }

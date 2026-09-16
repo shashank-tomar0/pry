@@ -573,9 +573,12 @@ export function locateSpans(spans: string[]): SensitiveRegion[] {
   const wanted = spans.map((s) => s.trim()).filter((s) => s.length >= 3).slice(0, 12);
   if (wanted.length === 0) return regions;
 
+  const deadline = performance.now() + REGION_SCAN_BUDGET_MS;
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   let node: Node | null;
+  let visited = 0;
   while ((node = walker.nextNode())) {
+    if (++visited > REGION_SCAN_MAX_NODES || performance.now() > deadline) break;
     const text = node.textContent ?? "";
     if (text.length < 3) continue;
     for (const span of wanted) {
@@ -672,6 +675,22 @@ function findAssociatedLabel(el: Element): HTMLElement | null {
 }
 
 /**
+ * Work ceiling for region collection.
+ *
+ * This runs on the page's main thread inside a synchronous message handler, so
+ * it must finish fast: the service worker gives the whole round trip a bounded
+ * window, and blowing it means the frame ships with NO text redaction at all
+ * (faces still blur — that channel is pixel work). A dense page used to walk
+ * every text node and Range-measure every match, which could exceed the
+ * window and silently disable text redaction on exactly the pages that need
+ * it most. The scan is now deadline- and count-bounded; everything found
+ * before the budget expires is still redacted.
+ */
+const REGION_SCAN_BUDGET_MS = 1500;
+const REGION_SCAN_MAX_NODES = 8000;
+const REGION_MAX_RESULTS = 200;
+
+/**
  * Find visible text regions carrying PII, using the SAME matchers the text
  * channel tokenizes with (email, phone, checksum-validated IDs). This closes
  * the two-channel gap: an email in plain text was tokenized for the model
@@ -685,8 +704,12 @@ function findTextRegions(): SensitiveRegion[] {
   const regions: SensitiveRegion[] = [];
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   let node: Node | null;
+  const deadline = performance.now() + REGION_SCAN_BUDGET_MS;
+  let visited = 0;
 
   while ((node = walker.nextNode())) {
+    if (regions.length >= REGION_MAX_RESULTS) break;
+    if (++visited > REGION_SCAN_MAX_NODES || performance.now() > deadline) break;
     const text = node.textContent ?? "";
     if (text.length < 6) continue; // shorter than the smallest match class
 

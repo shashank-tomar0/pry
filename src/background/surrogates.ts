@@ -1,15 +1,20 @@
 /**
- * Synthetic Semantic Surrogates
+ * Synthetic format-preserving surrogates.
  *
- * Generates photorealistic, mathematically-valid dummy data to replace sensitive
- * text and visual regions in screenshots.
+ * Replaces a sensitive value with a synthetic one that keeps its length,
+ * character classes, and checksum validity, so downstream form validation and
+ * model reasoning survive the swap.
  *
- * Why this is superior to black-box masking:
- * 1. Black boxes blind downstream Vision-Language Models (VLMs), destroying visual
- *    affordances (cursor positioning, placeholder text, form alignment).
- * 2. Blurring is mathematically reversible via super-resolution neural attacks.
- * 3. Surrogates provide 100% privacy (zero real pixels leave the browser) while
- *    maintaining 100% visual perception for the AI agent.
+ * Scope and honesty:
+ *   - Used ONLY for the pixel pipeline (inpainting confirmed credential / ID
+ *     FIELDS on the redacted screenshot). Text tokens (`<CRED_1>`) are produced
+ *     by tokenizer.ts and are unrelated to this module.
+ *   - The generator is a hash-derived Feistel-style digit mapping, NOT a NIST
+ *     SP 800-38G FF3-1 cipher: there is no key, no tweak, and no AES round
+ *     function. That is a real limitation, not a naming preference — because the
+ *     mapping is unkeyed, a surrogate that a vision model receives can be
+ *     brute-forced back to the original over its (small) digit space. Regions
+ *     that must not be recoverable belong on the opaque path.
  */
 
 // Verhoeff multiplication and permutation tables
@@ -98,13 +103,14 @@ export function generatePhoneSurrogate(): string {
 }
 
 /**
- * Format-Preserving Encryption (FPE / FF3-1 design pattern):
- * Deterministically maps a real numeric string into a synthetic surrogate
- * having the exact same length, digit properties, and passing the required
- * checksum algorithm (Luhn for cards, Verhoeff for Aadhaar).
+ * Deterministic format-preserving mapping: a real numeric string becomes a
+ * synthetic surrogate of the exact same length and digit properties that
+ * passes the required checksum (Luhn for cards, Verhoeff for Aadhaar), so
+ * forms and VLMs that validate length and checksums continue to work.
  *
- * This ensures that when down-stream forms or VLMs validate length and checksums,
- * the encrypted value passes transparently without leaking real digits.
+ * NOT FF3-1: the digit derivation is an unkeyed FNV-1a digest, so the mapping
+ * is deterministic and, given a surrogate, brute-forceable over the small
+ * remaining digit space. See the module header.
  */
 
 function simpleHash(str: string, seed: number = 0x811c9dc5): number {

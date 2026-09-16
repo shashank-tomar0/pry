@@ -226,20 +226,42 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
 function findText(query: string): ActionResult {
   const needle = query.toLowerCase();
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  const hits: string[] = [];
+  const candidates: string[] = [];
+  const seen = new Set<string>();
   let node: Node | null;
-  while ((node = walker.nextNode()) && hits.length < 5) {
+  while ((node = walker.nextNode()) && candidates.length < 24) {
     const text = node.textContent?.trim();
     if (text && text.toLowerCase().includes(needle)) {
       const parent = node.parentElement;
-      if (parent && parent.offsetParent !== null) {
-        hits.push(text.slice(0, 200));
+      if (parent && parent.offsetParent !== null && !seen.has(text)) {
+        seen.add(text);
+        candidates.push(text.slice(0, 200));
       }
     }
   }
-  return hits.length > 0
-    ? done(`Found ${hits.length} match(es):\n${hits.map((h) => `- ${h}`).join("\n")}`)
-    : fail(`No visible text matching ${JSON.stringify(query)} on this page.`);
+  if (candidates.length === 0) {
+    return fail(`No visible text matching ${JSON.stringify(query)} on this page.`);
+  }
+  // Rank, don't just take document order: the node whose ENTIRE text is the
+  // needle ("YouTube" — a menu item) is almost always what the planner is
+  // hunting for, while long nodes that merely contain it ("YouTube - Quarterly
+  // reminder about YouTube's Terms of Service…" — newsletter rows) used to
+  // fill the hit cap in DOM order and hide the actual match. Ties break
+  // toward shorter text.
+  const rank = (text: string): number => {
+    const lower = text.toLowerCase();
+    if (lower === needle) return 0;
+    if (lower.startsWith(needle)) return 1;
+    return 2;
+  };
+  const top = candidates
+    .map((text) => ({ text, r: rank(text), len: text.length }))
+    .sort((a, b) => a.r - b.r || a.len - b.len)
+    .slice(0, 5);
+  const scope = candidates.length > top.length ? ` (top ${top.length} of ${candidates.length})` : "";
+  return done(
+    `Found ${candidates.length} match(es)${scope}:\n${top.map((h) => `- ${h.text}`).join("\n")}`,
+  );
 }
 
 /** Executes one action in the page. Never throws — errors come back as results. */

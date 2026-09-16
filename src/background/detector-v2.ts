@@ -57,6 +57,18 @@ const LABEL_NAMES: Record<string, string> = {
 export function fuseDetections(
   base: DetectedPII[],
   nerSpans: NerSpanInput[],
+  /**
+   * Everything visible on the page right now (text + element names/values).
+   * When supplied, a span that does not literally occur in it is dropped.
+   *
+   * Why: nothing downstream can act on a span that is not on the page anyway —
+   * the tokenizer requires the literal value to replace it, and locateSpans
+   * requires the literal value to black-box it. Passing an absent span through
+   * only inflates the detection count ("4 PII detected" for text that was
+   * never there), and it is exactly what made stale spans — scored on page 1,
+   * reused while sanitizing page 3 — look like real detections.
+   */
+  haystack?: string,
 ): { detections: DetectedPII[]; added: number } {
   const values = base
     .map((d) => d.value)
@@ -66,6 +78,7 @@ export function fuseDetections(
   for (const span of nerSpans) {
     const text = span.text.trim();
     if (text.length < 3) continue;
+    if (haystack !== undefined && !haystack.includes(text)) continue;
     // Duplicate if the span appears inside any known value or vice versa.
     const overlapping = values.some(
       (v) => v.includes(text) || text.includes(v),

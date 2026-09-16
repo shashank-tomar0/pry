@@ -95,7 +95,7 @@ export function createNvidiaPlanner(apiKey: string, model: string): Planner {
   return {
     label: `NVIDIA ${model}`,
 
-    async run({ system, messages, tools, signal, onText }: PlannerRequest): Promise<PlannerTurn> {
+    async run({ system, messages, tools, signal, onText, onThought }: PlannerRequest): Promise<PlannerTurn> {
       let stream: Awaited<ReturnType<typeof client.chat.completions.create>>;
 
       try {
@@ -125,9 +125,15 @@ export function createNvidiaPlanner(apiKey: string, model: string): Planner {
           if (choice.finish_reason) finishReason = choice.finish_reason;
 
           const delta = choice.delta as any;
-          const reasoning = delta?.reasoning_content || delta?.reasoning;
-          if (reasoning) {
-            onText(reasoning);
+          // Reasoning/chain-of-thought tokens are the model's internal planning
+          // ("The user wants me to…"). They bloat the transcript and look broken
+          // in the UI, so they are never displayed verbatim — but their arrival
+          // is the proof the model is alive during a cold start, so each one is
+          // forwarded as liveness signal (the agent loop drives a wait ticker
+          // from it). Only `delta.content` (narration + tool-call text) reaches
+          // onText.
+          if (delta?.reasoning_content ?? delta?.reasoning) {
+            onThought?.(String(delta.reasoning_content ?? delta.reasoning));
           }
           if (delta?.content) {
             text += delta.content;

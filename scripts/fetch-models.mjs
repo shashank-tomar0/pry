@@ -36,7 +36,23 @@ async function download(url, dest, headers = {}) {
   return buf.length;
 }
 
-async function fetchHfModel(repo, slug, onnxFile = "model_quantized.onnx") {
+/**
+ * Download one Hugging Face model into models/<slug>/.
+ *
+ * `files` maps a path INSIDE the repo to a path inside models/<slug>/. Repos
+ * disagree on layout: some ship onnx/model.onnx, others put model.onnx at the
+ * root with no onnx/ directory. transformers.js only ever looks in onnx/, so
+ * the mapping normalizes the layout instead of hoping the repo matches.
+ */
+const DEFAULT_FILES = [
+  ["config.json", "config.json"],
+  ["tokenizer.json", "tokenizer.json"],
+  ["tokenizer_config.json", "tokenizer_config.json"],
+  ["special_tokens_map.json", "special_tokens_map.json"],
+  ["onnx/model_quantized.onnx", "onnx/model_quantized.onnx"],
+];
+
+async function fetchHfModel(repo, slug, files = DEFAULT_FILES) {
   const auth = HF_TOKEN ? { authorization: `Bearer ${HF_TOKEN}` } : {};
   const probe = await fetch(`https://huggingface.co/api/models/${repo}`, { headers: auth, redirect: "follow" });
   if (!probe.ok) {
@@ -44,15 +60,18 @@ async function fetchHfModel(repo, slug, onnxFile = "model_quantized.onnx") {
     return false;
   }
   const base = `https://huggingface.co/${repo}/resolve/main/`;
-  const files = ["config.json", "tokenizer.json", "tokenizer_config.json", `onnx/${onnxFile}`];
-  for (const file of files) {
-    const dest = `${ROOT}/${slug}/${file}`;
+  for (const [from, to] of files) {
+    const dest = `${ROOT}/${slug}/${to}`;
     if (existsSync(dest)) {
       console.log(`  = ${dest} (cached)`);
       continue;
     }
-    const bytes = await download(base + file, dest, auth);
-    console.log(`  + ${dest} (${Math.round(bytes / 1024)} KB)`);
+    try {
+      const bytes = await download(base + from, dest, auth);
+      console.log(`  + ${dest} (${Math.round(bytes / 1024)} KB)`);
+    } catch (err) {
+      console.log(`  ! ${from} unavailable (${err.message})`);
+    }
   }
   console.log(`OK  ${slug} ready`);
   return true;
@@ -87,6 +106,10 @@ const NER_CANDIDATES = [
   "onnx-community/distilbert-NER",
   "Xenova/distilbert-base-uncased-finetuned-conll03-english",
 ];
+// The bundled checkpoint is a quantized token classifier whose output is
+// repaired by src/shared/ner-spans.ts (BIO prefixes stripped, WordPiece
+// fragments merged). Pin the repair with `npm run verify`; score a replacement
+// against the real weights with `node scripts/eval-ner.mjs`.
 let nerDone = false;
 for (const repo of NER_CANDIDATES) {
   try {
@@ -99,19 +122,58 @@ for (const repo of NER_CANDIDATES) {
 if (!nerDone) console.log("SKIP ner: no candidate available. Detection falls back to regex + checksums.");
 
 console.log("== Injection guard (text-classification) ==");
-const GUARD_CANDIDATES = [
-  "onnx-community/Llama-Prompt-Guard-2-22M",
-  "protectai/deberta-v3-small-prompt-injection-v2",
-];
-let guardDone = false;
-for (const repo of GUARD_CANDIDATES) {
-  try {
-    guardDone = await fetchHfModel(repo, "guard");
-    if (guardDone) break;
-  } catch (err) {
-    console.log(`  ${repo}: ${err.message}`);
-  }
+// NO DEFAULT CANDIDATE, ON PURPOSE.
+//
+// Every small ONNX prompt-injection checkpoint reachable from this project was
+// downloaded and scored against a labeled benign/attack set
+// (scripts/eval-guard.mjs) and every one failed the shipping bar:
+//
+//   testsavantai/prompt-injection-defender-tiny-v0-onnx  17 MB  recall 40%
+//       + flags "Please ignore the previous section of this document" as an
+//         attack
+//   testsavantai/prompt-injection-defender-small-v0-onnx 110 MB  recall 87%
+//       + flags a Terms-of-Service page and a profile page as attacks (20% FP)
+//   protectai/deberta-v3-base-prompt-injection-v2        none ONNX-compatible
+//   sinatras/Llama-Prompt-Guard-2-86M-ONNX                303 MB  too large to
+//         bundle (int8 of a much bigger graph than the name suggests)
+//   protectai/deberta-v3-base-injection-onnx            738 MB  recall 100%
+//       + flags 14/15 BENIGN pages as INJECTION at 0.94-1.00 confidence —
+//         sign-in forms, download instructions, ToS, order-tracking text.
+//         Structural, not fixable by a threshold: prompt-injection classifiers
+//         are trained on LLM input streams where ANY instruction-like text is
+//         hostile, but a web page is MADE of instructions. Whole-page
+//         classification is the wrong shape for this job; a usable semantic
+//         guard needs a model fine-tuned ON page content (benign DOM text vs
+//         injected DOM text) — no public checkpoint does that today.
+//
+// A guard that flags ordinary pages manufactures false alarms on a feature
+// whose whole value is that its warnings can be trusted. Shipping nothing and
+// saying so is the honest choice until a checkpoint clears the bar.
+//
+// To evaluate a replacement before adopting it:
+//   1. node scripts/fetch-models.mjs --guard=<hf-repo>
+//   2. node scripts/eval-guard.mjs
+// Only wire it in as the default once that passes.
+const guardArg = process.argv.find((a) => a.startsWith("--guard="));
+if (guardArg) {
+  const repo = guardArg.slice("--guard=".length);
+  console.log(`Evaluating candidate guard: ${repo}`);
+  // Root-level layout: model.onnx with no onnx/ directory.
+  const ok = await fetchHfModel(repo, "guard", [
+    ["config.json", "config.json"],
+    ["tokenizer.json", "tokenizer.json"],
+    ["tokenizer_config.json", "tokenizer_config.json"],
+    ["special_tokens_map.json", "special_tokens_map.json"],
+    ["vocab.txt", "vocab.txt"],
+    ["model.onnx", "onnx/model.onnx"],
+  ]).catch((err) => {
+    console.log(`SKIP ${repo}: ${err.message}`);
+    return false;
+  });
+  if (ok) console.log("Now score it: node scripts/eval-guard.mjs");
+} else {
+  console.log("SKIP guard: no checkpoint meets the accuracy bar — the regex heuristic is the guard.");
+  console.log("     Score a candidate with: node scripts/fetch-models.mjs --guard=<hf-repo> && node scripts/eval-guard.mjs");
 }
-if (!guardDone) console.log("SKIP guard: no candidate available. Regex injection detector remains the only guard.");
 
 console.log("\nDone. Missing models are fine — every ML feature degrades to the\nnon-ML path at runtime when its files are absent.");

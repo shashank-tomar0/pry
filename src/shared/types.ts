@@ -85,6 +85,12 @@ export interface VerificationResult {
   ocrRan?: boolean;
   /** Raw OCR text when it surfaced a leak (truncated, evidence for the audit). */
   leakedText?: string;
+  /**
+   * True when the adversarial auditor found readable content in a soft
+   * (blur-tier) region and rebuilt the image with those regions destroyed,
+   * then re-verified. The shipped bytes are the escalated ones.
+   */
+  escalated?: boolean;
 }
 
 /** Screenshot processing result from the privacy pipeline. */
@@ -118,7 +124,7 @@ export type ContentRequest =
 /** A rendered entry in the side panel transcript. */
 export interface TranscriptEntry {
   id: string;
-  role: "user" | "assistant" | "step" | "error" | "system" | "egress";
+  role: "user" | "assistant" | "step" | "error" | "system" | "egress" | "thought";
   text: string;
   /** Set on "step" entries so the UI can show an icon per action type. */
   action?: ActionName;
@@ -137,7 +143,7 @@ export interface TripwireAlertDetail {
 
 /** Privacy audit snapshot — captured after each task for the judges. */
 export interface PrivacyAuditSnapshot {
-  /** Redacted screenshot as data URL (faces blurred, credentials masked). */
+  /** Redacted screenshot as data URL (faces destroyed, credentials masked). */
   redactedScreenshot?: string;
   /** PII detections found during this snapshot. */
   detections: Array<{
@@ -192,6 +198,13 @@ export type AgentEvent =
         totalRedacted: number;
         totalScreenshots: number;      totalPIIDetections: number;
       durationMs: number;
+      /**
+       * True only when a redacted frame actually left the browser (VLM vision
+       * enabled with a key). With vision off — the default — every screenshot
+       * is captured and redacted locally for the audit, and nothing is sent,
+       * so the panel must not label the frame "what shipped to the model".
+       */
+      shipped?: boolean;
       /** Latest re-OCR verification result, when a screenshot was redacted. */
       verification?: VerificationResult;
       };
@@ -333,8 +346,16 @@ export interface ElevenLabsSettings {
 }
 
 export interface PrivacySettings {
-  /** Enable face detection and blur on screenshots. */
-  blurFaces: boolean;
+  /**
+   * Detect faces in screenshots and DESTROY them (opaque fill).
+   *
+   * Not a blur: Gaussian-blurred faces are recoverable by super-resolution
+   * deanonymization (arXiv 2506.12344 concludes blur should not be used for
+   * face anonymization), and a reversible redaction of a biometric identifier
+   * is not a redaction. The legacy key was `blurFaces`; see normaliseSettings
+   * for the migration.
+   */
+  destroyFaces: boolean;
   /** Enable credential field masking. */
   maskCredentials: boolean;
   /** Enable PII tokenization for DOM values. */
@@ -362,7 +383,7 @@ export const DEFAULT_SETTINGS: Settings = {
     model: "",
   },
   privacy: {
-    blurFaces: true,
+    destroyFaces: true,
     maskCredentials: true,
     tokenizePII: true,
     showRedactionLabels: false,
@@ -400,6 +421,16 @@ export function normaliseSettings(stored: unknown): Settings {
   const raw = { ...source };
   delete (raw as unknown as { server?: unknown }).server;
 
+  // Face redaction used to be a Gaussian blur under `privacy.blurFaces`. Blur
+  // is recoverable, so the setting is now `privacy.destroyFaces` (opaque).
+  // Preserve the user's intent across the rename — someone who had turned
+  // face redaction OFF should not silently get it switched ON — then strip the
+  // dead key so it never lands in the settings object.
+  const legacyBlurFaces = (source.privacy as { blurFaces?: boolean } | undefined)?.blurFaces;
+  if (raw.privacy) {
+    delete (raw.privacy as { blurFaces?: boolean }).blurFaces;
+  }
+
   const settings: Settings = {
     ...DEFAULT_SETTINGS,
     ...raw,
@@ -411,7 +442,12 @@ export function normaliseSettings(stored: unknown): Settings {
       ...(raw.vision ?? {}),
       enabled: raw.vision?.enabled ?? legacyServerEnabled,
     },
-    privacy: { ...DEFAULT_SETTINGS.privacy, ...(raw.privacy ?? {}) },
+    privacy: {
+      ...DEFAULT_SETTINGS.privacy,
+      ...(raw.privacy ?? {}),
+      destroyFaces:
+        raw.privacy?.destroyFaces ?? (legacyBlurFaces === false ? false : DEFAULT_SETTINGS.privacy.destroyFaces),
+    },
     elevenlabs: { ...DEFAULT_SETTINGS.elevenlabs, ...(raw.elevenlabs ?? {}) },
     ml: { ...DEFAULT_SETTINGS.ml, ...(raw.ml ?? {}) },
   };
@@ -419,6 +455,26 @@ export function normaliseSettings(stored: unknown): Settings {
   // Pre-multi-provider installs stored a bare Anthropic key and model.
   if (raw.apiKey && !settings.apiKeys.anthropic) settings.apiKeys.anthropic = raw.apiKey;
   if (raw.model && !raw.models) settings.models.anthropic = raw.model;
+
+  // A stored ElevenLabs key with both voice toggles off is the legacy state:
+  // the user added a key (clear intent to use voice) but the build that saved
+  // it never turned STT/TTS on, so the mic button could never appear. Options
+  // now auto-enables both when a key is present — mirror that here so an
+  // existing install does not stay permanently voiceless.
+  if (settings.elevenlabs.apiKey && !settings.elevenlabs.sttEnabled && !settings.elevenlabs.ttsEnabled) {
+    settings.elevenlabs.sttEnabled = true;
+    settings.elevenlabs.ttsEnabled = true;
+  }
+
+  // The old suggested voice (Rachel, 21m00Tcm4TlvDq8ikWAM) is a LIBRARY voice:
+  // ElevenLabs' free plan rejects it over the API with 402 paid_plan_required,
+  // so installs that saved it get a TTS error on every run even though the
+  // bundled default (a premade voice) works. Migrate the legacy id to empty —
+  // the empty string falls back to DEFAULT_TTS_VOICE_ID — the same way the
+  // legacy blurFaces key is healed above.
+  if (settings.elevenlabs.voiceId.trim() === "21m00Tcm4TlvDq8ikWAM") {
+    settings.elevenlabs.voiceId = "";
+  }
 
   return settings;
 }
@@ -438,6 +494,8 @@ export interface InspectData {
   tab: { id?: number; title?: string; url?: string };
   original: string;
   redacted: string;
+  /** True when the redacted frame can actually be sent to a vision model. */
+  visionEnabled?: boolean;
   width: number;
   height: number;
   tiles: number;

@@ -50,13 +50,39 @@ try {
 // ONNX Runtime wasm binaries (transformers.js resolves them from this exact
 // directory) and the MediaPipe tasks-vision wasm (BlazeFace). Both are
 // vendored so no inference code is ever fetched from a CDN.
+/**
+ * ONNX Runtime wasm/mjs assets.
+ *
+ * These MUST come from the same onnxruntime-web build that transformers.js
+ * bundles, not from the top-level dependency. The two are frequently
+ * different versions (transformers pins a dev build), and ORT's wasm loader
+ * rejects a JS/wasm version mismatch — which transformers.js then swallows as
+ * "model unavailable". That failure is invisible: the model file probes fine,
+ * the transcript claims "NER model bundled", and detection silently never
+ * runs. Resolve the nested copy first, fall back to the hoisted one.
+ */
+const ORT_DIST_CANDIDATES = [
+  "node_modules/@huggingface/transformers/node_modules/onnxruntime-web/dist",
+  "node_modules/onnxruntime-web/dist",
+];
+let ortDist = "";
+for (const candidate of ORT_DIST_CANDIDATES) {
+  try {
+    await readdir(candidate);
+    ortDist = candidate;
+    break;
+  } catch {
+    // Not hoisted here — try the next candidate.
+  }
+}
 try {
-  await mkdir("dist/vendor/ort", { recursive: true });
-  for (const f of await readdir("node_modules/onnxruntime-web/dist")) {
+  for (const f of await readdir(ortDist)) {
     if (f.endsWith(".wasm") || f.endsWith(".mjs")) {
-      await cp(`node_modules/onnxruntime-web/dist/${f}`, `dist/vendor/ort/${f}`);
+      await mkdir("dist/vendor/ort", { recursive: true });
+      await cp(`${ortDist}/${f}`, `dist/vendor/ort/${f}`);
     }
   }
+  console.log(`vendored onnxruntime assets from ${ortDist}`);
 } catch {
   // onnxruntime-web not installed — ML features degrade, extension still works.
 }

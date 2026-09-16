@@ -16,10 +16,16 @@ const stopBtn = $("stop-btn");
 // The whole voice stack is feature-flagged on settings.elevenlabs.sttEnabled /
 // .ttsEnabled. Until those are on, no Scribe WS, no Flash TTS, no mic usage.
 import type { VoiceController } from "./voice-controller";
+import { DEFAULT_TTS_VOICE_ID } from "./voice-core";
 let voice: VoiceController | null = null;
 // Mic listeners attach exactly once (bootstrapVoice runs on every settings
-// save; re-adding pointer listeners would stack handlers on the same button).
+// save; re-adding listeners would stack handlers on the same button).
 let micListenersAttached = false;
+// Live recording badge on the mic button while dictation is open.
+let micRecTimer: ReturnType<typeof setInterval> | null = null;
+let micRecStartAt = 0;
+// Announce the mic once per panel session, not on every settings save.
+let micReadyAnnounced = false;
 
 async function bootstrapVoice(): Promise<void> {
   const settings = (await send({ kind: "get-state" })) as { settings?: import("../shared/types").Settings } | undefined;
@@ -33,8 +39,13 @@ async function bootstrapVoice(): Promise<void> {
   }
   if (micBtn) micBtn.classList.add("hidden");
 
-  if (!el?.apiKey || (!el.sttEnabled && !el.ttsEnabled)) return;
-  const voiceId = el.voiceId?.trim() || "21m00Tcm4TlvDq8ikWAM";
+  if (!el?.apiKey || !el.sttEnabled) {
+    // A key without STT enabled means dictation is off by choice — no mic.
+    // (normaliseSettings upgrades the legacy "key saved, both toggles off"
+    // state, which is what used to leave the button permanently missing.)
+    return;
+  }
+  const voiceId = el.voiceId?.trim() || DEFAULT_TTS_VOICE_ID;
 
   const { VoiceController } = await import("./voice-controller");
 
@@ -55,36 +66,48 @@ async function bootstrapVoice(): Promise<void> {
           micBtn.dataset.state = state;
           micBtn.classList.toggle("listening", state === "listening" || state === "connecting");
         }
+        if (state === "idle" || state === "error") stopMicBadge();
       },
-      onError: (msg) => emitLocalStatus(msg),
+      onFinal: () => {
+        // Auto-commit ended the turn — the badge stops with the state change.
+      },
+      onError: (msg) => {
+        emitLocalStatus(msg);
+      },
     },
   });
 
-  // Mic button: hold-to-talk. Press to start, release to commit.
-  // Listeners reference the module-level `voice` (not a captured instance),
-  // so they stay correct across re-bootstraps — attach them only once.
+  // Mic button: click once to start dictating, click again to send. The old
+  // hold-to-talk was hostile on a desktop — keeping the button pressed while
+  // typing (or just resting a hand) felt wrong, and a hold that released a
+  // beat too early committed half a sentence. Toggle is one fewer thing to
+  // think about, works the same on laptop, desktop, and touchscreen, and the
+  // button shows a live recording badge so the state is never in doubt.
   if (micBtn) {
     if (!micListenersAttached) {
       micListenersAttached = true;
-      const press = async (ev: PointerEvent) => {
-        ev.preventDefault();
-        micBtn.setPointerCapture(ev.pointerId);
+      const toggleMic = async (): Promise<void> => {
+        if (!voice) {
+          emitLocalStatus("Voice not initialized — check ElevenLabs API key and enable STT in settings.");
+          return;
+        }
+        if (voice.isListening) {
+          micBtn.title = "Transcribing…";
+          try {
+            await voice.stopListening();
+          } catch {
+            voice.cancel();
+          }
+          return;
+        }
         try {
-          await voice!.startListening();
+          await voice.startListening();
+          if (voice.isListening) startMicBadge(micBtn);
         } catch (err) {
           emitLocalStatus(err instanceof Error ? err.message : String(err));
         }
       };
-      const release = async () => {
-        try {
-          await voice!.stopListening();
-        } catch {
-          voice!.cancel();
-        }
-      };
-      micBtn.addEventListener("pointerdown", (e) => void press(e));
-      micBtn.addEventListener("pointerup", () => void release());
-      micBtn.addEventListener("pointercancel", () => voice?.cancel());
+      micBtn.addEventListener("click", () => void toggleMic());
     }
     // Show the mic on EVERY bootstrap — the old code hid it at the top of
     // this function and only re-showed it on first-ever attach, so a second
@@ -92,19 +115,84 @@ async function bootstrapVoice(): Promise<void> {
     // classList.remove overrides .hidden { display: none !important }
     // (micBtn.hidden = false does NOT remove the CSS class)
     micBtn.classList.remove("hidden");
+    // One honest line the first time voice becomes available, so "is the mic
+    // wired up?" is answerable without reading the console.
+    if (!micReadyAnnounced) {
+      micReadyAnnounced = true;
+      render({
+        id: `voice-ready-${Date.now()}`,
+        role: "system",
+        text: "Voice: dictation ready. Hold the mic button to talk (release to send), or tap it to start and tap again to send.",
+      });
+    }
   }
 }
 
 /** Local status line for voice events. Surfaces in the chat transcript as a
  *  system entry so mic-permission denials and TTS errors are visible
  *  (console.warn alone is invisible mid-demo). */
+let lastVoiceStatus = "";
+
+/** Live recording badge: the mic button turns into a pulsing dot and its
+ *  tooltip ticks up the elapsed seconds, so "am I being recorded?" and
+ *  "how do I send?" are answered by looking at the button. */
+function startMicBadge(micBtn: HTMLButtonElement): void {
+  stopMicBadge();
+  micRecStartAt = Date.now();
+  micBtn.textContent = "⏺";
+  micBtn.title = "Recording 0s — click to send";
+  micRecTimer = setInterval(() => {
+    const seconds = Math.round((Date.now() - micRecStartAt) / 1000);
+    micBtn.title = `Recording ${seconds}s — click to send`;
+  }, 500);
+}
+
+function stopMicBadge(): void {
+  if (micRecTimer !== null) {
+    clearInterval(micRecTimer);
+    micRecTimer = null;
+  }
+  const micBtn = document.getElementById("mic-btn");
+  if (micBtn) {
+    micBtn.textContent = "🎙";
+    micBtn.title = "Click to dictate — click again to send";
+  }
+}
+
+
 function emitLocalStatus(text: string): void {
   console.warn("[PRY voice]", text);
+  // Chrome returns the identical dismissal for every mic attempt. Repeating
+  // "Voice: Permission dismissed" six times buries the transcript, so show
+  // each distinct status once and translate the dead-end into a fix.
+  const status = /dismiss|denied|not allowed/i.test(text)
+    ? 'mic access was blocked. Chrome shows the Allow prompt once; after a dismissal it stays silent, so allow it permanently: open chrome://extensions → PRY → Details → Site settings → set Microphone to "Allow", then press the mic again.'
+    : text;
+  if (status === lastVoiceStatus) return;
+  lastVoiceStatus = status;
   render({
     id: `voice-${Date.now()}`,
     role: "system",
-    text: `Voice: ${text}`,
+    text: `Voice: ${status}`,
   });
+}
+
+/**
+ * True when a narration string carries at least one real character.
+ *
+ * Small models emit a bare space or newline (or a zero-width joiner) before a
+ * tool call. Rendering that opened a blank "PRY AGENT" card with a Copy
+ * button and no content — several stacked up in a run and looked like broken
+ * UI.
+ *
+ * Deliberately the SAME rule the background applies before it opens a card
+ * (trim, plus the zero-width characters trim() misses). A stricter rule here
+ * would disagree with the background: the card would be suppressed while the
+ * background still believed it was open, and every later streaming patch would
+ * find no node and silently drop the answer.
+ */
+function hasVisibleAssistantText(md: string): boolean {
+  return md.replace(/[\s\u00a0\u200b-\u200d\ufeff]+/g, "").length > 0;
 }
 
 /** Speak assistant text once a final answer arrives, gated on settings. */
@@ -352,6 +440,13 @@ function render(entry: TranscriptEntry): void {
           }
         }
       });
+    } else if (entry.role === "thought") {
+      node.innerHTML = `
+        <details class="thought-box" open>
+          <summary class="thought-summary">REASONING</summary>
+          <div class="thought-body"></div>
+        </details>
+      `;
     } else if (entry.role === "user") {
       node.innerHTML = `
         <div class="user-bubble">
@@ -391,6 +486,11 @@ function render(entry: TranscriptEntry): void {
   } else if (entry.role === "user") {
     const userTextEl = node.querySelector(".user-text");
     if (userTextEl) userTextEl.textContent = entry.text;
+  } else if (entry.role === "thought") {
+    const body = node.querySelector(".thought-body");
+    if (body) body.textContent = entry.text;
+    const box = node.querySelector("details");
+    if (box) box.open = entry.pending === true;
   } else if (entry.role === "egress") {
     const body = node.querySelector(".egress-body");
     if (body) body.textContent = entry.text;
@@ -433,6 +533,8 @@ function renderPrivacyAudit(audit: {
   totalScreenshots: number;
   totalPIIDetections: number;
   durationMs: number;
+  /** True when a redacted frame actually left the browser (VLM vision on). */
+  shipped?: boolean;
   verification?: {
     verified: boolean;
     regionsChecked: number;
@@ -478,7 +580,10 @@ function renderPrivacyAudit(audit: {
       ${leaked}
     `;
   } else if (audit.verification) {
-    verificationEl.innerHTML = `<div class="verify-chip warn"><span class="verify-badge">⚠ WARNING</span><span class="verify-summary">${escapeHtml(audit.verification.summary)}</span></div>`;
+    // Zero regions flagged: nothing was measured, so this is neither a pass
+    // nor a warning. It used to render as "⚠ WARNING" next to a summary that
+    // began "VERIFIED" — two contradictory claims in one chip.
+    verificationEl.innerHTML = `<div class="verify-chip neutral"><span class="verify-badge">○ NOTHING TO VERIFY</span><span class="verify-summary">${escapeHtml(audit.verification.summary)}</span></div>`;
   } else {
     verificationEl.innerHTML = "";
   }
@@ -496,8 +601,18 @@ function renderPrivacyAudit(audit: {
       }
       if (shot.redacted) {
         // Overlays for the redacted image: THIS frame's own 0-1 boxes, so the
-        // proof marker sits exactly on this frame's redactions.
-        pair.appendChild(buildShot(shot.redacted, "Redacted — what shipped to the model", shot.detections ?? [], true));
+        // proof marker sits exactly on this frame's redactions. The caption
+        // states whether it actually shipped: with vision off (the default) no
+        // screenshot leaves the browser, and calling it "what shipped to the
+        // model" claimed an egress that never happened.
+        pair.appendChild(buildShot(
+          shot.redacted,
+          audit.shipped
+            ? "Redacted — what shipped to the model"
+            : "Redacted — model-safe frame (vision off: never sent)",
+          shot.detections ?? [],
+          true,
+        ));
       }
       screenshotsEl.appendChild(pair);
     }
@@ -565,8 +680,11 @@ function appendAuditVerificationChip(audit: {
 }): void {
   const chip = document.createElement("div");
   chip.className = "entry audit-chip";
+  // "ZERO-LEAK VERIFIED" claimed something this check cannot measure: it proves
+  // the regions PRY redacted are unrecoverable in the shipped bytes, not that
+  // PRY found every sensitive thing on the page (see README §6.5).
   const verifiedBadge = audit.verification?.verified
-    ? `<span class="chip-status ok">✓ ZERO-LEAK VERIFIED</span>`
+    ? `<span class="chip-status ok">✓ REDACTIONS VERIFIED</span>`
     : `<span class="chip-status warn">🔒 PRIVACY AUDIT</span>`;
   const tokenCount = new Set(audit.allTokens.map((t) => t.token)).size;
 
@@ -751,6 +869,8 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
   switch (event.kind) {
     case "entry":
       if (event.entry.role === "assistant") {
+        // Never open a card that would render as an empty bubble.
+        if (!hasVisibleAssistantText(event.entry.text)) break;
         currentRunAssistantId = event.entry.id;
       }
       render(event.entry);
@@ -761,15 +881,26 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
       if (!node) break;
       if (event.text !== undefined) {
         if (node.classList.contains("assistant")) {
+          // Assistant patches are streaming DELTAS — append them.
           const current = (rawTexts.get(event.id) ?? "") + event.text;
-          rawTexts.set(event.id, current);
-          const body = node.querySelector(".assistant-body");
-          if (body) body.innerHTML = formatMarkdown(current);
+          if (hasVisibleAssistantText(current)) {
+            rawTexts.set(event.id, current);
+            const body = node.querySelector(".assistant-body");
+            if (body) body.innerHTML = formatMarkdown(current);
+          }
         } else if (node.classList.contains("step")) {
-          const current = (rawTexts.get(event.id) ?? "") + event.text;
-          rawTexts.set(event.id, current);
+          // Step patches are full REPLACEMENTS: the executor's detail
+          // supersedes the intent text the card opened with. Appending glued
+          // them together — "Read the pageRead the page." in the transcript.
+          rawTexts.set(event.id, event.text);
           const detail = node.querySelector(".detail");
-          if (detail) detail.textContent = current;
+          if (detail) detail.textContent = event.text;
+        } else if (node.classList.contains("thought")) {
+          // Reasoning deltas are streaming APPENDS, rendered as plain text.
+          const current = (rawTexts.get(event.id) ?? "") + (event.text ?? "");
+          rawTexts.set(event.id, current);
+          const body = node.querySelector(".thought-body");
+          if (body) body.textContent = current;
         } else if (node.classList.contains("egress")) {
           rawTexts.set(event.id, event.text ?? "");
           const body = node.querySelector(".egress-body");
@@ -779,6 +910,11 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
         }
       }
       if (event.pending !== undefined) node.classList.toggle("pending", event.pending);
+      // The turn settled — hand attention back to actions and answers by
+      // collapsing the reasoning block (one click re-expands it).
+      if (event.pending === false && node.classList.contains("thought")) {
+        node.querySelector("details")?.removeAttribute("open");
+      }
       if (atBottom()) transcriptEl.scrollTop = transcriptEl.scrollHeight;
       break;
     }
@@ -1288,6 +1424,7 @@ taskInput.addEventListener("input", () => {
 // Stop button
 stopBtn.addEventListener("click", () => {
   currentRunAssistantId = null;
+  stopMicBadge();
   voice?.cancel();
   void send({ kind: "stop" });
 });
@@ -1295,6 +1432,7 @@ stopBtn.addEventListener("click", () => {
 // New task
 $("new-task-btn").addEventListener("click", () => {
   currentRunAssistantId = null;
+  stopMicBadge();
   voice?.cancel();
   void send({ kind: "reset" });
   nodes.clear();
@@ -1477,7 +1615,10 @@ function renderWireLog(records: WireRecordView[]): void {
   const leakCount = records.reduce((n, r) => n + r.leaked.length, 0);
   summaryEl.textContent = records.length === 0
     ? "No planner turns recorded yet. Run a task — every turn is logged here with a leak re-scan."
-    : `${records.length} turn(s) logged · ${leakCount === 0 ? "no leaks detected on any outgoing payload" : `${leakCount} LEAK(S) DETECTED`}`;
+    // Scope the claim to the planner payload. The tripwire radar counts a
+    // different channel (third-party requests), so an unscoped "LEAK(S)"
+    // here read as a contradiction of the radar's "0 leaks" badge.
+    : `${records.length} turn(s) logged · ${leakCount === 0 ? "0 PII leaks in any payload sent to the model" : `${leakCount} LEAK(S) REACHED THE MODEL`}`;
 
   listEl.textContent = "";
   // Newest first, mirroring the transcript.

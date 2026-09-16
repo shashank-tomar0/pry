@@ -2,6 +2,7 @@ import type { ProviderId } from "../background/providers/types";
 import type { Settings } from "../shared/types";
 import { normaliseSettings } from "../shared/types";
 import { PROVIDERS, PROVIDER_IDS, listModels } from "../shared/models";
+import { DEFAULT_TTS_VOICE_ID } from "../sidepanel/voice-core";
 
 const $ = <T extends HTMLElement>(id: string): T =>
   document.getElementById(id) as T;
@@ -32,7 +33,7 @@ const activeModelDisplay = $("active-model-display");
 const activeProviderBadge = $("active-provider-badge");
 
 // Privacy elements
-const blurFacesEl = $<HTMLInputElement>("blurFaces");
+const destroyFacesEl = $<HTMLInputElement>("destroyFaces");
 const maskCredentialsEl = $<HTMLInputElement>("maskCredentials");
 const tokenizePIIEl = $<HTMLInputElement>("tokenizePII");
 const showRedactionLabelsEl = $<HTMLInputElement>("showRedactionLabels");
@@ -127,7 +128,7 @@ function renderAll(): void {
   mlGuardEl.checked = settings.ml.guard;
 
   // Privacy.
-  blurFacesEl.checked = settings.privacy.blurFaces;
+  destroyFacesEl.checked = settings.privacy.destroyFaces;
   maskCredentialsEl.checked = settings.privacy.maskCredentials;
   tokenizePIIEl.checked = settings.privacy.tokenizePII;
   showRedactionLabelsEl.checked = settings.privacy.showRedactionLabels;
@@ -161,7 +162,7 @@ function captureFields(): void {
   settings.models[settings.provider] = modelEl.value.trim();
   settings.vision.enabled = visionEnabledEl.checked;
   settings.vision.model = visionModelEl.value.trim();
-  settings.privacy.blurFaces = blurFacesEl.checked;
+  settings.privacy.destroyFaces = destroyFacesEl.checked;
   settings.privacy.maskCredentials = maskCredentialsEl.checked;
   settings.privacy.tokenizePII = tokenizePIIEl.checked;
   settings.privacy.showRedactionLabels = showRedactionLabelsEl.checked;
@@ -280,7 +281,7 @@ $("save").addEventListener("click", async () => {
   // a no-op (the side panel checks the flag + key together), but warn so
   // users know nothing will happen.
   settings.elevenlabs.apiKey = elApiKeyEl.value.trim();
-  settings.elevenlabs.voiceId = elVoiceIdEl.value.trim() || "21m00Tcm4TlvDq8ikWAM";
+  settings.elevenlabs.voiceId = elVoiceIdEl.value.trim() || DEFAULT_TTS_VOICE_ID;
   settings.elevenlabs.sttEnabled = elSttEl.checked;
   settings.elevenlabs.ttsEnabled = elTtsEl.checked;
 

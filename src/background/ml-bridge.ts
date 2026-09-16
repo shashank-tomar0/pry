@@ -8,14 +8,30 @@
  */
 
 import type { NerSpanInput } from "./detector-v2";
+import { ensureOffscreenDocument } from "./offscreen-doc";
 
-const ML_TIMEOUT_MS = 8000;
+/**
+ * Budget for one offscreen ML round trip (timer starts once the document
+ * exists, so a cold document start is not counted).
+ *
+ * 8 s was optimistic: the FIRST inference after a cold load has to page the
+ * quantized token-classification weights into wasm memory, which can exceed
+ * it. A timeout here degrades silently to the non-ML answer — the exact
+ * failure mode that made the wire log report names as LEAKs while the
+ * self-test claimed the model was loaded.
+ */
+const ML_TIMEOUT_MS = 15_000;
 
+/**
+ * ML_TIMEOUT_MS starts counting only once the document exists, so a cold
+ * start cannot be mistaken for a model timeout.
+ */
 async function callOffscreen<T>(
   message: { type: string; text: string },
   fallback: T,
   signal?: AbortSignal,
 ): Promise<T> {
+  await ensureOffscreenDocument().catch(() => undefined);
   try {
     const response = await Promise.race([
       chrome.runtime.sendMessage(message) as Promise<T | undefined>,
@@ -100,6 +116,40 @@ export function getActiveNerSpans(): string[] {
   // Copy: callers (the capture path) must never be able to mutate the state
   // that the next turn's screenshot depends on.
   return [...activeNerSpans];
+}
+
+export interface MlSelfTest {
+  ner: { ready: boolean; reason?: string; sample?: string[]; kept?: number };
+  guard: { ready: boolean; reason?: string; label?: string };
+  face: { ready: boolean };
+}
+
+/**
+ * Load every on-device model and run one real inference on each.
+ *
+ * Returns null when the offscreen document could not answer in time (the
+ * caller then falls back to the file-presence probe). This is the difference
+ * between "a model file exists" and "the model works" — only the latter is
+ * worth telling the user.
+ */
+export async function selfTestMl(): Promise<MlSelfTest | null> {
+  await ensureOffscreenDocument().catch(() => undefined);
+  try {
+    const response = (await Promise.race([
+      chrome.runtime.sendMessage({ type: "ml-self-test" }) as Promise<
+        { ok?: boolean; result?: MlSelfTest } | undefined
+      >,
+      // The self-test pays the one-time cost of every model's first load
+      // (wasm init + a cold disk read of the NER checkpoint, possibly under
+      // antivirus scanning). 30s lost that race on real installs and downgraded
+      // the status line to "present on disk (unverified)" even though the
+      // model works — the weaker claim, shown as if it were the honest one.
+      new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 60_000)),
+    ])) as { ok?: boolean; result?: MlSelfTest } | undefined;
+    return response?.result ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /** Probe which model files actually shipped (cheap HEAD on package URLs). */

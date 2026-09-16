@@ -7,8 +7,16 @@ import type {
 import { PAGE_ACTIONS } from "./tools";
 import { canonicalHost } from "./deterministic";
 
-/** How long a content-script round trip may take before we treat it as hung. */
-const CONTENT_TIMEOUT_MS = 30_000;
+/**
+ * How long a content-script round trip may take before we treat it as hung.
+ *
+ * 10 s turned slow-but-alive page work (a heavy page re-perceiving its DOM
+ * while an animation runs) into a reported failure, and the agent then
+ * re-planned against a page that had actually succeeded. Long enough to
+ * absorb a busy main thread, still short enough that a dead content script
+ * surfaces as an error instead of a silent freeze.
+ */
+const CONTENT_TIMEOUT_MS = 20_000;
 
 /** Tracks which tab the agent is currently driving. */
 export class TabController {
@@ -74,7 +82,7 @@ export class TabController {
   }
 
   /** Resolves once the tab has finished loading, or after a timeout. */
-  async waitForLoad(timeoutMs = 15000): Promise<void> {
+  async waitForLoad(timeoutMs = 8000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const tab = await chrome.tabs.get(this.tabId).catch(() => null);
@@ -204,7 +212,24 @@ export async function execute(
         controller,
       };
     }
-    return { result: await controller.act(action), controller };
+    const beforeUrl = tab?.url ?? "";
+    const result = await controller.act(action);
+    if (result.ok) {
+      // SPA navigations (YouTube: click a thumbnail → /watch; Gmail: open a
+      // conversation) change the URL via history.pushState without a real
+      // load event. The content script's post-click settle window can race
+      // the new page's first render and hand the planner a half-transitioned
+      // DOM — a watch-page URL with homepage elements — which the planner
+      // then cannot reconcile. A URL change after the action is the reliable
+      // signal: wait for the page to finish rendering and re-perceive once.
+      const afterUrl = (await chrome.tabs.get(controller.tabId).catch(() => null))?.url ?? "";
+      if (afterUrl && afterUrl !== beforeUrl) {
+        await controller.waitForLoad();
+        const fresh = await controller.snapshot();
+        if (fresh) result.snapshot = fresh;
+      }
+    }
+    return { result, controller };
   }
 
   switch (name) {

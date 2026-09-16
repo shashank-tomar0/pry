@@ -416,15 +416,17 @@
           <div style="padding-top: 6px;">
             <input type="checkbox" class="toggle" id="ml-ner" checked />
           </div>
+          <div class="toggle-desc">Bundled. Extracts names/orgs/locations so they are tokenized in text and black-boxed in screenshots.</div>
         </div>
         <div class="field-group">
           <label class="field-label">Injection Guard (page text)</label>
           <div style="padding-top: 6px;">
             <input type="checkbox" class="toggle" id="ml-guard" checked />
           </div>
+          <div class="toggle-desc">No model is bundled: every candidate checkpoint this project evaluated failed the accuracy bar (see <code>scripts/eval-guard.mjs</code>). The regex heuristic is active, and this toggle only matters if you drop a vetted model into <code>models/guard/</code>.</div>
         </div>
       </div>
-      <p class="section-subtitle" style="margin-top: 8px;">Fetch models: <code>node scripts/fetch-models.mjs</code> then rebuild. Without them these toggles are no-ops.</p>
+      <p class="section-subtitle" style="margin-top: 8px;">NER is ready out of the box. Before adding a guard checkpoint, score it: <code>node scripts/eval-guard.mjs</code> must pass — a guard that flags ordinary pages costs more trust than it buys. Rebuild after changing <code>models/</code>.</p>
     </div>
 
     <div class="section">
@@ -437,7 +439,11 @@
         </div>
         <div class="field-group" style="flex: 2;">
           <label class="field-label">Voice ID</label>
-          <input type="text" class="field-input" id="elevenlabs-voice-id" placeholder="e.g. 21m00Tcm4TlvDq8ikWAM" />
+          <!-- Placeholder is the PREMADE default. The familiar "Rachel" id is a
+               library voice, which the free plan rejects over the API with 402
+               paid_plan_required — suggesting it here sent free-tier users
+               straight into a payment error. -->
+          <input type="text" class="field-input" id="elevenlabs-voice-id" placeholder="SAz9YHcvj6GT2YYXdXww (premade — works on the free plan)" />
         </div>
       </div>
       <div class="field-row" style="margin-top: 8px;">
@@ -461,10 +467,10 @@
       <div class="privacy-grid" style="margin-top: 8px;">
         <div class="toggle-row">
           <div>
-            <div class="toggle-label">Blur Faces</div>
-            <div class="toggle-desc">Detect and blur faces in screenshots</div>
+            <div class="toggle-label">Destroy Faces</div>
+            <div class="toggle-desc">Replace detected faces with an opaque mask — irreversible, not a blur</div>
           </div>
-          <input type="checkbox" class="toggle" id="blurFaces" checked />
+          <input type="checkbox" class="toggle" id="destroyFaces" checked />
         </div>
         <div class="toggle-row">
           <div>

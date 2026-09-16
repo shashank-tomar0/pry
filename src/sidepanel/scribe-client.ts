@@ -1,15 +1,21 @@
 /**
  * ElevenLabs Scribe Realtime client (STT — voice task input).
  *
- * Wire protocol (from @elevenlabs/client 1.25 type defs):
+ * Wire protocol (from the published AsyncAPI spec for
+ * GET /v1/speech-to-text/realtime — NOT the SDK's convenience API):
  *   - Client-side browser usage requires a single-use token minted via the
  *     REST endpoint POST /v1/single-use-token/realtime_scribe (the raw key
  *     must never be sent from the extension).
- *   - Token + model id + audio format are sent as connection query params.
- *   - Audio frames are PCM16 base64-encoded and sent as WebSocket messages
- *     with {audioBase64} / {commit} shapes.
- *   - Events arrive as PARTIAL_TRANSCRIPT (live) and COMMITTED_TRANSCRIPT
- *     (final) via the SDK's RealtimeEvents map.
+ *   - Token + model id + audio format + commit strategy are connection query
+ *     params. commit_strategy=manual is explicit: we call commit() ourselves
+ *     when the mic is released, so VAD must not race us.
+ *   - The ONLY client message the server accepts is an InputAudioChunk:
+ *       { message_type: "input_audio_chunk", audio_base_64, commit, sample_rate }
+ *     `message_type`, `audio_base_64`, `commit` and `sample_rate` are all
+ *     REQUIRED. Sending the SDK's `{audioBase64}` shape (which is what this
+ *     module used to do) is silently dropped — audio was never transcribed.
+ *   - Server events are discriminated by `message_type`: session_started,
+ *     partial_transcript, committed_transcript, error, auth_error, …
  *
  * This module owns the connection; the side panel wires it up.
  */
@@ -23,6 +29,35 @@ const SCRIBE_MODEL = "scribe_v2_realtime";
 const SCRIBE_SAMPLE_RATE = 16000;
 const SCRIBE_AUDIO_FORMAT = "pcm_16000";
 
+/** The one client→server message type the Realtime STT API accepts. */
+export interface ScribeInputAudioChunk {
+  message_type: "input_audio_chunk";
+  audio_base_64: string;
+  commit: boolean;
+  sample_rate: number;
+}
+
+/**
+ * Build the wire frame for one audio chunk. Exported (and pure) so the
+ * verification harness can pin the exact shape — a wrong field name here is
+ * invisible at runtime and silently disables speech-to-text.
+ *
+ * An empty `audio_base_64` with `commit: true` is the documented commit
+ * signal (the field is required but the audio may be empty).
+ */
+export function scribeAudioChunk(
+  base64Audio: string,
+  commit = false,
+  sampleRate: number = SCRIBE_SAMPLE_RATE,
+): ScribeInputAudioChunk {
+  return {
+    message_type: "input_audio_chunk",
+    audio_base_64: base64Audio,
+    commit,
+    sample_rate: sampleRate,
+  };
+}
+
 /**
  * Mint a single-use WebSocket token using the user's API key (sent only
  * server-to-server, never embedded in the extension code).
@@ -35,6 +70,15 @@ export async function mintScribeToken(apiKey: string): Promise<string> {
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
+    // A 401 is the user's key, not a PRY bug, and the raw JSON body ("Invalid
+    // API key" plus a request id) does not say what to do about it. Say it.
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(
+        "ElevenLabs rejected the API key (401 unauthorized). Re-copy the key from " +
+          "elevenlabs.io → Profile → API keys into PRY's options and save — keys that " +
+          "were rotated, revoked, or pasted with a trailing space fail here.",
+      );
+    }
     throw new Error(`ElevenLabs token mint failed (${res.status}): ${detail.slice(0, 200)}`);
   }
   const body = (await res.json()) as { token?: string };
@@ -49,6 +93,9 @@ export function scribeWebSocketUrl(token: string): string {
   u.searchParams.set("model_id", SCRIBE_MODEL);
   u.searchParams.set("audio_format", SCRIBE_AUDIO_FORMAT);
   u.searchParams.set("sample_rate", String(SCRIBE_SAMPLE_RATE));
+  // Manual commit: the mic button's release is the end-of-utterance signal,
+  // so server-side VAD must not commit a segment out from under us.
+  u.searchParams.set("commit_strategy", "manual");
   return u.toString();
 }
 
@@ -77,12 +124,20 @@ export interface ScribeTranscriptCallbacks {
 export class ScribeConnection {
   private ws: WebSocket | null = null;
   private closed = false;
+  /** True once the server sent session_started — before that, audio is dropped. */
+  private sessionReady = false;
 
   constructor(private readonly callbacks: ScribeTranscriptCallbacks = {}) {}
+
+  /** True once the server confirmed the session and will accept audio. */
+  get isReady(): boolean {
+    return this.sessionReady && this.isOpen;
+  }
 
   connect(token: string): void {
     if (this.ws) this.close();
     this.closed = false;
+    this.sessionReady = false;
     const ws = new WebSocket(scribeWebSocketUrl(token));
     this.ws = ws;
     ws.onopen = () => this.callbacks.onOpen?.();
@@ -91,32 +146,79 @@ export class ScribeConnection {
     };
     ws.onerror = () => this.callbacks.onError?.("Scribe WebSocket error");
     ws.onmessage = (ev) => {
-      let payload: { type?: string; text?: string };
+      // The server discriminates events by `message_type`. Older SDK builds
+      // used `type`; accept both so a server-side rename cannot silently mute
+      // live transcription again.
+      let payload: { message_type?: string; type?: string; text?: string; error?: string; warning?: string };
       try {
         payload = JSON.parse(String(ev.data));
       } catch {
         return;
       }
-      if (payload.type === "partial_transcript" && typeof payload.text === "string") {
+      const kind = payload.message_type ?? payload.type ?? "";
+      if (kind === "session_started") {
+        this.sessionReady = true;
+        return;
+      }
+      if (kind === "partial_transcript" && typeof payload.text === "string") {
         this.callbacks.onPartial?.(payload.text);
-      } else if (payload.type === "committed_transcript" && typeof payload.text === "string") {
+      } else if (
+        (kind === "committed_transcript" || kind === "committed_transcript_with_timestamps") &&
+        typeof payload.text === "string"
+      ) {
         this.callbacks.onFinal?.(payload.text);
-      } else if (payload.type === "error" || payload.type === "auth_error") {
-        this.callbacks.onError?.(payload.text || payload.type);
+      } else if (kind === "warning" || kind === "error" || kind.endsWith("error") || kind === "quota_exceeded" || kind === "rate_limited" || kind === "commit_throttled") {
+        // Human-readable reason first — `error` carries the server's message.
+        this.callbacks.onError?.(payload.error || payload.warning || kind || "Scribe error");
       }
     };
   }
 
-  /** Send a base64-encoded PCM16 audio frame. */
+  /** True once the socket is open and audio/commits will actually send. */
+  get isOpen(): boolean {
+    return !!this.ws && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * Wait until the session can accept audio AND a commit.
+   *
+   * Waiting merely for WebSocket OPEN is not enough: a commit sent before
+   * session_started arrives is accepted by the socket but produces no
+   * transcript, which looks exactly like "the mic did nothing".
+   */
+  async waitForReady(timeoutMs = 3000): Promise<boolean> {
+    if (this.isReady) return true;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.closed) return false;
+      if (this.isReady) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return this.isReady;
+  }
+
+  /** Wait for the socket to open (quick taps release before onopen fires). */
+  async waitForOpen(timeoutMs = 2000): Promise<boolean> {
+    if (this.isOpen) return true;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.closed) return false;
+      if (this.isOpen) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return this.isOpen;
+  }
+
+  /** Send a base64-encoded PCM16 audio frame in the documented wire shape. */
   sendAudioBase64(b64: string): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ audioBase64: b64 }));
+    this.ws.send(JSON.stringify(scribeAudioChunk(b64, false)));
   }
 
   /** End-of-utterance commit so Scribe flushes the final transcript. */
   commit(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ commit: true }));
+    this.ws.send(JSON.stringify(scribeAudioChunk("", true)));
   }
 
   close(): void {

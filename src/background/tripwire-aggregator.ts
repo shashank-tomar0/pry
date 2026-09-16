@@ -53,10 +53,14 @@ export function createTripwireAggregator(): TripwireAggregator {
     const kinds = [...byType.entries()]
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
       .map(([kind, count]) => `${kind} ×${count}`);
+    // Name the channel explicitly. The wire log's "LEAK" count measures what
+    // reached the PLANNER; this counter measures PII-shaped payloads leaving
+    // the page for THIRD PARTIES. Saying "outbound leak" for both made the two
+    // panels look like they contradicted each other (0 there, 5 here).
     const headline =
       totalIntercepts === 1
-        ? "1 outbound PII leak flagged"
-        : `${totalIntercepts} outbound PII leaks flagged`;
+        ? "1 third-party PII leak intercepted"
+        : `${totalIntercepts} third-party PII leaks intercepted`;
     return kinds.length > 0 ? `${headline} · ${kinds.join(" · ")}` : headline;
   }
 

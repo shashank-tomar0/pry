@@ -98,6 +98,17 @@ export function bytesToBase64(bytes: Uint8Array): string {
 const TTS_MODEL_FLASH = "eleven_flash_v2_5";
 export const TTS_OUTPUT_FORMAT = "pcm_16000"; // 16 kHz mono PCM for streaming playback
 
+/**
+ * Default narration voice — a PREMADE voice, deliberately.
+ *
+ * The obvious choice (Rachel, `21m00Tcm4TlvDq8ikWAM`) is a LIBRARY voice, and
+ * ElevenLabs' free plan rejects library voices over the API with
+ * 402 `paid_plan_required` — so the hardcoded fallback made speak-aloud fail
+ * with a payment error on every free-tier install, for a reason that has
+ * nothing to do with the user's setup. Premade voices work on the free plan.
+ */
+export const DEFAULT_TTS_VOICE_ID = "SAz9YHcvj6GT2YYXdXww"; // River — relaxed, neutral
+
 export function ttsRequestBody(text: string): Record<string, unknown> {
   return {
     text,

@@ -40,7 +40,8 @@ import { piiKindFromOcrLabel } from "./reocr-verification";
 import type { DetectedPII } from "./pii-detector";
 import { observeWithVision, VISION_SUPPORTED, VISION_DEFAULT_MODELS } from "./vision";
 import { recordWire, tokensIn, scanForLeaks } from "./wire-log";
-import { requestMlNer, requestMlGuard, setActiveNerSpans, probeMlFiles } from "./ml-bridge";
+import { matchPiiInText } from "../shared/text-pii-patterns";
+import { requestMlNer, requestMlGuard, setActiveNerSpans, probeMlFiles, selfTestMl } from "./ml-bridge";
 import { fuseDetections, type NerSpanInput } from "./detector-v2";
 import {
   initLedger, recordSnapshot, recordDetections,
@@ -54,6 +55,20 @@ let counter = 0;
 const nextId = () => `e${++counter}`;
 
 // ─── Privacy-Aware Snapshot Rendering ───────────────────────────────────────
+
+/**
+ * Cheap 32-bit FNV-1a. Used only as a "did this page text change" signature,
+ * so the per-page Tier-0 models are not re-run on a page that did not move.
+ * Not cryptographic and never used as one.
+ */
+function fnv1a(text: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
 
 /**
  * Strips sensitive query parameters, auth tokens, and session fragments from
@@ -71,6 +86,35 @@ export function sanitizeUrl(rawUrl: string): string {
   } catch {
     return rawUrl.split(/[?#]/)[0] ?? rawUrl;
   }
+}
+
+/**
+ * Sanitizes free text that rides alongside the snapshot but outside its
+ * detectors: the page title (and any other raw string rendered into a prompt).
+ *
+ * This closes the title leak: Gmail's title is "Inbox (n) - you@gmail.com - Gmail",
+ * and the signed-in address (plus honorific names in document titles) reached
+ * the model raw — the wire-log leak scanner flagged it every run ("Email
+ * address (sh•••@gmail.com) reached the model") while the image channel was
+ * verified clean. Vault values map back to their existing token so the same
+ * value keeps ONE token across title, elements, and text; matches the vault
+ * has never seen are tokenized fresh.
+ */
+export function sanitizeTextPII(text: string): string {
+  if (!text || text.length < 6) return text;
+  // Pass 1: anything the vault already holds (the same email tokenized in the
+  // page body) becomes the SAME token here.
+  let out = tokenizer.redactValues(text);
+  // Pass 2: PII that lives only in this string. Matches arrive sorted by
+  // position — replace from the end so earlier indices stay valid.
+  const matches = matchPiiInText(out);
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const m = matches[i];
+    const kind = m.kind === "id_text" ? "id_number" : "credential";
+    const token = tokenizer.tokenize(m.value, kind);
+    out = out.slice(0, m.start) + token + out.slice(m.end);
+  }
+  return out;
 }
 
 /**
@@ -95,7 +139,7 @@ function renderSnapshot(snapshot: PageSnapshot): string {
 
   return [
     `URL: ${sanitizeUrl(snapshot.url)}`,
-    `Title: ${snapshot.title}`,
+    `Title: ${sanitizeTextPII(snapshot.title)}`,
     `Scroll: ${snapshot.scroll.y}/${snapshot.scroll.maxY}`,
     `Elements${snapshot.truncated ? "(truncated)" : ""}:`,
     ...lines,
@@ -199,11 +243,16 @@ function sanitizeSnapshot(
   // win duplicates; NER adds the recall the patterns never had.
   let mlMerged: Array<{ kind: string; method: string; confidence: number }> = [];
   if (ctx.mlDetections && ctx.mlDetections.length > 0) {
+    // Only spans literally present on THIS page count — see fuseDetections.
+    const haystack = [
+      snapshot.text,
+      ...snapshot.elements.map((el) => `${el.name}\n${el.value ?? ""}`),
+    ].join("\n");
     const fused = fuseDetections(allDetections, ctx.mlDetections.map((d) => ({
       text: d.value ?? "",
       label: d.label.startsWith("NER ") ? d.label.slice(4) : d.label,
       score: d.confidence,
-    })));
+    })), haystack);
     allDetections.length = 0;
     allDetections.push(...fused.detections);
     mlMerged = ctx.mlDetections.map((d) => ({
@@ -248,6 +297,11 @@ function sanitizeSnapshot(
   return {
     sanitized: {
       ...snapshot,
+      // The title bypasses the element/text detectors entirely (it is not part
+      // of `elements` or `text`), so it must be sanitized explicitly or the
+      // signed-in account's email in "Inbox (n) - you@gmail.com - Gmail" rides
+      // raw into every prompt that renders this snapshot.
+      title: sanitizeTextPII(snapshot.title),
       elements,
       text,
     },
@@ -282,6 +336,8 @@ export interface AgentDeps {
   } | null>;
   /** Record a privacy audit entry for the judges. */
   recordAudit?: (entry: {
+    /** True when this frame's redacted image was actually sent to a VLM. */
+    shipped?: boolean;
     original?: string;
     redacted?: string;
     detections: Array<{ kind: string; label: string; confidence: number; box?: { x: number; y: number; width: number; height: number } }>;
@@ -477,79 +533,147 @@ export async function runTask(
     guard: settings.ml?.guard !== false,
   };
 
-  // Honest ML status: announce ONCE per run which on-device capabilities are
-  // actually bundled. Never claiming a model that isn't there is the contract
-  // — and it turns the "models/ is empty" state from a silent mystery into a
-  // visible, actionable line in the transcript.
-  probeMlFiles().then((m) => {
+  // Honest ML status. The self-test LOADS each model and runs one real
+  // inference; file presence alone is not evidence (a model can be present and
+  // still fail to load, and the failure is swallowed by the degradation
+  // contract). The file probe is only a fallback for when the offscreen
+  // runtime cannot answer at all.
+  void selfTestMl().then((selfTest) => {
     const parts: string[] = [];
-    if (m.face) parts.push("faces: BlazeFace bundled");
-    if (mlFlags.ner) parts.push(m.ner ? "NER model bundled" : "NER model not bundled (regex + checksums active)");
-    if (mlFlags.guard) parts.push(m.guard ? "injection guard bundled" : "injection guard not bundled (regex heuristic active)");
-    if (parts.length === 0) return;
-    emit({
-      kind: "entry",
-      entry: {
-        id: nextId(),
-        role: "system",
-        text: `On-device ML: ${parts.join(" · ")}.`,
-      },
+    if (selfTest) {
+      if (selfTest.ner.ready) {
+        // Report what the DETECTOR kept, not what the model emitted. A model
+        // that loads but yields no policy-passing span is a silent no-op, and
+        // saying "loaded, found 4 entities" there is how that hid for so long.
+        const found = selfTest.ner.sample?.length
+          ? ` (${selfTest.ner.kept ?? selfTest.ner.sample.length} usable span(s): ${selfTest.ner.sample.join(", ")})`
+          : " (loaded, but the probe produced NO usable span — name tokenization is inactive)";
+        parts.push(`NER model loaded${found}`);
+      } else if (mlFlags.ner) {
+        parts.push(`NER model FAILED to load — regex + checksums active (${selfTest.ner.reason ?? "unknown"})`);
+      }
+      if (selfTest.guard.ready) {
+        parts.push(`injection guard loaded (probe verdict: ${selfTest.guard.label ?? "n/a"})`);
+      } else if (mlFlags.guard) {
+        parts.push(`injection guard not bundled — regex heuristic active`);
+      }
+      parts.push(selfTest.face.ready ? "BlazeFace loaded" : "BlazeFace unavailable — skin-colour fallback active");
+      emit({
+        kind: "entry",
+        entry: {
+          id: nextId(),
+          role: "system",
+          text: `On-device ML self-test: ${parts.join(" · ")}.`,
+        },
+      });
+      return;
+    }
+    // Offscreen runtime did not answer — fall back to what is on disk, and say
+    // that this is a weaker claim.
+    return probeMlFiles().then((m) => {
+      if (m.face) parts.push("faces: BlazeFace bundled");
+      if (mlFlags.ner) parts.push(m.ner ? "NER model present on disk (unverified)" : "NER model not bundled (regex + checksums active)");
+      if (mlFlags.guard) parts.push(m.guard ? "injection guard present on disk (unverified)" : "injection guard not bundled (regex heuristic active)");
+      if (parts.length === 0) return;
+      emit({
+        kind: "entry",
+        entry: {
+          id: nextId(),
+          role: "system",
+          text: `On-device ML: ${parts.join(" · ")}.`,
+        },
+      });
     });
   });
+  // ── Tier-0 (on-device) refresh ────────────────────────────────────────────
+  // The NER and injection models are per-PAGE, not per-run. They used to be
+  // scored exactly once, against the snapshot the run started from — so every
+  // later page was un-scored: a name in prose on page 3 was neither tokenized
+  // for the planner nor black-boxed in the screenshot, and the wire log
+  // honestly reported the resulting leak while the rest of the pipeline
+  // believed it had covered it. The stale span list also kept the FIRST page's
+  // names fused into the sanitizer context for the whole run.
+  //
+  // Re-scoring is gated on a cheap signature of the page text, so a page that
+  // did not change (most turns) costs nothing.
+  let lastTier0Signature = "";
+  let lastNerNotice = "";
+  const refreshTier0 = async (text: string): Promise<void> => {
+    if (!mlFlags.ner && !mlFlags.guard) return;
+    const signature = `${text.length}:${fnv1a(text)}`;
+    if (signature === lastTier0Signature) return;
+    lastTier0Signature = signature;
+
+    // Tier-0 NER (Detection v2): fetch spans for THIS page's text before
+    // sanitizing so the fusion layer sees them, and hand the span texts to the
+    // screenshot path so the same names become black-box regions (the
+    // NER-to-pixel bridge). Degrades to [] when the model is missing or slow;
+    // the run never stalls on it.
+    if (mlFlags.ner) {
+      try {
+        const spans: NerSpanInput[] = await requestMlNer(text, mlFlags, signal);
+        setActiveNerSpans(spans.map((sp) => sp.text));
+        // REPLACE, never merge — page 3's spans must not inherit page 1's.
+        sanitizeCtx.mlDetections = spans.length > 0
+          ? spans.map((s) => ({
+              kind: "pii_text" as const,
+              value: s.text,
+              confidence: Math.min(0.95, Math.max(0.5, s.score)),
+              label: `NER ${s.label}`,
+            }))
+          : undefined;
+        const notice = spans.map((s) => s.text).sort().join("|");
+        if (spans.length > 0 && notice !== lastNerNotice) {
+          lastNerNotice = notice;
+          emit({
+            kind: "entry",
+            entry: {
+              id: nextId(),
+              role: "system",
+              text: `On-device NER: ${spans.length} name/location span(s) detected by the local model.`,
+            },
+          });
+        }
+      } catch {
+        setActiveNerSpans([]);
+        sanitizeCtx.mlDetections = undefined;
+        // NER is additive — never block the run.
+      }
+    }
+
+    // Tier-0 injection guard: the model's semantic verdict on this page's
+    // text, announced alongside the regex detector's opinion.
+    if (mlFlags.guard) {
+      try {
+        const verdict = await requestMlGuard(text, mlFlags, signal);
+        if (verdict?.injection) {
+          emit({
+            kind: "entry",
+            entry: {
+              id: nextId(),
+              role: "system",
+              text: `Injection guard: page text scored ${verdict.score.toFixed(2)} (${verdict.label}) by the local classifier. Treated as data, not instructions.`,
+            },
+          });
+        }
+      } catch {
+        // Same contract — additive, never blocking.
+      }
+    }
+  };
+
   // Latest DOM (text) detections for the audit view — the screenshots only
   // carry visual detections, so without this the proof panel hides the emails,
   // phones and ID numbers the DOM sanitizer actually tokenized.
   let lastDomDetections: Array<{ kind: string; confidence: number }> = [];
   if (snapshot) {
     // Record snapshot in privacy ledger.
-    recordSnapshot(snapshot.url, snapshot.title, snapshot.elements.length).catch(() => {});
+    // The ledger persists across sessions, so it follows the same rule as the
+    // model context: titles and URLs are sanitized before they are written.
+    recordSnapshot(sanitizeUrl(snapshot.url), sanitizeTextPII(snapshot.title), snapshot.elements.length).catch(() => {});
 
-    // Tier-0 NER (Detection v2): fetch spans for the page text before
-    // sanitizing so the fusion layer sees them. Degrades to [] when the
-    // model is missing or slow; the run never stalls on it.
-    try {
-      const spans: NerSpanInput[] = await requestMlNer(snapshot.text, mlFlags, signal);
-      // Hand the span texts to the screenshot path: they become black-box
-      // regions in the next captured frame (the NER-to-pixel bridge).
-      setActiveNerSpans(spans.map((sp) => sp.text));
-      if (spans.length > 0) {
-        sanitizeCtx.mlDetections = spans.map((s) => ({
-          kind: "pii_text" as const,
-          value: s.text,
-          confidence: Math.min(0.95, Math.max(0.5, s.score)),
-          label: `NER ${s.label}`,
-        }));
-        emit({
-          kind: "entry",
-          entry: {
-            id: nextId(),
-            role: "system",
-            text: `On-device NER: ${spans.length} name/location span(s) detected by the local model.`,
-          },
-        });
-      }
-    } catch {
-      setActiveNerSpans([]);
-      // NER is additive — never block the run.
-    }
-
-    // Tier-0 injection guard: the model's semantic verdict on this page's
-    // text, announced alongside the regex detector's opinion.
-    try {
-      const verdict = await requestMlGuard(snapshot.text, mlFlags, signal);
-      if (verdict?.injection) {
-        emit({
-          kind: "entry",
-          entry: {
-            id: nextId(),
-            role: "system",
-            text: `Injection guard: page text scored ${verdict.score.toFixed(2)} (${verdict.label}) by the local classifier. Treated as data, not instructions.`,
-          },
-        });
-      }
-    } catch {
-      // Same contract — additive, never blocking.
-    }
+    // Tier-0 models score THIS page (see refreshTier0).
+    await refreshTier0(snapshot.text);
 
     const { sanitized, piiCount, detections, suppressed, rejected } = sanitizeSnapshot(snapshot, sanitizeCtx);
     snapshot = sanitized;
@@ -651,6 +775,18 @@ export async function runTask(
           });
         }
         piiTotal += processed.redactedCount;
+
+        // Optional VLM vision: only the redacted screenshot leaves. Its
+        // description rides in the first planner turn so the agent genuinely
+        // sees the screen before planning a single action. This runs BEFORE
+        // the audit record so the panel can say whether the frame really
+        // shipped instead of assuming it did.
+        let shippedToModel = false;
+        if (visionEnabled && visionApiKey && !signal.aborted) {
+          initialVisionNote = await observeScreen(processed.redactedDataUrl, "");
+          shippedToModel = initialVisionNote.length > 0;
+        }
+
         // Record for privacy audit — DOM textual detections AND visual ones,
         // so the panel shows every PII item this snapshot handled.
         recordAudit?.({
@@ -659,15 +795,9 @@ export async function runTask(
           detections: [...visualDetections, ...auditFromDetections(lastDomDetections)],
           tokens: tokenizer.getTokenSummary(),
           redactedCount: processed.redactedCount,
+          shipped: shippedToModel,
           verification,
         });
-
-        // Optional VLM vision: only the redacted screenshot leaves. Its
-        // description rides in the first planner turn so the agent genuinely
-        // sees the screen before planning a single action.
-        if (visionEnabled && visionApiKey && !signal.aborted) {
-          initialVisionNote = await observeScreen(processed.redactedDataUrl, "");
-        }
       }
     } catch {
       // Screenshot capture is optional — DOM perception still works.
@@ -729,6 +859,10 @@ export async function runTask(
     if (relevant.length === 0) return "";
     return (
       `--- How similar tasks succeeded here before ---\n` +
+      `These are ROUTES from older, different tasks. Copy the route, never the values: ` +
+      `every name, search term, and parameter below belonged to that older task, not to yours. ` +
+      `If your task omits something (a search term, a recipient), proceed WITHOUT it — ` +
+      `never borrow a value from these examples.\n\n` +
       relevant.map((t) => `Task: ${t.task}\nSteps: ${t.steps}`).join("\n\n") +
       `\n--- End past successes ---`
     );
@@ -754,7 +888,7 @@ export async function runTask(
         (historyBlock ? `${historyBlock}\n\n` : "") +
         (lessonsBlock ? `${lessonsBlock}\n\n` : "") +
         (trajectoriesBlock ? `${trajectoriesBlock}\n\n` : "") +
-        taskPrompt(tokenizedTask, sanitizeUrl(tab.url ?? ""), tab.title ?? "") +
+        taskPrompt(tokenizedTask, sanitizeUrl(tab.url ?? ""), sanitizeTextPII(tab.title ?? "")) +
         (snapshot ? `\n\n--- Current page ---\n${renderSnapshot(snapshot)}` : "") +
         (initialVisionNote ? `\n\n${initialVisionNote}` : ""),
     },
@@ -769,7 +903,21 @@ export async function runTask(
   const LOOP_WINDOW = 5;
 
   function recordAction(name: string, input: Record<string, unknown>): void {
-    recentActions.push({ name, input: JSON.stringify(input) });
+    // Sign click/type actions by the target's role+name, not the raw id:
+    // element ids are re-issued on every snapshot, so the same on-page target
+    // arrives as a different id each turn — click #9 and click #11 on
+    // "Google apps" looked like two distinct actions and the loop detector
+    // went blind exactly on re-snapshot loops (click → find_text → click →
+    // find_text ran forever without tripping the threshold). The semantic
+    // signature is stable across snapshots, so both the consecutive and the
+    // oscillation checks see the repetition.
+    let signature = JSON.stringify(input);
+    const elId = (input as { element_id?: unknown }).element_id;
+    if (typeof elId === "number" && snapshot) {
+      const el = snapshot.elements.find((e) => e.id === elId);
+      if (el) signature = JSON.stringify({ target: `${el.role}:${el.name}` });
+    }
+    recentActions.push({ name, input: signature });
     if (recentActions.length > LOOP_WINDOW) recentActions.shift();
   }
 
@@ -995,19 +1143,92 @@ export async function runTask(
     // remainder is always flushed before the turn ends, so nothing is lost.
     const FLUSH_INTERVAL_MS = 60;
     const FLUSH_CHUNK_CHARS = 200;
+    // Live narration budget: ~2-3 lines. Reasoning models (esp. Llama/NIM)
+    // dump chain-of-thought into delta.content, so uncapped streaming floods
+    // the panel and slows rendering (a patch per chunk re-formats markdown).
+    // The planner's full text is preserved in `turn.text`; only the DISPLAY
+    // is capped. Final answers (no tool calls) get the remainder afterwards.
+    const MAX_NARRATION_CHARS = 240;
+    // The exact redacted text already shown. Tracking the string (not a
+    // length) is what makes the final-answer remainder safe to compute: the
+    // redacted form can differ in length from the raw form (a long email
+    // collapses to <CRED_1>), so slicing the redacted string by a RAW length
+    // duplicated or dropped characters at the seam.
+    let emittedText = "";
     let pendingText = "";
     let flushTimer: ReturnType<typeof setInterval> | null = null;
 
+    // ─── Reasoning stream (shown, in its own dimmed collapsible block) ───
+    // Displaying the model's chain-of-thought is safe here: the model only
+    // ever RECEIVED tokenized data, so its reasoning can only quote tokens —
+    // and every flushed chunk still runs through the vault sweep like any
+    // other displayed string. It is capped so a runaway monologue cannot
+    // flood the transcript (the cap is announced, never silent), it is never
+    // fed to the learning systems, and it collapses when the turn settles.
+    const MAX_THOUGHT_CHARS = 6000;
+    let thoughtEntryId: string | null = null;
+    let thoughtEmitted = 0;
+    let thoughtTruncated = false;
+    let thoughtPending = "";
+    let thoughtChars = 0;
+
+    const flushThought = (): void => {
+      if (thoughtPending.length === 0) return;
+      const safe = tokenizer.redactValues(thoughtPending);
+      thoughtPending = "";
+      if (thoughtTruncated || safe.length === 0) return;
+      const remaining = MAX_THOUGHT_CHARS - thoughtEmitted;
+      const chunk = safe.slice(0, remaining);
+      thoughtEmitted += chunk.length;
+      if (!thoughtEntryId) {
+        thoughtEntryId = nextId();
+        emit({ kind: "entry", entry: { id: thoughtEntryId, role: "thought", text: chunk, pending: true } });
+      } else {
+        emit({ kind: "patch", id: thoughtEntryId, text: chunk });
+      }
+      if (thoughtEmitted >= MAX_THOUGHT_CHARS) {
+        thoughtTruncated = true;
+        emit({
+          kind: "patch",
+          id: thoughtEntryId,
+          text: "\n\n… reasoning truncated for display — the full stream still drove the run.",
+        });
+      }
+    };
+
     const flushPending = (): void => {
+      flushThought();
       if (pendingText.length === 0) return;
-      const safe = tokenizer.redactValues(pendingText);
+      const remaining = MAX_NARRATION_CHARS - emittedText.length;
+      if (remaining <= 0) {
+        pendingText = "";
+        return;
+      }
+      const safe = tokenizer.redactValues(pendingText).slice(0, remaining);
       pendingText = "";
+      // Whitespace-only narration (several small models emit a bare space or
+      // newline before a tool call) must not open an empty assistant card —
+      // the panel rendered those as blank "PRY AGENT" bubbles with a Copy
+      // button and no content. Skip them; the next real flush opens the card.
+      if (!safe.trim()) return;
+      emittedText += safe;
       if (!opened) {
         opened = true;
         emit({ kind: "entry", entry: { id: entryId, role: "assistant", text: safe } });
       } else {
         emit({ kind: "patch", id: entryId, text: safe });
       }
+    };
+
+    const ensureFlushTimer = (): void => {
+      if (flushTimer !== null) return;
+      flushTimer = setInterval(() => {
+        flushPending();
+        if (pendingText.length === 0 && thoughtPending.length === 0 && flushTimer !== null) {
+          clearInterval(flushTimer);
+          flushTimer = null;
+        }
+      }, FLUSH_INTERVAL_MS);
     };
 
     const onText = (delta: string): void => {
@@ -1018,15 +1239,7 @@ export async function runTask(
         flushPending();
         return;
       }
-      if (flushTimer === null) {
-        flushTimer = setInterval(() => {
-          flushPending();
-          if (pendingText.length === 0 && flushTimer !== null) {
-            clearInterval(flushTimer);
-            flushTimer = null;
-          }
-        }, FLUSH_INTERVAL_MS);
-      }
+      ensureFlushTimer();
     };
 
     // Honest egress meter: remote planners (everything except local Ollama)
@@ -1071,23 +1284,116 @@ export async function runTask(
       // The wire log must never break the run it is auditing.
     }
 
-    // One turn = one bounded planner call. Stalls (slow first token, dropped
-    // stream, hung connection, rate limit) abort after TURN_TIMEOUT_MS and are
-    // retried ONCE automatically — transient provider hiccups must not kill a
-    // demo run. The turn-local abort cancels the request; the user's Stop wins.
-    const plannerTimeoutMessage = `The planner (${planner.label}) did not respond within ${Math.round(TURN_TIMEOUT_MS / 1000)}s. The provider may be overloaded or the network stalled.`;
-    const runPlannerTurn = async (turnAbort: AbortController) =>
-      withTurnTimeout(
+    // One turn = one bounded planner call, bounded by SILENCE rather than wall
+    // clock (see the budget constants). The turn-local abort cancels the
+    // request; the user's Stop always wins.
+    const isColdTurn = step === 0;
+    const firstOutputBudgetMs = isColdTurn ? FIRST_OUTPUT_TIMEOUT_COLD_MS : FIRST_OUTPUT_TIMEOUT_MS;
+
+    // Honest, reason-specific failure text (see turnCutShortMessage).
+    const turnCutShortMessage = (
+      reason: "silent" | "ceiling",
+      liveness: TurnLiveness,
+      waitedMs: number,
+    ): string => turnCutShortMessageFor(planner.label, reason, liveness, waitedMs, firstOutputBudgetMs);
+
+    // ─── Planner-wait ticker ───
+    // A cold free-tier planner can legitimately take ~55-90s on its first turn
+    // while it streams chain-of-thought, and even warm turns can take tens of
+    // seconds. Silence for that long is indistinguishable from a frozen run,
+    // so after a short grace window a live status line appears and ticks every
+    // second. Once reasoning tokens actually arrive the live reasoning block
+    // takes over as the liveness indicator and this line hands off to it. A
+    // turn that starts producing output within the grace window never emits
+    // the line at all.
+    const waitStart = performance.now();
+    let waitEntryId: string | null = null;
+    let waitSettled = false;
+    const waitTimer = setInterval(() => {
+      if (waitSettled) return;
+      const seconds = Math.round((performance.now() - waitStart) / 1000);
+      if (opened) {
+        // Narration is rendering — the panel is visibly alive. Finalize the
+        // line (if it ever appeared) and stop ticking.
+        if (waitEntryId) {
+          waitSettled = true;
+          emit({ kind: "patch", id: waitEntryId, text: `Planner started responding after ${seconds}s.` });
+        }
+        clearInterval(waitTimer);
+        return;
+      }
+      if (seconds * 1000 < 5_000) return;
+      const thought = thoughtChars > 0
+        ? ` · model is reasoning (${thoughtChars.toLocaleString()} chars so far)`
+        : " · no tokens yet";
+      const text = `Waiting on the planner — ${seconds}s${thought}`;
+      if (!waitEntryId) {
+        waitEntryId = nextId();
+        emit({ kind: "entry", entry: { id: waitEntryId, role: "system", text } });
+      } else {
+        emit({ kind: "patch", id: waitEntryId, text });
+      }
+    }, 1000);
+    const settleWait = (outcome: "responded" | "failed" | "cancelled"): void => {
+      waitSettled = true;
+      clearInterval(waitTimer);
+      // Final flush, then collapse the reasoning block — the turn is over and
+      // the transcript should hand attention back to actions and answers.
+      flushPending();
+      if (thoughtEntryId !== null) {
+        emit({ kind: "patch", id: thoughtEntryId, text: "", pending: false });
+      }
+      if (!waitEntryId || outcome === "cancelled") return;
+      const seconds = Math.max(1, Math.round((performance.now() - waitStart) / 1000));
+      emit({
+        kind: "patch",
+        id: waitEntryId,
+        text: outcome === "responded"
+          ? `Planner responded in ${seconds}s.`
+          : `Planner gave no usable response in ${seconds}s.`,
+      });
+    };
+
+    const runPlannerTurn = async (turnAbort: AbortController, liveness: TurnLiveness) =>
+      withTurnBudget(
         planner.run({
           system: systemPrompt,
           messages,
           tools: TOOLS,
           signal: mergeAbort(signal, turnAbort.signal),
-          onText,
+          onText: (delta) => {
+            // Any streamed output proves the turn is alive and resets the
+            // silence window — a slow reasoner must not be killed for being
+            // thorough, only for being dead.
+            liveness.lastEventAt = performance.now();
+            liveness.events++;
+            onText(delta);
+          },
+          onThought: (delta) => {
+            liveness.lastEventAt = performance.now();
+            liveness.events++;
+            thoughtChars += delta.length;
+            // The first reasoning token ends the wait ticker's job: the live
+            // stream below is now the liveness indicator.
+            if (waitEntryId !== null && !waitSettled) {
+              waitSettled = true;
+              clearInterval(waitTimer);
+              emit({ kind: "patch", id: waitEntryId, text: "Planner is reasoning — streamed live below." });
+            }
+            if (!thoughtTruncated) {
+              thoughtPending += delta;
+              ensureFlushTimer();
+            }
+          },
         }),
-        TURN_TIMEOUT_MS,
-        plannerTimeoutMessage,
-        () => turnAbort.abort(),
+        liveness,
+        {
+          firstOutputMs: firstOutputBudgetMs,
+          idleMs: STREAM_IDLE_TIMEOUT_MS,
+          maxMs: MAX_TURN_MS,
+          onTimeout: () => turnAbort.abort(),
+          messageFor: turnCutShortMessage,
+        },
       );
 
     // ─── AGENT EGRESS GUARD ───
@@ -1107,12 +1413,21 @@ export async function runTask(
     }
 
     let turn;
+    let firstTurnLiveness: TurnLiveness = newTurnLiveness();
     try {
-      turn = await runPlannerTurn(new AbortController());
+      turn = await runPlannerTurn(new AbortController(), firstTurnLiveness);
+      settleWait("responded");
     } catch (firstError) {
-      if (signal.aborted) { finishTask(); return; }
+      if (signal.aborted) { settleWait("cancelled"); finishTask(); return; }
       const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
-      if (!isRetryablePlannerError(firstMessage)) {
+      // A ceiling cut is not a transient hiccup: the turn WAS streaming and we
+      // stopped it for taking too long, so a retry re-sends the same prompt to
+      // the same slow model and gets cut the same way. Retrying it is what
+      // turned "this model reasons slowly" into an endless "retrying once…"
+      // loop with the run never reaching a terminal state.
+      const cutWhileStreaming = firstTurnLiveness.ended === "ceiling";
+      if (!isRetryablePlannerError(firstMessage) || cutWhileStreaming) {
+        settleWait("failed");
         errorCount++;
         emit({
           kind: "entry",
@@ -1121,7 +1436,10 @@ export async function runTask(
         finishTask();
         return;
       }
-      // Transient stall — one automatic retry before giving up.
+      // Transient stall (never produced a token, or the stream went quiet) —
+      // one automatic retry before giving up. The wait ticker deliberately
+      // keeps ticking across the retry: from the user's point of view this is
+      // still one continuous planner wait.
       emit({
         kind: "entry",
         entry: {
@@ -1131,9 +1449,11 @@ export async function runTask(
         },
       });
       try {
-        turn = await runPlannerTurn(new AbortController());
+        turn = await runPlannerTurn(new AbortController(), newTurnLiveness());
+        settleWait("responded");
       } catch (secondError) {
-        if (signal.aborted) { finishTask(); return; }
+        if (signal.aborted) { settleWait("cancelled"); finishTask(); return; }
+        settleWait("failed");
         errorCount++;
         emit({
           kind: "entry",
@@ -1159,6 +1479,29 @@ export async function runTask(
 
     messages.push({ role: "assistant", text: turn.text, toolCalls: turn.toolCalls });
 
+    // Narration was display-capped above. Tool-call turns stay short (the
+    // step card already says what happened); final answers deliver the rest
+    // so nothing the user asked for is ever cut off. Only append when what was
+    // shown is a true prefix of the full redacted answer — otherwise the seam
+    // would duplicate text. When narration never opened the card (all
+    // whitespace flushes), a patch would target a node the panel does not
+    // have and the answer would be silently dropped — open the card instead.
+    if (turn.stopReason !== "refusal" && turn.toolCalls.length === 0) {
+      const full = tokenizer.redactValues(turn.text);
+      if (full.trim()) {
+        if (!opened) {
+          opened = true;
+          emittedText = full.slice(0, MAX_NARRATION_CHARS);
+          emit({ kind: "entry", entry: { id: entryId, role: "assistant", text: emittedText } });
+          const remainder = full.slice(emittedText.length);
+          if (remainder) emit({ kind: "patch", id: entryId, text: remainder });
+        } else if (full.length > emittedText.length && full.slice(0, emittedText.length) === emittedText) {
+          const remainder = full.slice(emittedText.length);
+          if (remainder) emit({ kind: "patch", id: entryId, text: remainder });
+        }
+      }
+    }
+
     if (turn.stopReason === "refusal") {
       errorCount++;
       emit({
@@ -1183,7 +1526,9 @@ export async function runTask(
     const results: ToolOutcome[] = [];
 
     for (const call of turn.toolCalls) {
-      if (signal.aborted) return;
+      // Stop must unwind through finishTask (vault clear, running=false,
+      // experience emit) — a bare return freezes the panel on RUNNING forever.
+      if (signal.aborted) { finishTask(); return; }
 
       const stepId = nextId();
 
@@ -1414,6 +1759,11 @@ ${freshRendered}`,
           const navigated = snapshot && fresh.url !== snapshot.url;
           snapshot = fresh;
 
+          // Tier-0 models are per-page: re-score THIS page before it is
+          // sanitized, or a name on the new page is neither tokenized for the
+          // planner nor black-boxed in the screenshot that follows.
+          await refreshTier0(fresh.text);
+
           // Apply privacy pipeline to fresh snapshot (checksum validation +
           // learned false-positive suppression included).
           const { sanitized, piiCount, detections: freshDetections, suppressed: freshSuppressed, rejected: freshRejected } = sanitizeSnapshot(snapshot, sanitizeCtx);
@@ -1493,6 +1843,18 @@ ${freshRendered}`,
                   });
                 }
                 piiTotal += processed.redactedCount;
+
+                // Optional VLM vision: describe the redacted screen for the
+                // planner. Request bytes count toward the honest egress badge.
+                // Run before the audit record so the panel's caption reflects
+                // whether pixels actually left the browser.
+                let shippedToModel = false;
+                if (visionEnabled && visionApiKey && !signal.aborted) {
+                  const described = await observeScreen(processed.redactedDataUrl, observation);
+                  shippedToModel = described.length > 0;
+                  observation = described;
+                }
+
                 // Record for privacy audit — fresh DOM detections + visuals.
                 recordAudit?.({
                   original: screenshotResult.original,
@@ -1500,14 +1862,9 @@ ${freshRendered}`,
                   detections: [...visualDetections, ...auditFromDetections(freshDetections)],
                   tokens: tokenizer.getTokenSummary(),
                   redactedCount: processed.redactedCount,
+                  shipped: shippedToModel,
                   verification,
                 });
-
-                // Optional VLM vision: describe the redacted screen for the
-                // planner. Request bytes count toward the honest egress badge.
-                if (visionEnabled && visionApiKey && !signal.aborted) {
-                  observation = await observeScreen(processed.redactedDataUrl, observation);
-                }
               }
             } catch {
               // Screenshot is optional.
@@ -1571,42 +1928,164 @@ function warnIfInjected(snapshot: PageSnapshot, emit: (e: AgentEvent) => void): 
   });
 }
 
-/** Max wall-clock time per planner turn before it is aborted as stalled. */
-const TURN_TIMEOUT_MS = 35_000;
+/**
+ * How long a turn may produce NOTHING before we call it dead.
+ *
+ * Covers a free-tier cold start (measured 55 s for the opening request against
+ * NVIDIA's endpoint, versus 3-7 s warm) and providers that buffer a
+ * non-streaming completion instead of streaming it.
+ */
+const FIRST_OUTPUT_TIMEOUT_COLD_MS = 90_000;
+const FIRST_OUTPUT_TIMEOUT_MS = 60_000;
+
+/**
+ * How long a turn that HAS started streaming may go quiet before we call it
+ * dropped. Reasoning models emit deltas continuously, so 30 s of total silence
+ * is a dead connection, however long the turn has legitimately been running.
+ */
+const STREAM_IDLE_TIMEOUT_MS = 30_000;
+
+/**
+ * Absolute ceiling on one planner turn.
+ *
+ * A turn is bounded by silence, not by wall clock — a reasoning model (measured:
+ * 63 s, then 88 s on a Gmail inbox prompt) must be allowed to finish while it
+ * is visibly making progress. This ceiling exists only so a pathological stream
+ * cannot run forever, and it stays under Manifest V3's 5-minute limit on a
+ * single service-worker request.
+ *
+ * History: a flat 45 s wall clock for every warm turn cut those turns
+ * mid-reasoning, retried the whole prompt, cut the retry the same way, and left
+ * the panel on "retrying once…" until the run died — the reported freeze.
+ */
+const MAX_TURN_MS = 210_000;
 
 /**
  * Stall/transient failure classifiers — these warrant one automatic retry.
  * Everything else (bad model, rejected key, malformed request) is not retried.
  */
-function isRetryablePlannerError(message: string): boolean {
+export function isRetryablePlannerError(message: string): boolean {
   return /did not respond within|rate.?limit|timed? ?out|network|fetch failed|econn|overloaded|temporarily|503|429|502|504|timeout/i.test(
     message,
   );
 }
 
 /**
- * Resolve a promise unless it takes longer than `ms`, in which case call
- * `onTimeout` (to cancel the underlying request) and reject with `message`.
- * The original promise's later settle is absorbed so nothing is unhandled.
+ * Live evidence that a planner turn is making progress.
+ *
+ * Every streamed delta (narration or reasoning) records itself here. The budget
+ * uses it to tell the two very different failures apart — a provider that never
+ * answers, and a model that is answering slowly — which the old flat wall clock
+ * could not, and which is why a healthy 88 s turn was killed at 45 s.
  */
-function withTurnTimeout<T>(
+interface TurnLiveness {
+  /** Timestamp of the last streamed delta. */
+  lastEventAt: number;
+  /** Number of deltas this turn has produced. */
+  events: number;
+  /** How the turn ended; the retry policy reads this. */
+  ended: "settled" | "silent" | "ceiling";
+}
+
+export function newTurnLiveness(): TurnLiveness {
+  return { lastEventAt: performance.now(), events: 0, ended: "settled" };
+}
+
+/**
+ * Failure text for a turn we cut short, chosen so the retry policy reads it
+ * correctly. Exported (and pure) so the harness can pin the classification:
+ *
+ *   - `silent` keeps the "did not respond" / "network stalled" wording that
+ *     `isRetryablePlannerError` treats as a transient hiccup worth one retry;
+ *   - `ceiling` deliberately contains NO such keyword, because a turn stopped
+ *     while it was still streaming is not a hiccup — the retry would re-send the
+ *     same prompt to the same slow model and be stopped identically, which is
+ *     exactly how a slow reasoning model produced an endless "retrying once…"
+ *     loop instead of an actionable error.
+ */
+export function turnCutShortMessageFor(
+  plannerLabel: string,
+  reason: "silent" | "ceiling",
+  liveness: TurnLiveness,
+  waitedMs: number,
+  firstOutputBudgetMs: number,
+): string {
+  const waited = Math.round(waitedMs / 1000);
+  if (reason === "ceiling") {
+    return (
+      `The planner (${plannerLabel}) was still streaming after ${waited}s and was stopped. ` +
+      `This model reasons slowly for a prompt this size — switch to a faster provider ` +
+      `(Groq openai/gpt-oss-20b) in the options, or break the task into smaller steps.`
+    );
+  }
+  if (liveness.events > 0) {
+    const silent = Math.round(Math.max(0, performance.now() - liveness.lastEventAt) / 1000);
+    return (
+      `The planner (${plannerLabel}) stopped streaming after ${liveness.events} update(s) and ` +
+      `went silent for ${silent}s — the network stalled or the connection dropped.`
+    );
+  }
+  return (
+    `The planner (${plannerLabel}) did not respond within ${Math.round(firstOutputBudgetMs / 1000)}s. ` +
+    `The provider may be overloaded or the network stalled.`
+  );
+}
+
+/**
+ * Resolve a promise unless the turn goes dead first, in which case call
+ * `onTimeout` (to cancel the underlying request) and reject.
+ *
+ * Two phases, because a cold provider and a slow reasoner look different:
+ *   - before any output: `firstOutputMs` covers a cold start or a buffered
+ *     completion;
+ *   - after output started: only silence is a failure, `idleMs` of it.
+ * `maxMs` bounds the whole turn. The original promise's later settle is
+ * absorbed so nothing is unhandled.
+ */
+export function withTurnBudget<T>(
   promise: Promise<T>,
-  ms: number,
-  message: string,
-  onTimeout: () => void,
+  liveness: TurnLiveness,
+  opts: {
+    firstOutputMs: number;
+    idleMs: number;
+    maxMs: number;
+    onTimeout: () => void;
+    messageFor: (reason: "silent" | "ceiling", liveness: TurnLiveness, waitedMs: number) => string;
+  },
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      onTimeout();
-      reject(new Error(message));
-    }, ms);
+    const startedAt = performance.now();
+    let done = false;
+    const finish = (reason: "silent" | "ceiling", waitedMs: number): void => {
+      done = true;
+      clearInterval(ticker);
+      liveness.ended = reason;
+      opts.onTimeout();
+      reject(new Error(opts.messageFor(reason, liveness, waitedMs)));
+    };
+    const ticker = setInterval(() => {
+      const waited = performance.now() - startedAt;
+      if (liveness.events === 0) {
+        if (waited > opts.firstOutputMs) finish("silent", waited);
+        return;
+      }
+      if (performance.now() - liveness.lastEventAt > opts.idleMs) {
+        finish("silent", waited);
+        return;
+      }
+      if (waited > opts.maxMs) finish("ceiling", waited);
+    }, 500);
     promise.then(
       (value) => {
-        clearTimeout(timer);
+        if (done) return;
+        done = true;
+        clearInterval(ticker);
         resolve(value);
       },
       (error) => {
-        clearTimeout(timer);
+        if (done) return;
+        done = true;
+        clearInterval(ticker);
         reject(error);
       },
     );

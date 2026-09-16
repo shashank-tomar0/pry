@@ -54,6 +54,11 @@ chrome.runtime.onMessage.addListener(
           detail: "sensitive-regions",
           sensitiveRegions: getSensitiveRegions(),
           dpr: window.devicePixelRatio || 1,
+          // Where the viewport sat when the regions were measured. The
+          // full-page stitcher needs this to map viewport-space region
+          // coordinates onto the stitched page-space image.
+          scrollY: Math.round(window.scrollY),
+          viewportWidth: window.innerWidth,
         });
         return false;
 
@@ -65,6 +70,8 @@ chrome.runtime.onMessage.addListener(
           detail: "located-spans",
           sensitiveRegions: locateSpans((request as { spans?: string[] }).spans ?? []),
           dpr: window.devicePixelRatio || 1,
+          scrollY: Math.round(window.scrollY),
+          viewportWidth: window.innerWidth,
         });
         return false;
 

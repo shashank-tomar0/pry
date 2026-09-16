@@ -46,6 +46,8 @@ interface InspectData {
   tab: { id: number; title?: string; url?: string };
   original: string;
   redacted: string;
+  /** True when the redacted frame can actually be sent to a vision model. */
+  visionEnabled?: boolean;
   width: number;
   height: number;
   tiles: number;
@@ -64,6 +66,13 @@ interface InspectData {
   };
   vault: VaultEntry[];
   snapshot?: {
+    url: string;
+    title: string;
+    elements: Array<{ id: number; role: string; name: string; value?: string }>;
+    text: string;
+  };
+  /** Raw pre-tokenization perception — the Before view's source. */
+  snapshotBefore?: {
     url: string;
     title: string;
     elements: Array<{ id: number; role: string; name: string; value?: string }>;
@@ -92,11 +101,12 @@ function maskValue(val: string): string {
 }
 
 async function loadTabs(): Promise<void> {
+  const previous = tabPicker.value;
   const tabs = await chrome.tabs.query({});
   tabPicker.innerHTML = "";
   for (const tab of tabs) {
     if (!tab.id || !tab.url) continue;
-    if (/^(chrome|edge|about|devtools):/.test(tab.url)) continue;
+    if (/^(chrome|edge|about|devtools|chrome-extension):/.test(tab.url)) continue;
     const option = document.createElement("option");
     option.value = String(tab.id);
     let host = tab.url;
@@ -107,6 +117,12 @@ async function loadTabs(): Promise<void> {
     }
     option.textContent = `${tab.title || "untitled"} - ${host}`;
     tabPicker.appendChild(option);
+  }
+  // Keep the user's selection across refreshes — the picker previously reset
+  // to the first tab on every reload, which read as "my selection doesn't
+  // work" when the real problem was the list going stale.
+  if (previous && tabPicker.querySelector(`option[value="${previous}"]`)) {
+    tabPicker.value = previous;
   }
   if (tabPicker.options.length === 0) {
     setStatus("No inspectable tabs found. Open a webpage or test fixture first.", true);
@@ -141,14 +157,29 @@ async function drawShot(): Promise<void> {
   const coverage = currentData.tiles > 1 ? `full-page (${currentData.tiles} tiles stitched)` : "viewport";
 
   if (shotView === "redacted") {
-    shotNote.textContent = `${image.naturalWidth}x${image.naturalHeight}px - ${kb} KB - ${coverage} - ${currentData.redactedCount} regions masked. Shipped to planner.`;
+    // Only claim egress when the redacted frame really can leave: with vision
+    // off (the default) nothing is sent, and "Shipped to planner" was a claim
+    // about a transfer that never happened.
+    const egressNote = currentData.visionEnabled
+      ? "Sent to the vision model when it runs."
+      : "Held locally - vision is off, so no image is sent.";
+    shotNote.textContent = `${image.naturalWidth}x${image.naturalHeight}px - ${kb} KB - ${coverage} - ${currentData.redactedCount} regions masked. ${egressNote}`;
   } else {
     shotNote.textContent = `${image.naturalWidth}x${image.naturalHeight}px - ${kb} KB - ${coverage} - Raw un-redacted capture (NEVER leaves device). Outlines mark detection boxes.`;
 
-    // Draw detection boxes on original
+    // Draw detection boxes on original. Boxes arrive normalized 0-1
+    // (the convention the offscreen pipeline emits, so overlays land
+    // correctly at any DPR or display size) — they MUST be scaled to the
+    // canvas, or every outline collapses into a single pixel at the origin.
+    const canvasW = shot.width;
+    const canvasH = shot.height;
     currentData.detections.forEach((det, idx) => {
       if (!det.box) return;
-      const { x, y, width, height } = det.box;
+      const x = det.box.x * canvasW;
+      const y = det.box.y * canvasH;
+      const width = det.box.width * canvasW;
+      const height = det.box.height * canvasH;
+      if (width < 1 || height < 1) return;
       ctx.strokeStyle = idx === activeDetectionIndex ? "#00888c" : "#e23829";
       ctx.lineWidth = idx === activeDetectionIndex ? 3 : 2;
       ctx.strokeRect(x, y, width, height);
@@ -158,9 +189,10 @@ async function drawShot(): Promise<void> {
       ctx.font = "bold 11px sans-serif";
       const text = `${det.kind}: ${det.label}`;
       const textWidth = ctx.measureText(text).width;
-      ctx.fillRect(x, Math.max(0, y - 16), textWidth + 8, 16);
+      const badgeY = Math.min(Math.max(0, y - 16), canvasH - 16);
+      ctx.fillRect(x, badgeY, textWidth + 8, 16);
       ctx.fillStyle = "#ffffff";
-      ctx.fillText(text, x + 4, Math.max(12, y - 4));
+      ctx.fillText(text, x + 4, badgeY + 12);
     });
   }
 }
@@ -190,7 +222,10 @@ function renderSummary(): void {
   residualEl.className = `residual ${hasResidual ? "dirty" : "clean"}`;
   residualEl.innerHTML = hasResidual
     ? `<strong>Residual PII Leak Detected!</strong><span class="sub">${d.verification?.summary || "Adversarial re-OCR identified un-redacted characters."}</span>`
-    : `<strong>Zero-Leak Integrity Confirmed.</strong><span class="sub">${d.verification?.summary || "Adversarial re-OCR verified zero residual sensitive patterns in redacted pixels."}</span>`;
+    // Not "Zero-Leak": the check proves the REDACTED regions are clean in the
+    // shipped bytes. It cannot see a region no detector flagged, so the banner
+    // states the scoped claim rather than a completeness one (README §6.5).
+    : `<strong>Redaction Integrity Confirmed.</strong><span class="sub">${d.verification?.summary || "Re-OCR re-read the redacted regions of the shipped image: no residual sensitive pattern inside them."}</span>`;
   residualEl.classList.remove("hidden");
 }
 
@@ -301,24 +336,39 @@ function renderFindings(): void {
 // --- Render Text View ------------------------------------------------------
 
 function renderTextView(): void {
-  if (!currentData || !currentData.snapshot) {
-    textviewEl.innerHTML = `<p class="hint">No DOM text available.</p>`;
+  // "after" = the tokenized text the planner received; "before" = the raw
+  // page text as perceived. Before the raw snapshot was shipped alongside,
+  // this switch rendered the same string twice — dead UI.
+  const source =
+    textView === "before"
+      ? currentData?.snapshotBefore ?? currentData?.snapshot
+      : currentData?.snapshot;
+
+  if (!source) {
+    textviewEl.innerHTML = `<p class="hint">No DOM text available. Run a scan on a tab with a loaded page.</p>`;
     return;
   }
 
-  const text = currentData.snapshot.text || "";
+  const text = source.text || "";
   if (!text) {
     textviewEl.innerHTML = `<p class="hint">Page has no visible text.</p>`;
     return;
   }
 
+  const note =
+    textView === "before"
+      ? `<p class="hint">BEFORE — raw page text exactly as the content script perceived it. This is what the redaction pipeline works from.</p>`
+      : `<p class="hint">AFTER — tokenized text, the ONLY form that ever reaches the planner. Values are vault tokens; the raw form above never leaves the device.</p>`;
+
   const paragraphs = text.split("\n").filter((p) => p.trim().length > 0);
-  textviewEl.innerHTML = paragraphs
-    .map((p) => {
-      const escaped = escape(p);
-      return `<p>${escaped.replace(/&lt;([A-Z]+_\d+)&gt;/g, '<span class="tok">&lt;$1&gt;</span>')}</p>`;
-    })
-    .join("");
+  textviewEl.innerHTML =
+    note +
+    paragraphs
+      .map((p) => {
+        const escaped = escape(p);
+        return `<p>${escaped.replace(/&lt;([A-Z]+_\d+)&gt;/g, '<span class="tok">&lt;$1&gt;</span>')}</p>`;
+      })
+      .join("");
 }
 
 // --- Render DOM Tree -------------------------------------------------------
@@ -393,6 +443,17 @@ async function scan(): Promise<void> {
 // --- Event Bindings --------------------------------------------------------
 
 scanBtn.addEventListener("click", () => void scan());
+
+$("refresh-tabs").addEventListener("click", () => {
+  void loadTabs().then(() => setStatus("Tab list refreshed."));
+});
+
+// Refresh the tab list whenever the user returns to the inspector: tabs opened
+// since the page loaded used to be invisible until a manual reload.
+chrome.tabs.onActivated.addListener(() => void loadTabs());
+chrome.tabs.onUpdated.addListener((_tabId, change, tab) => {
+  if (change.status === "complete" || change.title) void loadTabs();
+});
 
 clearWireBtn.addEventListener("click", async () => {
   await chrome.runtime.sendMessage({ kind: "clear-wire-log" });

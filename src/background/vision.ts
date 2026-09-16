@@ -176,6 +176,18 @@ export function parseVisionResponse(provider: ProviderId, json: unknown): string
 }
 
 /**
+ * Wall-clock budget for one vision observation.
+ *
+ * The vision call sits in the post-action pipeline, between the tool result
+ * and the next planner turn. Without a timeout, a stalled VLM endpoint (cold
+ * vision model, oversized stitched image, dead connection) hung that pipeline
+ * FOREVER — the run sat on a pending step card with no error, no ticker, and
+ * no way forward. Vision is enhancement, not necessity: 20s and then the run
+ * continues on the DOM channel.
+ */
+const VISION_TIMEOUT_MS = 20_000;
+
+/**
  * Sends the redacted screenshot to a vision model and returns its description
  * plus the request byte count. Throws on transport/HTTP errors; callers treat
  * vision as best-effort and degrade to DOM-only on any failure.
@@ -190,24 +202,41 @@ export async function observeWithVision(
 ): Promise<VisionObservation> {
   const request = buildVisionRequest(provider, model, apiKey, imageDataUrl, textContext);
 
-  const response = await fetch(request.url, {
-    method: "POST",
-    headers: request.headers,
-    body: JSON.stringify(request.body),
-    signal,
-  });
+  // Merge the caller's signal with a hard timeout: the run abort (user Stop)
+  // alone left the fetch unbounded, which is how a run used to freeze between
+  // two planner turns.
+  const timeoutAbort = new AbortController();
+  const timer = setTimeout(() => timeoutAbort.abort(), VISION_TIMEOUT_MS);
+  const mergedSignal =
+    typeof AbortSignal.any === "function" && signal
+      ? AbortSignal.any([signal, timeoutAbort.signal])
+      : (signal ?? timeoutAbort.signal);
 
-  if (!response.ok) {
-    let detail = "";
-    try {
-      detail = (await response.text()).slice(0, 300);
-    } catch {
-      // Response body may be gone; the status text is enough.
+  let response: Response;
+  let json: unknown;
+  try {
+    response = await fetch(request.url, {
+      method: "POST",
+      headers: request.headers,
+      body: JSON.stringify(request.body),
+      signal: mergedSignal,
+    });
+    if (!response.ok) {
+      let detail = "";
+      try {
+        detail = (await response.text()).slice(0, 300);
+      } catch {
+        // Response body may be gone; the status text is enough.
+      }
+      throw new Error(`Vision API error ${response.status}: ${detail || response.statusText}`);
     }
-    throw new Error(`Vision API error ${response.status}: ${detail || response.statusText}`);
+    // The body read is inside the timeout too: headers can arrive promptly and
+    // the stream still stall mid-body, which hung the pipeline just as hard.
+    json = await response.json();
+  } finally {
+    clearTimeout(timer);
   }
 
-  const json: unknown = await response.json();
   const text = parseVisionResponse(provider, json);
   return { text, bytes: request.bytes, provider, model };
 }

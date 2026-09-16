@@ -68,6 +68,11 @@ export class VoiceController {
   private ttsAbort: AbortController | null = null;
   private cancelListening = false;
   private state: "idle" | "connecting" | "listening" | "error" = "idle";
+  /** Frames actually handed to the socket (0 means the mic produced nothing). */
+  private framesSent = 0;
+  /** Resolved the moment a committed transcript arrives (or the session dies). */
+  private finalWaiter: (() => void) | null = null;
+  private heardFinal = false;
   private readonly config: VoiceControllerConfig;
   private callbacks: VoiceControllerCallbacks;
 
@@ -85,31 +90,14 @@ export class VoiceController {
     if (this.isListening) return;
     this.stopSpeaking();
     this.cancelListening = false;
+    this.framesSent = 0;
+    this.heardFinal = false;
+    this.finalWaiter = null;
     try {
       this.setState("connecting");
-      const token = await mintScribeToken(this.config.apiKey);
-      if (this.cancelListening) {
-        this.cleanup();
-        return;
-      }
-      this.scribe = new ScribeConnection({
-        onPartial: (text) => {
-          this.callbacks.onPartial?.(text);
-          this.config.setUserEntryText(text);
-        },
-        onFinal: (text) => {
-          const trimmed = text.trim();
-          this.callbacks.onFinal?.(trimmed);
-          this.config.submitTask(trimmed);
-          this.config.setUserEntryText("");
-          void this.stopListening();
-        },
-        onError: (msg) => {
-          this.callbacks.onError?.(msg);
-          this.setState("error");
-        },
-      });
-      this.scribe.connect(token);
+      // Mic FIRST (inside the user gesture): the permission prompt and the
+      // AudioContext appear instantly, and the context isn't suspended for
+      // being created in a detached async continuation after the network mint.
       this.mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1, sampleRate: SCRIBE_SAMPLE_RATE_HZ },
       });
@@ -127,12 +115,60 @@ export class VoiceController {
       this.processor = this.audioCtx.createScriptProcessor(MIC_CHUNK_FRAMES, 1, 1);
       this.processor.onaudioprocess = (ev) => {
         const input = ev.inputBuffer.getChannelData(0);
-        if (this.scribe && this.state === "listening") {
+        // Send whenever a socket exists — sendAudioBase64 already no-ops
+        // until OPEN. Gating on `state === "listening"` dropped the first
+        // ~500ms of speech while the socket was still connecting.
+        if (this.scribe) {
+          this.framesSent++;
           this.scribe.sendAudioBase64(micFrameToScribeBase64(input));
         }
       };
       source.connect(this.processor);
       this.processor.connect(this.audioCtx.destination);
+      if (this.cancelListening) {
+        this.cleanup();
+        return;
+      }
+      // Network mint AFTER the mic is live so a slow/failed key doesn't leave
+      // the button stuck on "connecting" with no mic prompt ever shown.
+      const token = await mintScribeToken(this.config.apiKey);
+      if (this.cancelListening) {
+        this.cleanup();
+        return;
+      }
+      this.scribe = new ScribeConnection({
+        onPartial: (text) => {
+          this.callbacks.onPartial?.(text);
+          this.config.setUserEntryText(text);
+        },
+        onFinal: (text) => {
+          const trimmed = text.trim();
+          this.heardFinal = true;
+          this.finalWaiter?.();
+          this.finalWaiter = null;
+          this.callbacks.onFinal?.(trimmed);
+          if (trimmed) {
+            this.config.submitTask(trimmed);
+            this.config.setUserEntryText("");
+          }
+          void this.stopListening();
+        },
+        onClose: (reason) => {
+          // Session dropped: unblock stopListening so the button never hangs.
+          this.finalWaiter?.();
+          this.finalWaiter = null;
+          if (!this.heardFinal && !this.cancelListening) {
+            this.callbacks.onError?.(`Scribe session closed before any transcript (${reason}).`);
+          }
+        },
+        onError: (msg) => {
+          this.callbacks.onError?.(msg);
+          this.finalWaiter?.();
+          this.finalWaiter = null;
+          this.setState("error");
+        },
+      });
+      this.scribe.connect(token);
       this.setState("listening");
       this.callbacks.onOpen?.();
     } catch (err) {
@@ -145,11 +181,37 @@ export class VoiceController {
 
   /** Stop capture and commit the in-flight utterance. */
   async stopListening(): Promise<void> {
+    if (!this.scribe && !this.isListening) return;
     this.cancelListening = true;
-    if (this.scribe) this.scribe.commit();
-    // Give Scribe a beat to deliver the COMMITTED_TRANSCRIPT before we tear
-    // down the mic; commit() returns immediately on the wire.
-    await new Promise((r) => setTimeout(r, 350));
+    const scribe = this.scribe;
+    // Quick taps release before the session is live; a commit on a socket that
+    // has not received session_started is accepted but produces no transcript,
+    // so the utterance is silently lost. Wait for the session, then commit.
+    if (scribe) {
+      if (scribe.isOpen) {
+        const finalArrived = new Promise<void>((resolve) => {
+          this.finalWaiter = resolve;
+        });
+        await scribe.waitForReady(3000);
+        scribe.commit();
+        // Wait for the server's committed transcript (bounded) instead of a
+        // blind sleep — a fixed 900ms could tear the mic down mid-flight on a
+        // slow link and drop the words the user just spoke.
+        await Promise.race([
+          finalArrived,
+          new Promise<void>((r) => setTimeout(r, 3000)),
+        ]);
+      }
+      // Silence here is the failure mode that used to look like a dead button:
+      // say exactly which half (capture vs. transcript) came up empty.
+      if (!this.heardFinal) {
+        this.callbacks.onError?.(
+          this.framesSent === 0
+            ? "No microphone audio was captured - grant mic access to the side panel and try again."
+            : "Scribe returned no transcript. Check that the ElevenLabs key is valid and has STT quota.",
+        );
+      }
+    }
     this.cleanup();
   }
 
@@ -297,6 +359,8 @@ export class VoiceController {
       this.scribe.close();
       this.scribe = null;
     }
+    this.finalWaiter?.();
+    this.finalWaiter = null;
     this.setState("idle");
   }
 }

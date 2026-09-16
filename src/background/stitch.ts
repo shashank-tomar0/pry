@@ -7,8 +7,18 @@
 
 import type { PageMetrics } from "../shared/types";
 
-const CAPTURE_INTERVAL_MS = 500;
+/**
+ * Settle time between scroll and capture.
+ *
+ * The content script already waits 100ms for layout, but paint + compositor
+ * upload on a heavy page needs longer. At 150ms tiles were captured mid-scroll
+ * and the stitched image came out torn/duplicated — which reads as a
+ * "distorted screenshot" in the audit view. 400ms is the value this shipped
+ * with before the timing was tightened.
+ */
+const CAPTURE_INTERVAL_MS = 400;
 const MAX_IMAGE_HEIGHT = 16000;
+/** Tiles at 85% viewport steps: 20 tiles covers ~17 viewports of page. */
 const MAX_TILES = 20;
 
 function delay(ms: number): Promise<void> {
@@ -89,9 +99,14 @@ export async function captureAndStitchFullPage(
       const blob = await res.blob();
       const bitmap = await createImageBitmap(blob);
 
-      // Draw onto canvas at actual scroll offset
-      const destY = Math.round(metrics.scrollY * dpr);
-      ctx.drawImage(bitmap, 0, destY);
+      // Draw onto canvas at the actual scroll offset, scaled to the canvas
+      // width. Canvas width is pageWidth*dpr while a tile is viewportWidth*dpr;
+      // on a page with horizontal overflow those differ, and an unscaled tile
+      // left a blank strip down the right edge of the stitched image.
+      const scaleRatio = canvasWidth / Math.max(1, bitmap.width);
+      const tileHeight = Math.round(bitmap.height * scaleRatio);
+      const destY = Math.round(metrics.scrollY * dpr * scaleRatio);
+      ctx.drawImage(bitmap, 0, destY, canvasWidth, tileHeight);
       bitmap.close();
 
       tileCount++;

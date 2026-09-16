@@ -9,9 +9,12 @@ import type {
 } from "../shared/types";
 import { createTripwireAggregator } from "./tripwire-aggregator";
 import { normaliseSettings } from "../shared/types";
+import { regionMappingFor } from "../shared/region-mapping";
+import { VISION_SUPPORTED } from "./vision";
 import { tokenizer } from "./tokenizer";
 import { clearWire, wireRecords } from "./wire-log";
 import { getActiveNerSpans } from "./ml-bridge";
+import { ensureOffscreenDocument } from "./offscreen-doc";
 import { runTask } from "./agent";
 import { createPlanner } from "./providers";
 import { generateLessons } from "./lesson-generator";
@@ -180,28 +183,12 @@ function askConfirm(id: string, summary: string): Promise<boolean> {
 // ─── Screenshot Capture (Service Worker Only) ───────────────────────────────
 
 /**
- * Ensure the offscreen document exists. Only the service worker can
- * create offscreen documents via chrome.offscreen.createDocument.
+ * Bring up the offscreen document early, at the start of a run, so the first
+ * ML call and the first screenshot do not pay a cold-start race. Failures are
+ * non-fatal — every ML consumer degrades on its own.
  */
-async function ensureOffscreenDocument(): Promise<void> {
-  try {
-    const existingContexts = await (chrome.runtime as any).getContexts({
-      contextTypes: ["OFFSCREEN_DOCUMENT"],
-    });
-    if (existingContexts?.length > 0) return;
-  } catch {
-    // getContexts may not be available in older Chrome versions.
-  }
-
-  try {
-    await (chrome.offscreen as any).createDocument({
-      url: "offscreen.html",
-      reasons: ["WORKERS", "BLOBS"],
-      justification: "Canvas screenshot redaction, Tesseract OCR verification, and face detection",
-    });
-  } catch {
-    // May already exist.
-  }
+async function warmOffscreen(): Promise<void> {
+  await ensureOffscreenDocument();
 }
 
 /**
@@ -214,19 +201,41 @@ async function ensureOffscreenDocument(): Promise<void> {
 async function captureVisibleTab(tabId: number): Promise<{ dataUrl: string; width: number; height: number } | null> {
   try {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (!tab?.id) return null;
+    if (!tab?.id || !tab.windowId) return null;
 
-    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, { format: "png" });
+    // chrome.tabs.captureVisibleTab ignores the tab id entirely — it captures
+    // whatever is VISIBLE in the window. For the agent run that is always the
+    // driving tab, but a caller like the privacy inspector passes a tab that
+    // is NOT focused, and the capture silently photographed the wrong page
+    // (the inspector itself). When the target is not the visible tab, bring it
+    // to the front just long enough to capture, then restore the user's tab.
+    let previousActiveId: number | null = null;
+    if (!tab.active) {
+      const [current] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+      previousActiveId = current?.id ?? null;
+      await chrome.tabs.update(tabId, { active: true });
+      // Let the tab actually paint: a capture that races the activation
+      // returns the previous frame.
+      await new Promise((r) => setTimeout(r, 400));
+    }
 
-    // Get image dimensions by loading into an offscreen canvas.
-    const response = await fetch(dataUrl);
-    const blob = await response.blob();
-    const bitmap = await createImageBitmap(blob);
-    const width = bitmap.width;
-    const height = bitmap.height;
-    bitmap.close();
+    try {
+      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
 
-    return { dataUrl, width, height };
+      // Get image dimensions by loading into an offscreen canvas.
+      const response = await fetch(dataUrl);
+      const blob = await response.blob();
+      const bitmap = await createImageBitmap(blob);
+      const width = bitmap.width;
+      const height = bitmap.height;
+      bitmap.close();
+
+      return { dataUrl, width, height };
+    } finally {
+      if (previousActiveId !== null) {
+        await chrome.tabs.update(previousActiveId, { active: true }).catch(() => undefined);
+      }
+    }
   } catch {
     return null;
   }
@@ -235,7 +244,7 @@ async function captureVisibleTab(tabId: number): Promise<{ dataUrl: string; widt
 /**
  * Process a screenshot through the offscreen document's privacy pipeline.
  * Returns the redacted image and detection results.
- * `privacy` carries the user's toggles (face blur, credential masking,
+ * `privacy` carries the user's toggles (face destruction, credential masking,
  * redaction labels) so the offscreen pipeline honors them.
  */
 async function processScreenshot(
@@ -248,10 +257,18 @@ async function processScreenshot(
   }> = [],
   dpr: number = 1,
   privacy?: {
-    blurFaces: boolean;
+    destroyFaces: boolean;
     maskCredentials: boolean;
     showRedactionLabels: boolean;
   },
+  /**
+   * Maps region coordinates onto THIS image. Viewport captures use the DPR
+   * alone; a stitched full-page image additionally scales tiles onto the
+   * page canvas and offsets every region by the scroll position it was
+   * measured at (both precomputed by the caller).
+   */
+  regionScale: number = dpr,
+  regionOffsetY: number = 0,
 ): Promise<ProcessedScreenshotResult> {
   await ensureOffscreenDocument();
 
@@ -294,6 +311,8 @@ async function processScreenshot(
       height,
       sensitiveRegions,
       dpr,
+      regionScale,
+      regionOffsetY,
       privacy,
     });
   });
@@ -308,11 +327,17 @@ async function processScreenshot(
 async function getSensitiveRegions(tabId: number): Promise<{
   regions: Array<{ x: number; y: number; width: number; height: number; kind: string; label: string }>;
   dpr: number;
+  /** Viewport scroll (CSS px) when the regions were measured — full-page mapping. */
+  scrollY: number;
+  /** Viewport CSS width when the regions were measured — full-page mapping. */
+  viewportWidth: number;
+  /** Set when region collection did not complete — text PII is NOT redacted. */
+  failure: string | null;
 } | null> {
   // Distinguish "no receiver" (content script not injected — reinject) from
   // "receiver busy" (script exists but hung — reinjecting would only create a
   // duplicate listener, so we skip and let the region call time out gracefully).
-  const callContent = (message: unknown, timeoutMs = 15000): Promise<
+  const callContent = (message: unknown, timeoutMs = 20000): Promise<
     { ok: true; value: unknown } | { ok: false; reason: "timeout" | "error" }
   > =>
     new Promise((resolve) => {
@@ -343,7 +368,7 @@ async function getSensitiveRegions(tabId: number): Promise<{
 
   try {
     // Ensure content script is injected (may not be if tab predates extension).
-    const ping = await callContent({ kind: "ping" });
+    const ping = await callContent({ kind: "ping" }, 4000);
     if (!ping.ok && ping.reason === "error") {
       await chrome.scripting.executeScript({
         target: { tabId },
@@ -358,23 +383,43 @@ async function getSensitiveRegions(tabId: number): Promise<{
     // only returns rects where that exact text is visible, so spans left over
     // from a previous page can never over-redact the current one.
     const activeNerSpans = getActiveNerSpans();
-    const [result, nerResult] = await Promise.all([
+    let [result, nerResult] = await Promise.all([
       callContent({ kind: "get-sensitive-regions" }),
       activeNerSpans.length > 0
         ? callContent({ kind: "locate-spans", spans: activeNerSpans })
         : Promise.resolve(null),
     ]);
+
+    // A single error (the page navigated, or the script was replaced by a
+    // reload mid-call) is recoverable: reinject and ask once more. A timeout
+    // is not retried — the page's main thread is busy and a second call would
+    // block it for another full window.
+    if (!result.ok && result.reason === "error") {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] }).catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 100));
+      result = await callContent({ kind: "get-sensitive-regions" });
+    }
+
     const nerValue = nerResult?.ok
       ? (nerResult.value as { sensitiveRegions?: unknown[] } | null)
       : null;
     if (!result.ok) {
-      console.log("[PRY] No sensitive regions returned from content script");
-      return null;
+      const why = result.reason === "timeout"
+        ? "the page's main thread did not answer in time (heavy script, or a frozen tab)"
+        : "the content script is not reachable on this page";
+      console.log(`[PRY] Sensitive-region collection failed: ${result.reason}`);
+      return { regions: [], dpr: 1, scrollY: 0, viewportWidth: 0, failure: why };
     }
-    const value = result.value as { sensitiveRegions?: unknown[]; dpr?: number };
-    if (!value.sensitiveRegions) {
+    const value = result.value as { sensitiveRegions?: unknown[]; dpr?: number; scrollY?: number; viewportWidth?: number };
+    if (!value?.sensitiveRegions) {
       console.log("[PRY] No sensitive regions returned from content script");
-      return null;
+      return {
+        regions: [],
+        dpr: value?.dpr ?? 1,
+        scrollY: value?.scrollY ?? 0,
+        viewportWidth: value?.viewportWidth ?? 0,
+        failure: "the content script returned no region list",
+      };
     }
     const regions = value.sensitiveRegions as Array<{
       x: number; y: number; width: number; height: number; kind: string; label: string;
@@ -385,10 +430,22 @@ async function getSensitiveRegions(tabId: number): Promise<{
       regions.push(...(nerValue.sensitiveRegions as typeof regions));
     }
     console.log(`[PRY] Content script found ${regions.length} sensitive regions (${nerFound} from on-device NER), DPR=${value.dpr}`);
-    return { regions, dpr: value.dpr ?? 1 };
+    return {
+      regions,
+      dpr: value.dpr ?? 1,
+      scrollY: value.scrollY ?? 0,
+      viewportWidth: value.viewportWidth ?? 0,
+      failure: null,
+    };
   } catch (err) {
     console.warn("[PRY] getSensitiveRegions failed:", err);
-    return null;
+    return {
+      regions: [],
+      dpr: 1,
+      scrollY: 0,
+      viewportWidth: 0,
+      failure: err instanceof Error ? err.message : String(err),
+    };
   }
 }
 
@@ -434,32 +491,51 @@ export async function captureAndProcessScreenshot(
 
   // Sensitive regions + DPR come from the SAME tab we captured.
   const sensitiveData = await getSensitiveRegions(tabId);
-  if (!sensitiveData) {
-    // The content script could not deliver regions (file:// without the
-    // access toggle, a page it cannot inject into, or a hang). Say so in the
-    // transcript: text PII will NOT be redacted in this frame, and silence
-    // here is exactly how that used to look like a mystery.
+  if (sensitiveData?.failure) {
+    // Text-region collection could not complete, so this frame's text PII is
+    // NOT redacted (faces still are — that channel is pure pixel work). This
+    // used to be silent, which is exactly how "faces blurred but the email is
+    // still readable" looked like a mystery. Say it, once, with the reason.
     emit({
       kind: "entry",
       entry: {
         id: `regions-fail-${Date.now()}`,
         role: "system",
-        text: "Privacy: sensitive-region detection is unavailable on this page (content script not running - e.g. file:// without 'Allow access to file URLs'). Text PII in this screenshot may stay visible; faces are still blurred on-device.",
+        text: `Privacy warning: text-region detection did not complete (${sensitiveData.failure}). Text PII in this screenshot may stay visible; faces are still destroyed on-device (that channel is pure pixel work). If this repeats on one site, retry on a lighter page.`,
       },
     });
   }
   const dpr = sensitiveData?.dpr ?? 1;
   const sensitiveRegions = sensitiveData?.regions ?? [];
 
-  console.log(`[PRY] Screenshot (tab ${tabId}): ${width}x${height} @ ${dpr}x DPR, ${sensitiveRegions.length} sensitive regions found`);
+  // Region→image mapping. Regions are measured in VIEWPORT CSS pixels; a
+  // viewport capture is viewport×DPR, so scale = DPR. A stitched full-page
+  // capture is the whole PAGE drawn at (canvasWidth / tileWidth) of each
+  // viewport tile, and the regions were measured after the scroll was
+  // restored — so every region needs that tile scale AND the restored scroll
+  // offset. Getting this wrong put every text-PII black box at the wrong y in
+  // full-page mode (the "faces blurred but text PII elsewhere" ledger view).
+  // Shared with the inspector's capture path so the two can never disagree.
+  const { scale: regionScale, offsetY: regionOffsetY, mapped: fullPageImage } = regionMappingFor({
+    imageWidth: width,
+    dpr,
+    viewportWidth: sensitiveData?.viewportWidth ?? 0,
+    scrollY: sensitiveData?.scrollY ?? 0,
+    fullPage: Boolean(fullPage),
+  });
+
+  console.log(`[PRY] Screenshot (tab ${tabId}): ${width}x${height} @ ${dpr}x DPR, ${sensitiveRegions.length} sensitive regions found` +
+    (fullPageImage ? `, region scale ${regionScale.toFixed(3)}, offset y ${Math.round(regionOffsetY)}px` : ""));
 
   const processed = await processScreenshot(
     rawDataUrl, width, height, sensitiveRegions, dpr,
     {
-      blurFaces: privacy.blurFaces,
+      destroyFaces: privacy.destroyFaces,
       maskCredentials: privacy.maskCredentials,
       showRedactionLabels: privacy.showRedactionLabels,
     },
+    regionScale,
+    regionOffsetY,
   );
   return { original: rawDataUrl, processed };
 }
@@ -472,6 +548,8 @@ interface AuditEntry {
   detections: Array<{ kind: string; label: string; confidence: number }>;
   tokens: Array<{ token: string; kind: string; sample?: string }>;
   redactedCount: number;
+  /** True when this frame's redacted image was actually sent to a VLM. */
+  shipped?: boolean;
   verification?: VerificationResult;
   timestamp: number;
 }
@@ -487,6 +565,7 @@ function recordAuditEntry(data: {
   detections: Array<{ kind: string; label: string; confidence: number; box?: { x: number; y: number; width: number; height: number } }>;
   tokens: Array<{ token: string; kind: string; sample?: string }>;
   redactedCount: number;
+  shipped?: boolean;
   verification?: VerificationResult;
 }): void {
   // Limit stored entries to prevent memory bloat (each base64 screenshot ~1-5MB).
@@ -539,6 +618,9 @@ function emitPrivacyAudit(): void {
       totalScreenshots: auditEntries.length,
       totalPIIDetections: allDetections.length,
       durationMs: Date.now() - taskStartTime,
+      // Did ANY frame in this run reach a vision model? Only then is the
+      // redacted pane "what shipped to the model".
+      shipped: auditEntries.some((e) => e.shipped === true),
       verification: lastVerification,
     },
   });
@@ -564,6 +646,11 @@ async function start(task: string, tabId: number): Promise<void> {
   taskStartTime = Date.now();
   auditEntries = [];
   emit({ kind: "status", running: true });
+
+  // Create the offscreen runtime BEFORE runTask's first NER/guard call. It is
+  // fire-and-forget: the model load itself is warmed by the self-test inside
+  // runTask, and a failure here only means ML degrades as before.
+  void warmOffscreen();
   emit({ kind: "entry", entry: { id: `u-${Date.now()}`, role: "user", text: tokenizedTask } });
 
   try {
@@ -945,6 +1032,16 @@ chrome.runtime.onMessage.addListener(
           }
 
           try {
+            // Capture the tab the user is looking at (the inspector) so we can
+            // hand focus back after full-page capture — the stitcher leaves
+            // the scanned tab in the foreground, which read as "the inspector
+            // navigated me away".
+            let focusReturnTabId: number | null = null;
+            if (fullPage) {
+              const [focused] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+              focusReturnTabId = focused?.id ?? null;
+            }
+
             // 1. Capture snapshot via content script
             const snapshotRes = await chrome.tabs.sendMessage(tabId, { kind: "snapshot" }).catch(() => null);
             const snapshot = snapshotRes && typeof snapshotRes === "object" && "snapshot" in snapshotRes
@@ -982,13 +1079,30 @@ chrome.runtime.onMessage.addListener(
               return;
             }
 
+            // Full-page capture scrolled the target tab into the foreground;
+            // give the inspector its focus back before the heavy work below.
+            if (focusReturnTabId !== null) {
+              await chrome.tabs.update(focusReturnTabId, { active: true }).catch(() => undefined);
+            }
+
             // 3. Sensitive regions & DPR
             const sensitiveData = await getSensitiveRegions(tabId);
             const dpr = sensitiveData?.dpr ?? 1;
             const sensitiveRegions = sensitiveData?.regions ?? [];
 
-            // 4. Run through privacy pipeline
+            // 4. Run through privacy pipeline. The inspector can capture a
+            // stitched full-page image too, so it needs the SAME region→image
+            // mapping the agent's capture path uses: without it, a full-page
+            // inspect painted every text-PII box at a viewport-relative y on a
+            // page-tall canvas (the misaligned redaction seen in the ledger).
             const settings = await loadSettings();
+            const inspectorMapping = regionMappingFor({
+              imageWidth: width,
+              dpr,
+              viewportWidth: sensitiveData?.viewportWidth ?? 0,
+              scrollY: sensitiveData?.scrollY ?? 0,
+              fullPage,
+            });
             const processed = await processScreenshot(
               rawDataUrl,
               width,
@@ -996,10 +1110,12 @@ chrome.runtime.onMessage.addListener(
               sensitiveRegions,
               dpr,
               {
-                blurFaces: settings.privacy.blurFaces,
+                destroyFaces: settings.privacy.destroyFaces,
                 maskCredentials: settings.privacy.maskCredentials,
                 showRedactionLabels: settings.privacy.showRedactionLabels,
               },
+              inspectorMapping.scale,
+              inspectorMapping.offsetY,
             );
 
             // 5. Run tokenization pass so vault and tokens are populated
@@ -1020,6 +1136,9 @@ chrome.runtime.onMessage.addListener(
                 tab: { id: tab.id, title: tab.title, url: tab.url },
                 original: rawDataUrl,
                 redacted: processed.redactedDataUrl,
+                // Lets the inspector state whether this frame can leave at all
+                // instead of labelling every redaction "Shipped to planner".
+                visionEnabled: settings.vision.enabled && VISION_SUPPORTED[settings.provider],
                 width,
                 height,
                 tiles: tilesCount,
@@ -1029,6 +1148,13 @@ chrome.runtime.onMessage.addListener(
                 verification: processed.verification,
                 vault: vaultEntries,
                 snapshot: tokenizedSnapshot,
+                // The RAW page text as perceived, pre-tokenization — the
+                // inspector's Before view. The tokenized form above is the
+                // After view. Without the raw half the Before/After switch
+                // had nothing to switch to.
+                snapshotBefore: snapshot
+                  ? { url: snapshot.url, title: snapshot.title, text: snapshot.text, elements: snapshot.elements }
+                  : undefined,
               },
             });
           } catch (err) {

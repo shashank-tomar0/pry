@@ -314,18 +314,57 @@ const redD1 = makeImage(40, 40, (x, y) => (x >= 10 && x < 30 && y >= 10 && y < 3
 const vD1 = verifyRegions(origD1, redD1, [{ x: 10, y: 10, width: 20, height: 20, kind: "id_number", label: "Aadhaar" }]);
 ok("blacked-out region verifies (solid mask)", vD1.verified && vD1.regionsRedacted === 1, JSON.stringify(vD1));
 
-// D2: face region with real content (skin-tone variance), blurred afterwards
-// (simulated by a heavy uniform smear) → verified via the pixel-diff path.
+// D2: face region with real content (skin-tone variance) that was only BLURRED
+// (heavy uniform smear) → must FAIL. A blurred face is still the face: Gaussian
+// blur is invertible by super-resolution deanonymization, so "pixels changed"
+// is not evidence of an irreversible redaction for a biometric identifier.
 const origD2 = makeImage(40, 40, (x, y) => {
   if (x >= 5 && x < 25 && y >= 5 && y < 25) return ((x + y) % 2 ? [215, 180, 160] : [180, 145, 130]);
   return white();
 });
 const redD2 = makeImage(40, 40, (x, y) => {
-  if (x >= 5 && x < 25 && y >= 5 && y < 25) return [70, 70, 70]; // heavy blur/overlay smear
+  if (x >= 5 && x < 25 && y >= 5 && y < 25) return [70, 70, 70]; // blur/overlay smear, not opaque
   return white();
 });
 const vD2 = verifyRegions(origD2, redD2, [{ x: 5, y: 5, width: 20, height: 20, kind: "face", label: "Face detected" }]);
-ok("content region that was blurred verifies via pixel diff", vD2.verified && vD2.regionsRedacted === 1, JSON.stringify(vD2));
+ok("a merely blurred face FAILS verification (reversible redaction)",
+  !vD2.verified && vD2.regionsRedacted === 0 && vD2.leakedPatterns.length === 1, JSON.stringify(vD2));
+
+// D2b: the same face region DESTROYED with an opaque fill → verified.
+const redD2b = makeImage(40, 40, (x, y) => (x >= 5 && x < 25 && y >= 5 && y < 25 ? black() : white()));
+const vD2b = verifyRegions(origD2, redD2b, [{ x: 5, y: 5, width: 20, height: 20, kind: "face", label: "Face destroyed" }]);
+ok("an opaque destroyed face verifies (irreversible)",
+  vD2b.verified && vD2b.regionsRedacted === 1, JSON.stringify(vD2b));
+
+// D2c: soft blur-tier kinds are still allowed to verify by pixel change, so
+// the irreversibility rule is scoped to faces and does not break fields.
+const vD2c = verifyRegions(origD2, redD2, [{ x: 5, y: 5, width: 20, height: 20, kind: "input_field", label: "Field" }]);
+ok("a blurred input_field still verifies (soft tier unaffected)",
+  vD2c.verified && vD2c.regionsRedacted === 1, JSON.stringify(vD2c));
+
+// D2d: an opaque face mask whose EDGE rings under JPEG (a 1px non-black
+// border) must still verify — the opacity proof measures the interior, or a
+// correct redaction would fail for an artifact of the mask itself.
+const redD2d = makeImage(40, 40, (x, y) => {
+  const inRegion = x >= 5 && x < 25 && y >= 5 && y < 25;
+  const onEdge = x === 5 || x === 24 || y === 5 || y === 24;
+  if (inRegion) return onEdge ? [120, 120, 120] : black();
+  return white();
+});
+const vD2d = verifyRegions(origD2, redD2d, [{ x: 5, y: 5, width: 20, height: 20, kind: "face", label: "Face destroyed" }]);
+ok("opaque face with a JPEG-ringing edge still verifies",
+  vD2d.verified && vD2d.regionsRedacted === 1, JSON.stringify(vD2d));
+
+// D2e: and the Inset must not hide a real regression — a face whose interior
+// is only blurred (edge stays dark) still fails.
+const redD2e = makeImage(40, 40, (x, y) => {
+  const inRegion = x >= 5 && x < 25 && y >= 5 && y < 25;
+  if (inRegion) return [80, 60, 55]; // smeared skin tone, dark enough to pass a naive black check
+  return white();
+});
+const vD2e = verifyRegions(origD2, redD2e, [{ x: 5, y: 5, width: 20, height: 20, kind: "face", label: "Face" }]);
+ok("a blurred-but-dark face interior still FAILS (inset hides nothing)",
+  !vD2e.verified && vD2e.regionsRedacted === 0, JSON.stringify(vD2e));
 
 // D3: blank region (empty input field over white page) → trivially verified.
 const origD3 = makeImage(40, 40, white);
@@ -1104,7 +1143,12 @@ const agg = createTripwireAggregator();
 ok("fresh aggregator reports zero intercepts",
   agg.total() === 0 && agg.counts().size === 0);
 ok("fresh aggregator summary names the count",
-  agg.summary().includes("0 outbound PII leaks flagged"));
+  agg.summary().includes("0 third-party PII leaks intercepted"));
+// The wire log reports a DIFFERENT number (what reached the planner), so the
+// radar's headline must name its own channel or the two panels read as
+// contradictory (0 there, 5 here).
+ok("aggregator summary scopes itself to the third-party channel",
+  agg.summary().includes("third-party") && !agg.summary().includes("outbound PII leak"));
 
 agg.bump({ url: "https://mail.google.com/sync/i/fd?c=1", method: "POST", piiType: "credit_card", sample: "•••• 9411", timestamp: 1 });
 agg.bump({ url: "https://www.mail.google.com/sync/i/fd?c=2", method: "POST", piiType: "credit_card", sample: "•••• 0930", timestamp: 2 });
@@ -1116,7 +1160,7 @@ ok("counts by type: credit_card ×2, email ×1",
 ok("hosts are normalized (www stripped) and counted",
   agg.hosts().get("mail.google.com") === 2 && agg.hosts().get("analytics.thirdparty.com") === 1);
 const aggSummary = agg.summary();
-ok("summary headline carries the total", aggSummary.includes("3 outbound PII leaks flagged"));
+ok("summary headline carries the total", aggSummary.includes("3 third-party PII leaks intercepted"));
 ok("summary breaks down by type, highest first",
   aggSummary.includes("CREDIT_CARD ×2") && aggSummary.includes("EMAIL ×1"));
 ok("summary orders types by count descending",
@@ -1488,11 +1532,11 @@ ok("TTS output format is PCM16 (matches AudioContext default)",
 // ─── Scenario Z: Scribe client wire shapes (pure functions only) ─────────────
 console.log("\n=== Scenario Z: Scribe client URL + token auth ===\n");
 
-const { mintScribeToken, scribeWebSocketUrl, micFrameToScribeBase64, SCRIBE_SAMPLE_RATE_HZ } =
+const { mintScribeToken, scribeWebSocketUrl, scribeAudioChunk, micFrameToScribeBase64, SCRIBE_SAMPLE_RATE_HZ } =
   await import("../src/sidepanel/scribe-client.ts");
 
 ok("Scribe sample rate is 16 kHz (PCM16)", SCRIBE_SAMPLE_RATE_HZ === 16000);
-ok("scribeWebSocketUrl carries token, model_id, audio_format, sample_rate",
+ok("scribeWebSocketUrl carries token, model_id, audio_format, sample_rate, commit_strategy=manual",
   (() => {
     const u = new URL(scribeWebSocketUrl("tkn-123"));
     return u.protocol === "wss:"
@@ -1500,7 +1544,27 @@ ok("scribeWebSocketUrl carries token, model_id, audio_format, sample_rate",
       && u.searchParams.get("token") === "tkn-123"
       && u.searchParams.get("model_id") === "scribe_v2_realtime"
       && u.searchParams.get("audio_format") === "pcm_16000"
-      && u.searchParams.get("sample_rate") === "16000";
+      && u.searchParams.get("sample_rate") === "16000"
+      && u.searchParams.get("commit_strategy") === "manual";
+  })());
+
+// The wire shape is the whole ballgame for STT: the SDK's friendly
+// {audioBase64} form is NOT what the WebSocket accepts, and sending it is a
+// silent no-op (audio never transcribed). Pin the documented InputAudioChunk.
+ok("audio frames use the documented InputAudioChunk wire shape",
+  (() => {
+    const frame = scribeAudioChunk("QUJD");
+    return frame.message_type === "input_audio_chunk"
+      && frame.audio_base_64 === "QUJD"
+      && frame.commit === false
+      && frame.sample_rate === 16000;
+  })());
+ok("commit frames are input_audio_chunk with commit=true",
+  (() => {
+    const frame = scribeAudioChunk("", true);
+    return frame.message_type === "input_audio_chunk"
+      && frame.commit === true
+      && frame.audio_base_64 === "";
   })());
 ok("micFrameToScribeBase64 returns base64-encoded PCM16 (2 bytes per sample)",
   micFrameToScribeBase64(new Float32Array(64)).length > 0
@@ -1750,5 +1814,311 @@ ok("fusion maps PII vocabularies to friendly audit labels",
     && fusedLbl.detections.some((d) => d.value === "rahul@acme.in" && d.label === "NER Email address")
     && fusedLbl.detections.some((d) => d.value === "Acme Pvt Ltd" && d.label === "NER Organization"),
   JSON.stringify(fusedLbl.detections.map((d) => d.label)));
+
+// ── Subword-fragment repair (the silent NER no-op) ────────────────────────
+// The screenshot evidence: the self-test line read "found: P, ##riya Sharma".
+// Fragment spans never match real page text, so the name was neither
+// tokenized in the text channel nor boxed in the pixel channel — it reached
+// the model raw and the wire log reported it as a LEAK. Pin the repair.
+console.log("\n=== Scenario AF: NER subword-fragment repair ===\n");
+
+const { normalizeSpans } = await import("../src/shared/ner-spans.ts");
+
+const nerRepaired = normalizeSpans([
+  { word: "P", entity_group: "PER", score: 0.99 },
+  { word: "##riya Sharma", entity_group: "PER", score: 0.95 },
+  { word: "Ramesh Gupta", entity_group: "PER", score: 0.98 },
+  { word: "Acme Corporation", entity_group: "ORG", score: 0.97 },
+]);
+ok("WordPiece fragments are merged into whole spans",
+  nerRepaired[0]?.text === "Priya Sharma" && nerRepaired[1]?.text === "Ramesh Gupta",
+  JSON.stringify(nerRepaired.map((s) => s.text)));
+ok("no continuation marker survives normalization",
+  nerRepaired.every((s) => !s.text.includes("##") && !s.text.includes("\u2581")));
+ok("merged span keeps the weakest fragment score (honest threshold)",
+  nerRepaired[0]?.score === 0.95);
+ok("distinct labels are never fused by a continuation",
+  normalizeSpans([
+    { word: "Acme", entity_group: "ORG", score: 0.9 },
+    { word: "##Corp", entity_group: "LOC", score: 0.9 },
+  ]).length === 2);
+// \u2581 marks a word START (a space), unlike ## which glues — conflating
+// them turns "New" + "\u2581Delhi" into "NewDelhi".
+const sentencePiece = normalizeSpans([
+  { word: "\u2581New", entity_group: "LOC", score: 0.9 },
+  { word: "\u2581Delhi", entity_group: "LOC", score: 0.9 },
+]);
+ok("SentencePiece markers join with a space, not glue",
+  sentencePiece.length === 1 && sentencePiece[0].text === "New Delhi",
+  JSON.stringify(sentencePiece));
+ok("unmarked neighbours are never fused into one entity",
+  normalizeSpans([
+    { word: "Google", entity_group: "ORG", score: 0.9 },
+    { word: "Apple", entity_group: "ORG", score: 0.9 },
+  ]).length === 2);
+ok("malformed pipeline output never throws", normalizeSpans(null).length === 0);
+
+// ── Token-level BIO output (the silent-zero defect) ───────────────────────
+// Measured against the real bundled weights: the pipeline can return raw tags
+// (`entity: "B-PER"`) instead of pre-aggregated groups. Those labels fail a
+// PER/ORG/LOC policy check, every span was discarded, and the on-device NER
+// contributed NOTHING while the self-test still listed entities. Pin the fix.
+const bio = normalizeSpans([
+  { entity: "B-PER", word: "P", score: 0.99 },
+  { entity: "I-PER", word: "##riya", score: 0.97 },
+  { entity: "I-PER", word: "Sharma", score: 0.99 },
+  { entity: "O", word: "met", score: 0.99 },
+  { entity: "B-PER", word: "Ramesh", score: 0.99 },
+  { entity: "I-PER", word: "Gupta", score: 0.99 },
+  { entity: "B-ORG", word: "Acme", score: 0.99 },
+  { entity: "I-ORG", word: "Corporation", score: 0.99 },
+]);
+ok("BIO prefixes are stripped so the label policy can match",
+  bio[0]?.label === "PER" && bio.some((s) => s.label === "ORG"),
+  JSON.stringify(bio.map((s) => s.label)));
+ok("token-level BIO output merges into whole entities",
+  bio.map((s) => s.text).join(" | ") === "Priya Sharma | Ramesh Gupta | Acme Corporation",
+  bio.map((s) => s.text).join(" | "));
+ok("outside spans ('O') are dropped, never emitted as entities",
+  !bio.some((s) => s.text === "met" || s.label === "O"));
+ok("BIO-stripped labels pass the PII policy that silently rejected them before",
+  keepLabel(bio[0].label) && keepLabel(bio[2].label));
+ok("a span with no surface text is dropped, never emitted empty",
+  normalizeSpans([{ entity: "B-PER", score: 0.99 }]).length === 0);
+ok("array-shaped scores are coerced, not silently NaN",
+  normalizeSpans([{ entity_group: "PER", word: "Priya", score: [0.2, 0.91] }])[0]?.score === 0.91);
+
+// ── Scenario AG: the title channel is sanitized like every other channel ──
+// The page title bypasses the element/text detectors entirely. Gmail's title
+// is "Inbox (n) - you@gmail.com - Gmail", so the signed-in address reached the
+// model raw on every run — the wire-log leak scanner flagged it ("Email
+// address (sh---@gmail.com) reached the model") while the pixel channel was
+// verified clean. Pin the repair: title PII is tokenized, and a value the
+// vault already holds keeps the SAME token it has in the page body.
+console.log("\n=== Scenario AG: title-channel PII sanitization ===\n");
+
+const { sanitizeTextPII } = await import("../src/background/agent.ts");
+
+const GMAIL_TITLE = "Inbox (16) - shashank.negi@gmail.com - Gmail";
+const titleOut = sanitizeTextPII(GMAIL_TITLE);
+ok("title email becomes a vault token, never raw",
+  !titleOut.includes("shashank.negi@gmail.com") && /<[A-Z]+_[0-9]+>/.test(titleOut),
+  titleOut);
+
+// Vault consistency: register the email as the body channel would, then
+// sanitize a title carrying the same address — both must map to one token.
+tokenizer.clear();
+tokenizer.tokenizeDetections(
+  { elements: [], text: "contact: shashank.negi@gmail.com for help", url: "https://x.test", title: "" },
+  [{ kind: "credential", value: "shashank.negi@gmail.com" }],
+);
+const bodyRender = sanitizeTextPII("contact: shashank.negi@gmail.com for help");
+ok("body channel keeps its existing token (no re-tokenization)",
+  bodyRender.includes("<CRED_1>") && !bodyRender.includes("shashank.negi@gmail.com"), bodyRender);
+const sameTitle = sanitizeTextPII("Mail - shashank.negi@gmail.com");
+ok("the same address in the title maps to the SAME token",
+  sameTitle.includes("<CRED_1>"), sameTitle);
+
+// Honorific names in titles (the "Person name (Dr--------)" wire-log leak).
+tokenizer.clear();
+const doctorTitle = sanitizeTextPII("Dr. Ramesh Gupta - Profile | HealthSite");
+ok("honorific person names in titles are tokenized",
+  !doctorTitle.includes("Ramesh Gupta") && /<[A-Z]+_[0-9]+>/.test(doctorTitle), doctorTitle);
+
+// Clean titles pass through untouched (no token spam on ordinary pages).
+tokenizer.clear();
+ok("an ordinary title is not modified",
+  sanitizeTextPII("YouTube") === "YouTube" &&
+  sanitizeTextPII("Schedule Design Masterclass IN 2026") === "Schedule Design Masterclass IN 2026");
+
+// Empty/short strings short-circuit.
+ok("short input returns unchanged",
+  sanitizeTextPII("") === "" && sanitizeTextPII("ok") === "ok");
+
+// ── Scenario AH: face channels fuse, they do not replace each other ───────
+// The screenshot evidence: on a YouTube page the large thumbnail face came
+// back destroyed (opaque black) and every smaller thumbnail/avatar face
+// survived, fully readable. Cause: the pixel pipeline ran its three face
+// channels as an EXCLUSIVE chain (`if (faceBoxes.length === 0)`), so one
+// BlazeFace hit skipped the skin-colour pass — and BlazeFace is a SHORT-RANGE
+// detector that finds one large portrait and drops 40px thumbnail faces.
+console.log("\n=== Scenario AH: face-channel fusion policy ===\n");
+
+const { mergeFaceBoxes, coversExistingFace, overlapArea } = await import("../src/shared/face-regions.ts");
+
+const modelBigFace = { x: 300, y: 100, width: 220, height: 220, confidence: 0.93, source: "model" };
+const skinThumbA = { x: 40, y: 520, width: 60, height: 60, confidence: 0.7, source: "skin" };
+const skinThumbB = { x: 700, y: 300, width: 48, height: 48, confidence: 0.6, source: "skin" };
+
+const fusedFaces = mergeFaceBoxes([modelBigFace], [skinThumbA, skinThumbB]);
+ok("a model hit does not suppress the supplementary face channel",
+  fusedFaces.length === 3, JSON.stringify(fusedFaces.map((f) => f.source)));
+ok("supplementary faces survive alongside the model's face",
+  fusedFaces.some((f) => f.source === "skin" && f.x === 40)
+    && fusedFaces.some((f) => f.source === "skin" && f.x === 700));
+
+// The same face seen by two channels must not be redacted twice.
+const skinDuplicate = { x: 310, y: 110, width: 200, height: 200, confidence: 0.5, source: "skin" };
+const fusedDupes = mergeFaceBoxes([modelBigFace], [skinDuplicate, skinThumbA]);
+ok("a skin blob overlapping a detected face is not a second face",
+  fusedDupes.filter((f) => f.source === "model").length === 1
+    && fusedDupes.length === 2, JSON.stringify(fusedDupes));
+ok("overlap coverage is measured against the SMALLER box",
+  coversExistingFace(
+    { x: 320, y: 120, width: 20, height: 20, confidence: 0.5, source: "skin" },
+    [modelBigFace],
+  ));
+ok("overlapArea is zero for disjoint boxes",
+  overlapArea(modelBigFace, skinThumbB) === 0);
+
+// A confident detection is never trimmed to make room for a heuristic guess.
+const manyModelFaces = Array.from({ length: 12 }, (_, i) => ({
+  x: i * 100, y: 0, width: 80, height: 80, confidence: 0.9, source: "model",
+}));
+const manySkin = Array.from({ length: 20 }, (_, i) => ({
+  x: i * 37, y: 400, width: 50, height: 50, confidence: 0.5, source: "skin",
+}));
+const capped = mergeFaceBoxes(manyModelFaces, manySkin);
+ok("every model-detected face is kept",
+  capped.filter((f) => f.source === "model").length === 12);
+ok("supplementary additions are capped so a photo cannot wall the page",
+  capped.filter((f) => f.source === "skin").length <= 8,
+  String(capped.filter((f) => f.source === "skin").length));
+ok("model boxes are ordered largest first",
+  capped[0].width === 80);
+
+// ── Scenario AI: a NER span that is not on the page is not a detection ────
+// Tier-0 spans are scored per page now, but the fusion layer is the last line
+// of defence: nothing downstream can act on a span that is not literally on
+// the page (the tokenizer needs the literal value to replace it, locateSpans
+// needs it to black-box it). Reporting one anyway inflated the detection
+// count with PII the pipeline never handled.
+console.log("\n=== Scenario AI: detection honesty — spans must exist on the page ===\n");
+
+const pageHaystack = "Welcome to YouTube. Recommended: Building with Ollama by Ravi Menon.";
+const fusedPresent = fuseDetections(
+  [],
+  [{ text: "Ravi Menon", label: "PER", score: 0.9 }],
+  pageHaystack,
+);
+ok("a span that IS on the page is still detected",
+  fusedPresent.added === 1 && fusedPresent.detections[0].value === "Ravi Menon");
+const fusedAbsent = fuseDetections(
+  [],
+  [{ text: "Priya Sharma", label: "PER", score: 0.9 }],
+  pageHaystack,
+);
+ok("a stale span from another page is not reported as a detection on this one",
+  fusedAbsent.added === 0, JSON.stringify(fusedAbsent.detections.map((d) => d.value)));
+ok("omitting the haystack keeps the previous behaviour (callers opt in)",
+  fuseDetections([], [{ text: "Ravi Menon", label: "PER", score: 0.9 }]).added === 1);
+
+// ── Scenario AJ: region→image mapping is one function, two capture paths ──
+// A stitched full-page canvas needs the tile scale AND the restored scroll
+// offset. The agent's capture path had it; the inspector's did not, so a
+// full-page inspect painted text-PII boxes at a viewport-relative y on a
+// page-tall image — the misaligned "faces masked, text readable" ledger frame.
+console.log("\n=== Scenario AJ: region→image mapping ===\n");
+
+const { regionMappingFor } = await import("../src/shared/region-mapping.ts");
+
+const viewportMap = regionMappingFor({
+  imageWidth: 1424, dpr: 2, viewportWidth: 712, scrollY: 0, fullPage: false,
+});
+ok("viewport capture scales regions by DPR alone",
+  viewportMap.scale === 2 && viewportMap.offsetY === 0 && viewportMap.mapped === false);
+
+const fullPageMap = regionMappingFor({
+  imageWidth: 712, dpr: 2, viewportWidth: 712, scrollY: 900, fullPage: true,
+});
+ok("full-page capture maps CSS px onto the page-tall canvas",
+  fullPageMap.scale === 1, JSON.stringify(fullPageMap));
+ok("full-page capture offsets regions by the restored scroll position",
+  fullPageMap.offsetY === 900);
+const downscaledPage = regionMappingFor({
+  imageWidth: 356, dpr: 2, viewportWidth: 712, scrollY: 400, fullPage: true,
+});
+ok("a downscaled stitch scales the offset with the image",
+  downscaledPage.scale === 0.5 && downscaledPage.offsetY === 200,
+  JSON.stringify(downscaledPage));
+ok("full-page mapping degrades to viewport mapping without a viewport width",
+  regionMappingFor({ imageWidth: 800, dpr: 1, viewportWidth: 0, scrollY: 500, fullPage: true }).mapped === false);
+
+// ── Scenario AK: planner turns are bounded by silence, not wall clock ──────
+// The screenshot evidence: turn 1 answered at 63s, turn 2 at 88s (a 45s abort
+// plus a 43s retry), then a fixed 45s wall clock cut every later turn
+// mid-reasoning, retried the whole prompt, cut the retry the same way, and left
+// the panel on "retrying once…" with the run never reaching a terminal state.
+// Pin the policy: a slow-but-streaming turn survives, a silent one is retried,
+// a still-streaming turn past the ceiling is reported as a MODEL problem rather
+// than looped forever.
+console.log("\n=== Scenario AK: planner turn liveness policy ===\n");
+
+const {
+  withTurnBudget, newTurnLiveness, turnCutShortMessageFor, isRetryablePlannerError,
+} = await import("../src/background/agent.ts");
+
+const budgetOpts = (messageFor) => ({
+  firstOutputMs: 40, idleMs: 40, maxMs: 150, onTimeout() {}, messageFor,
+});
+
+// A turn that keeps producing deltas past the first-output window must live.
+const streamingLiveness = newTurnLiveness();
+const keepAlive = setInterval(() => {
+  streamingLiveness.lastEventAt = performance.now();
+  streamingLiveness.events++;
+}, 10);
+let streamResolved = false;
+await Promise.race([
+  withTurnBudget(new Promise((r) => setTimeout(() => r("answered"), 220)), streamingLiveness, budgetOpts(() => "should not fire")),
+  new Promise((r) => setTimeout(r, 600)),
+]).then((v) => { streamResolved = v === "answered"; });
+clearInterval(keepAlive);
+ok("a slow turn that keeps streaming is NOT killed (the 63s/88s turns)",
+  streamResolved && streamingLiveness.ended === "settled");
+
+// A turn that never produces output is cut and classified as retryable.
+const silentLiveness = newTurnLiveness();
+let silentReason = "";
+await withTurnBudget(
+  new Promise(() => {}),
+  silentLiveness,
+  budgetOpts((reason, liveness, waited) => turnCutShortMessageFor("NVIDIA test", reason, liveness, waited, 60_000)),
+).catch((err) => { silentReason = err.message; });
+ok("a turn that never answers is cut as 'silent'", silentLiveness.ended === "silent", silentReason);
+ok("the no-output message is still classed as a transient stall (one retry)",
+  isRetryablePlannerError(silentReason));
+
+// A turn that streams and then goes quiet is a dropped connection: retryable.
+const droppedLiveness = newTurnLiveness();
+droppedLiveness.events = 12;
+droppedLiveness.lastEventAt = performance.now() - 5000;
+const droppedMessage = turnCutShortMessageFor("NVIDIA test", "silent", droppedLiveness, 45_000, 60_000);
+ok("a stream that goes quiet is reported as a dropped connection and stays retryable",
+  isRetryablePlannerError(droppedMessage) && /went silent/.test(droppedMessage), droppedMessage);
+
+// A turn still streaming when the ceiling hits is NOT a transient hiccup.
+const ceilingLiveness = newTurnLiveness();
+const ceilingMessage = turnCutShortMessageFor("NVIDIA test", "ceiling", ceilingLiveness, 210_000, 60_000);
+ok("the ceiling message names the real cause (a slow model)",
+  /still streaming/.test(ceilingMessage) && /faster provider/.test(ceilingMessage), ceilingMessage);
+ok("the ceiling message is NOT retryable — no endless 'retrying once…' loop",
+  !isRetryablePlannerError(ceilingMessage));
+
+// And the budget really does end a permanently-streaming turn as 'ceiling'.
+const foreverLiveness = newTurnLiveness();
+const foreverTouch = setInterval(() => {
+  foreverLiveness.lastEventAt = performance.now();
+  foreverLiveness.events++;
+}, 10);
+let ceilingEnding = "";
+await withTurnBudget(
+  new Promise(() => {}),
+  foreverLiveness,
+  budgetOpts((reason, liveness, waited) => turnCutShortMessageFor("NVIDIA test", reason, liveness, waited, 60_000)),
+).catch(() => { ceilingEnding = foreverLiveness.ended; });
+clearInterval(foreverTouch);
+ok("an unbounded stream is stopped at the ceiling, not left running",
+  ceilingEnding === "ceiling", ceilingEnding);
 
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

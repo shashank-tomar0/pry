@@ -13,7 +13,7 @@
  * "redacted" before any bytes leave the device.
  */
 
-import { pcm16ToFloat32, TTS_OUTPUT_FORMAT, ttsRequestBody } from "./voice-core";
+import { DEFAULT_TTS_VOICE_ID, pcm16ToFloat32, TTS_OUTPUT_FORMAT, ttsRequestBody } from "./voice-core";
 
 const TTS_STREAM_URL = (voiceId: string) =>
   `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}/stream`;
@@ -50,6 +50,24 @@ export async function streamTts(
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
+    // 402 is the one users will actually hit: ElevenLabs' free plan rejects
+    // library voices over the API. The raw body says `paid_plan_required`
+    // without explaining that a PREMADE voice fixes it for free.
+    if (res.status === 402) {
+      callbacks.onError?.(
+        "ElevenLabs refuses this voice on the free plan (402 paid_plan_required). " +
+          "Library voices need a paid subscription; set the voice id in PRY's options to a " +
+          `premade voice instead — the default (${DEFAULT_TTS_VOICE_ID}) works on the free plan.`,
+      );
+      return;
+    }
+    if (res.status === 401 || res.status === 403) {
+      callbacks.onError?.(
+        "ElevenLabs rejected the API key for text-to-speech (401 unauthorized). " +
+          "Re-copy it from elevenlabs.io → Profile → API keys into PRY's options and save.",
+      );
+      return;
+    }
     callbacks.onError?.(`ElevenLabs TTS error (${res.status}): ${detail.slice(0, 200)}`);
     return;
   }

@@ -3,9 +3,22 @@
  *
  * Manifest V3 service workers cannot access DOM APIs, WebGPU, or run
  * long-lived inference. This offscreen document provides the environment for:
- *   1. DOM-guided screenshot redaction (blurring/masking PII regions)
- *   2. Face detection (Chrome FaceDetector API → skin-color fallback)
+ *   1. DOM-guided screenshot redaction (masking/blurring PII regions)
+ *   2. Face detection (BlazeFace → Chrome FaceDetector → skin-colour)
  *   3. Canvas-based redaction engine
+ *
+ * Redaction tiers, weakest to strongest:
+ *   - blur      : the soft tier, for non-identifying fields (input_field,
+ *                 credential_label). Deterministic, and escalated to an
+ *                 opaque mask if the adversarial OCR auditor can still read
+ *                 anything inside it (see the escalation pass below).
+ *   - surrogate : real pixels replaced by a synthetic value, for confirmed
+ *                 credential fields.
+ *   - opaque    : zero-entropy solid fill. Used for text PII, and for FACES.
+ *                 Faces are deliberately NOT blurred — blur is recoverable by
+ *                 super-resolution deanonymization (arXiv 2506.12344), and a
+ *                 reversible redaction of a biometric identifier is not a
+ *                 redaction.
  *
  * The key insight: instead of trying to detect PII from the image (which
  * requires heavy ML models), we use the DOM to KNOW where sensitive data
@@ -20,9 +33,10 @@ import { verifyRegions, emptyVerification, detectPIIInText, layoutRegionCrops } 
 import { getSyntheticSurrogate } from "../background/surrogates";
 import { ocrDataUrl } from "./ocr";
 import type { VerificationResult } from "../shared/types";
-import { detectSpans } from "../ml/ner";
-import { classifyInjection } from "../ml/guard";
+import { detectSpans, warmUpNer } from "../ml/ner";
+import { classifyInjection, warmUpGuard } from "../ml/guard";
 import { FilesetResolver, FaceDetector as MpFaceDetector } from "@mediapipe/tasks-vision";
+import { mergeFaceBoxes, type FaceBox } from "../shared/face-regions";
 
 // ─── BlazeFace (real face detection, Tier 0) ────────────────────────────────
 // Replaces the skin-color heuristic as the PRIMARY face channel. The model
@@ -231,9 +245,10 @@ function detectFacesBySkinColor(
         const aspectRatio = regionW / regionH;
 
         // Faces are roughly 1:1 to 1:1.5 aspect ratio. Min size 28px keeps
-        // real faces in thumbnails while dropping tiny avatar icons, and the
-        // cap below stops YouTube-style grids of 14+ thumbnails from turning
-        // the whole page into one giant blur (each also earns a "Face" chip).
+        // real faces in thumbnails while dropping tiny avatar icons. The
+        // per-frame cap on how many of these guesses are ADDED lives in
+        // mergeFaceBoxes (shared policy), never here: this scanner's job is
+        // to report what it sees, not to decide what the pipeline keeps.
         if (aspectRatio > 0.5 && aspectRatio < 2.0 && regionW > 28 && regionH > 28) {
           regions.push({
             x: minX,
@@ -247,9 +262,11 @@ function detectFacesBySkinColor(
     }
   }
 
-  // Merge overlapping regions, then cap the count — a thumbnail grid should
-  // not produce an unbounded wall of face blurs.
-  return mergeOverlappingRegions(regions).slice(0, 8);
+  // Merge regions that are obviously the same blob. Capping how many of
+  // these guesses reach the pipeline happens in mergeFaceBoxes, which can
+  // also see the model's boxes — capping here would throw away a real face
+  // before the channel that trusts it ever looked.
+  return mergeOverlappingRegions(regions);
 }
 
 function mergeOverlappingRegions(
@@ -377,10 +394,17 @@ async function processScreenshot(
   sensitiveRegions: SensitiveRegion[] = [],
   dpr: number = 1,
   privacy?: {
-    blurFaces: boolean;
+    destroyFaces: boolean;
     maskCredentials: boolean;
     showRedactionLabels: boolean;
   },
+  /**
+   * Region→image mapping (see the service worker's captureAndProcessScreenshot):
+   * DPR for viewport captures; tile scale + scroll offset pre-multiplied for
+   * stitched full-page captures.
+   */
+  regionScale: number = dpr,
+  regionOffsetY: number = 0,
 ): Promise<{
   redactedDataUrl: string;
   detections: Array<{
@@ -430,29 +454,60 @@ async function processScreenshot(
   const allDetections: DetectedPII[] = [];
 
   // Scale factor: DOM coordinates are CSS pixels, screenshot is device pixels.
-  const scale = dpr;
+  // Full-page captures fold the tile scale and scroll offset into regionScale
+  // / regionOffsetY so the same mapping covers both capture modes.
+  const scale = regionScale > 0 ? regionScale : dpr;
 
   const maskCredentials = privacy?.maskCredentials !== false;
-  const blurFaces = privacy?.blurFaces !== false;
+  const destroyFaces = privacy?.destroyFaces !== false;
   const showLabels = privacy?.showRedactionLabels === true;
 
   // 1. DOM-guided redaction — redact known sensitive regions.
   for (const region of sensitiveRegions) {
-    // Scale CSS coordinates to device pixels + expand by 4px padding.
+    // Scale CSS coordinates to device pixels + expand by 4px padding. The
+    // scroll offset applies before clamping so a region above the fold of the
+    // restored viewport still lands on the right stitched row.
     const padding = 4 * scale;
     const rx = Math.max(0, Math.round(region.x * scale - padding));
-    const ry = Math.max(0, Math.round(region.y * scale - padding));
+    const ry = Math.max(0, Math.round(region.y * scale + regionOffsetY - padding));
     const rw = Math.min(width - rx, Math.round(region.width * scale + padding * 2));
     const rh = Math.min(height - ry, Math.round(region.height * scale + padding * 2));
 
     if (rw <= 0 || rh <= 0) continue;
 
-    // Solid black box for PII found in plain text (email/phone/id *_text
-    // spans from the pixel channel): the exact-span redaction users expect,
-    // trivially verified by re-OCR, and it reads unambiguously as "this was
-    // redacted". Labels and plain input fields still blur (over-covering a
-    // whole field with a black box destroys layout context). Everything
-    // else — credential/ID *fields* — gets the surrogate inpaint treatment.
+    // Placement per region kind:
+    //   face                 → opaque black fill (same guarantee as the pixel
+    //                          channel; a blurred face is still the face)
+    //   *_text               → solid black box over exactly the PII span
+    //   credential_label /
+    //   input_field          → soft box-blur, escalated if OCR reads it back
+    //   everything else      → surrogate inpaint (real pixels discarded)
+    //
+    // DOM-detected faces (perceive.ts marks avatar/profile images as
+    // `kind: "face"`) used to fall through to the SURROGATE branch: a white
+    // box with a lock glyph. That broke the pipeline's own contract in both
+    // directions — a white box is a reversible redaction for a biometric
+    // identifier, and verifyRegions (DESTROYED_KINDS) then failed the frame,
+    // reporting a leak on a region the pipeline itself had painted white.
+    const isFace = region.kind === "face";
+
+    if (isFace && !destroyFaces) {
+      // Face redaction is switched off by the user: still report the
+      // detection, change nothing. (The pixel channel behaves identically.)
+      allDetections.push({
+        kind: "face",
+        box: {
+          x: (region.x * scale) / width,
+          y: (region.y * scale + regionOffsetY) / height,
+          width: (region.width * scale) / width,
+          height: (region.height * scale) / height,
+        },
+        confidence: 0.95,
+        label: region.label,
+      });
+      continue;
+    }
+
     const solidText = region.kind.endsWith("_text");
     const useBlur =
       region.kind === "credential_label" ||
@@ -462,7 +517,7 @@ async function processScreenshot(
     // gated by the user's maskCredentials toggle. Soft input-field blur always
     // runs (a generic field the user types into is still sensitive), but when
     // masking is off we degrade to blur so the pixels are still protected.
-    if (solidText && maskCredentials) {
+    if (isFace || (solidText && maskCredentials)) {
       // Solid black, zero information left: the span is exactly the PII.
       ctx.fillStyle = "#000000";
       ctx.fillRect(rx, ry, rw, rh);
@@ -490,13 +545,13 @@ async function processScreenshot(
     }
 
     allDetections.push({
-      kind: (region.kind === "credential_label" || region.kind === "input_field") ? "credential" : region.kind as any,
+      kind: isFace ? "face" : (region.kind === "credential_label" || region.kind === "input_field") ? "credential" : region.kind as any,
       // Normalized 0-1 coordinates (same convention as face boxes) so the
       // audit panel can overlay proof markers on the thumbnail regardless of
       // DPR or display size: x_norm = cssPx * dpr / deviceWidth.
       box: {
         x: (region.x * scale) / width,
-        y: (region.y * scale) / height,
+        y: (region.y * scale + regionOffsetY) / height,
         width: (region.width * scale) / width,
         height: (region.height * scale) / height,
       },
@@ -521,20 +576,27 @@ async function processScreenshot(
     }
   }
 
-  // 2. Face detection — BlazeFace (real model) first, Chrome FaceDetector
-  // second, skin-color heuristic as the last-resort fallback.
-  let faceBoxes: Array<{ x: number; y: number; width: number; height: number; confidence: number }> = [];
+  // 2. Face detection — every channel contributes (see shared/face-regions.ts).
+  //
+  // This used to be an EXCLUSIVE chain: `if (faceBoxes.length === 0)` guarded
+  // both fallbacks, so a single BlazeFace hit suppressed the skin-colour pass.
+  // A short-range detector reliably finds one large portrait and reliably
+  // misses 40 px thumbnail faces, so on a video grid the pipeline destroyed the
+  // big face and shipped every small one — the "faces are not being blacked
+  // out" report. Model channels still run only as a pair (Chrome's detector is
+  // the same class of accuracy as BlazeFace and costs a full-image encode).
+  let modelFaces: FaceBox[] = [];
 
   try {
-    faceBoxes = await detectFacesWithBlazeFace(canvas);
-    if (faceBoxes.length > 0) {
-      console.log(`[PRY Offscreen] BlazeFace found ${faceBoxes.length} faces`);
+    modelFaces = (await detectFacesWithBlazeFace(canvas)).map((f) => ({ ...f, source: "model" as const }));
+    if (modelFaces.length > 0) {
+      console.log(`[PRY Offscreen] BlazeFace found ${modelFaces.length} faces`);
     }
   } catch {
     // Fall through to the next channel.
   }
 
-  if (faceBoxes.length === 0) {
+  if (modelFaces.length === 0) {
     const chromeDetector = await getChromeFaceDetector();
     if (chromeDetector) {
       try {
@@ -545,15 +607,16 @@ async function processScreenshot(
         })());
         const faces = await chromeDetector.detect(bitmap);
         bitmap.close();
-        faceBoxes = faces.map((f) => ({
+        modelFaces = faces.map((f) => ({
           x: f.boundingBox.x,
           y: f.boundingBox.y,
           width: f.boundingBox.width,
           height: f.boundingBox.height,
           confidence: 0.95,
+          source: "model" as const,
         }));
-        if (faceBoxes.length > 0) {
-          console.log(`[PRY Offscreen] Chrome FaceDetector found ${faceBoxes.length} faces`);
+        if (modelFaces.length > 0) {
+          console.log(`[PRY Offscreen] Chrome FaceDetector found ${modelFaces.length} faces`);
         }
       } catch {
         // Fall through to skin-color.
@@ -561,31 +624,62 @@ async function processScreenshot(
     }
   }
 
-  if (faceBoxes.length === 0) {
-    // Fallback: skin-color heuristic on the ORIGINAL pixels (not the already
-    // redacted canvas, which may contain black masks).
+  // Always run the supplementary pass, on the ORIGINAL pixels (not the already
+  // redacted canvas, which may contain black masks). It adds faces the model
+  // missed and never removes one the model found.
+  let skinFaces: FaceBox[] = [];
+  try {
     const imageData = originalCtx.getImageData(0, 0, width, height);
-    faceBoxes = detectFacesBySkinColor(imageData, width, height);
-    if (faceBoxes.length > 0) {
-      console.log(`[PRY Offscreen] Skin-color heuristic found ${faceBoxes.length} faces`);
+    skinFaces = detectFacesBySkinColor(imageData, width, height).map((f) => ({ ...f, source: "skin" as const }));
+    if (skinFaces.length > 0) {
+      console.log(`[PRY Offscreen] Skin-colour heuristic found ${skinFaces.length} candidate faces`);
     }
+  } catch {
+    // No supplementary channel — the model's boxes still stand.
   }
 
+  const faceBoxes = mergeFaceBoxes(modelFaces, skinFaces);
+  if (faceBoxes.length > modelFaces.length) {
+    console.log(
+      `[PRY Offscreen] Face channels fused: ${faceBoxes.length} faces ` +
+      `(${modelFaces.length} model + ${faceBoxes.length - modelFaces.length} from skin-colour)`,
+    );
+  }
+
+  // DOM-detected avatar/profile images arrive as `kind: "face"` regions and
+  // are NOT part of faceBoxes (they are DOM regions, painted earlier). They are
+  // handled where they are drawn — see the region loop — so that channel stays
+  // consistent with this one.
+
   for (const face of faceBoxes) {
-    // Expand face box by 20% for better coverage.
-    const expandX = face.width * 0.1;
-    const expandY = face.height * 0.1;
+    // Expand face box for fuller coverage. Slightly wider than before: this is
+    // now a destructive fill, so the chin/jaw/hairline at the edge of the
+    // detector box must be covered too, or the surviving facial outline is
+    // itself identifying.
+    const expandX = face.width * 0.15;
+    const expandY = face.height * 0.15;
     const rx = Math.max(0, Math.round(face.x - expandX));
     const ry = Math.max(0, Math.round(face.y - expandY));
     const rw = Math.min(width - rx, Math.round(face.width + expandX * 2));
     const rh = Math.min(height - ry, Math.round(face.height + expandY * 2));
 
     if (rw > 10 && rh > 10) {
-      if (blurFaces) {
-        // Apply blur to face region (deterministic, verifiable).
-        boxBlurRegion(ctx, rx, ry, rw, rh, 10 * scale);
+      if (destroyFaces) {
+        // `source` only affects reporting: both channels are heuristics, and
+        // both are destroyed the same way.
+        // DESTROY, do not blur. A solid opaque fill leaves zero recoverable
+        // signal: nothing of the original pixels survives to be
+        // super-resolved, deconvolved, or statistically reconstructed. Blur is
+        // a low-pass filter and is invertible given the kernel — which is
+        // exactly what PRY's own threat model (super-resolution de-blurring)
+        // says about everyone else's redaction.
+        //
+        // The fill is pure black so verification can PROVE the outcome: the
+        // region must come back near-uniformly black in the shipped bytes.
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(rx, ry, rw, rh);
 
-        redactionRegions.push({ x: rx, y: ry, width: rw, height: rh, kind: "face", label: "Face detected" });
+        redactionRegions.push({ x: rx, y: ry, width: rw, height: rh, kind: "face", label: "Face destroyed" });
       }
 
       allDetections.push({
@@ -597,80 +691,48 @@ async function processScreenshot(
           height: face.height / height,
         },
         confidence: face.confidence,
-        label: "Face detected",
+        label: destroyFaces ? "Face destroyed (opaque)" : "Face detected",
       });
     }
   }
 
-  // 3. Convert to Blob.
-  const redactedBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.92 });
-  const redactedDataUrl = await blobToDataUrl(redactedBlob);
+  // 3. Convert to Blob. These are `let` because the adversarial auditor may
+  // rebuild and re-encode the image (see the escalation pass below) in which
+  // case the ESCALATED bytes are the ones that ship.
+  let redactedBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.92 });
+  let redactedDataUrl = await blobToDataUrl(redactedBlob);
 
-  // 4. Re-OCR verification — decode the EXACT bytes that will be shipped (the
-  // post-JPEG image) and re-scan every redacted region to prove the redaction
-  // actually worked at the pixel level.
+  // 4. Adversarial verification — decode the EXACT bytes that will be shipped
+  // (the post-JPEG image) and re-scan every redacted region, at the pixel level
+  // and with a real OCR re-read, to prove the redaction worked.
   let verification: VerificationResult = emptyVerification();
   if (redactionRegions.length > 0) {
     try {
-      const redactedBitmap = await createImageBitmap(redactedBlob);
-      const verifyCanvas = new OffscreenCanvas(width, height);
-      const verifyCtx = verifyCanvas.getContext("2d", { willReadFrequently: true })!;
-      verifyCtx.drawImage(redactedBitmap, 0, 0);
-      redactedBitmap.close();
-      const redactedData = verifyCtx.getImageData(0, 0, width, height);
       const originalData = originalCtx.getImageData(0, 0, width, height);
-      verification = verifyRegions(originalData, redactedData, redactionRegions);
+      const first = await verifyShippedImage(redactedBlob, originalData, redactionRegions, width, height);
+      verification = first.result;
 
-      // 5. Real OCR pass scoped to the redacted regions ONLY. The regions are
-      //    composited into one strip (crop layout is pure, in reocr-verification)
-      //    and OCR re-reads that strip. Scanning the whole shipped image would
-      //    flag PII that is legitimately visible elsewhere on the page (an email
-      //    in an inbox row), so leaks are only meaningful inside regions the
-      //    pipeline claimed to redact. Any failure here keeps the pixel result
-      //    — OCR must never discard or downgrade the pixel verification.
-      try {
-        const layout = layoutRegionCrops(redactionRegions);
-        if (layout.slots.length > 0) {
-          const ocrCanvas = new OffscreenCanvas(layout.width, layout.height);
-          const ocrCtx = ocrCanvas.getContext("2d")!;
-          ocrCtx.fillStyle = "#ffffff";
-          ocrCtx.fillRect(0, 0, layout.width, layout.height);
-          const regionBitmap = await createImageBitmap(redactedBlob);
-          for (const slot of layout.slots) {
-            ocrCtx.drawImage(
-              regionBitmap,
-              slot.sx, slot.sy, slot.sw, slot.sh,
-              slot.dx, slot.dy, slot.dw, slot.dh,
-            );
-          }
-          regionBitmap.close();
-
-          const ocrText = await ocrDataUrl(await blobToDataUrl(await ocrCanvas.convertToBlob({ type: "image/jpeg", quality: 0.9 })));
-          if (ocrText) {
-            const ocrLeaks = detectPIIInText(ocrText);
-            verification = {
-              ...verification,
-              ocrRan: true,
-              leakedText: ocrLeaks.length > 0 ? ocrText.slice(0, 300) : undefined,
-            };
-            if (ocrLeaks.length > 0) {
-              verification.verified = false;
-              verification.leakedPatterns = [
-                ...verification.leakedPatterns,
-                ...ocrLeaks.map((l) => `OCR: ${l} still readable inside a redacted region`),
-              ];
-              verification.confidence = Math.min(verification.confidence, 0.3);
-              verification.summary =
-                `WARNING: OCR found ${ocrLeaks.join(", ")} still readable inside a redacted region. ` +
-                `Pixel regions: ${verification.regionsRedacted}/${verification.regionsChecked} confirmed.`;
-            } else {
-              verification.summary =
-                `${verification.summary} OCR re-read the redacted regions and found no readable PII.`;
-            }
-          }
-        }
-      } catch {
-        // OCR is corroboration only — the pixel result above stands.
+      // 5. ESCALATION — the auditor must REMEDIATE, not just complain.
+      //    If OCR could still read PII inside a soft (blur-tier) region, the
+      //    blur is proven insufficient. Rebuild the whole frame from the
+      //    untouched original pixels with every region destroyed, re-encode,
+      //    and verify again. The escalated image is what ships, so the failure
+      //    never reaches the model — and the claim that incomplete redactions
+      //    are elevated to zero-entropy fills is a description of this code
+      //    rather than an aspiration.
+      if (first.ocrLeaks.length > 0) {
+        const escalated = await rebuildWithOpaqueMasks(originalCanvas, redactionRegions, width, height);
+        redactedBlob = escalated.blob;
+        redactedDataUrl = escalated.dataUrl;
+        const second = await verifyShippedImage(redactedBlob, originalData, redactionRegions, width, height);
+        verification = {
+          ...second.result,
+          escalated: true,
+          leakedText: verification.leakedText ?? second.result.leakedText,
+          summary: second.result.verified
+            ? `ESCALATED: OCR found ${first.ocrLeaks.join(", ")} readable in a blurred region, so every region was destroyed and the image re-verified. ${second.result.summary}`
+            : `ESCALATED and still failing: ${second.result.summary}`,
+        };
       }
       console.log(`[PRY Offscreen] Re-OCR verification: ${verification.summary}`);
     } catch (error) {
@@ -704,6 +766,107 @@ async function processScreenshot(
   };
 }
 
+/**
+ * Verify ONE candidate shipped image: pixel checks over every redacted region,
+ * then a real OCR re-read scoped to exactly those regions.
+ *
+ * OCR scoping matters. The regions are composited into one strip (crop layout
+ * is pure, in reocr-verification) and only that strip is read. Scanning the
+ * whole shipped image would flag PII that is legitimately still visible on the
+ * page — an email in an inbox row, a phone number in body text — and turn
+ * every honest run into a false WARNING.
+ *
+ * Returns the pixel result plus whichever OCR leaks were found, so the caller
+ * can decide whether to escalate. Any OCR failure keeps the pixel result: OCR
+ * must never downgrade or discard the pixel verification.
+ */
+async function verifyShippedImage(
+  blob: Blob,
+  originalData: ImageData,
+  regions: Array<{ x: number; y: number; width: number; height: number; kind: string; label: string }>,
+  width: number,
+  height: number,
+): Promise<{ result: VerificationResult; ocrLeaks: string[] }> {
+  const bitmap = await createImageBitmap(blob);
+  const verifyCanvas = new OffscreenCanvas(width, height);
+  const verifyCtx = verifyCanvas.getContext("2d", { willReadFrequently: true })!;
+  verifyCtx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+
+  let result = verifyRegions(originalData, verifyCtx.getImageData(0, 0, width, height), regions);
+  let ocrLeaks: string[] = [];
+
+  try {
+    const layout = layoutRegionCrops(regions);
+    if (layout.slots.length > 0) {
+      const ocrCanvas = new OffscreenCanvas(layout.width, layout.height);
+      const ocrCtx = ocrCanvas.getContext("2d")!;
+      ocrCtx.fillStyle = "#ffffff";
+      ocrCtx.fillRect(0, 0, layout.width, layout.height);
+      const regionBitmap = await createImageBitmap(blob);
+      for (const slot of layout.slots) {
+        ocrCtx.drawImage(
+          regionBitmap,
+          slot.sx, slot.sy, slot.sw, slot.sh,
+          slot.dx, slot.dy, slot.dw, slot.dh,
+        );
+      }
+      regionBitmap.close();
+
+      const ocrText = await ocrDataUrl(await blobToDataUrl(await ocrCanvas.convertToBlob({ type: "image/jpeg", quality: 0.9 })));
+      if (ocrText) {
+        ocrLeaks = detectPIIInText(ocrText);
+        result = {
+          ...result,
+          ocrRan: true,
+          leakedText: ocrLeaks.length > 0 ? ocrText.slice(0, 300) : undefined,
+        };
+        if (ocrLeaks.length > 0) {
+          result.verified = false;
+          result.leakedPatterns = [
+            ...result.leakedPatterns,
+            ...ocrLeaks.map((l) => `OCR: ${l} still readable inside a redacted region`),
+          ];
+          result.confidence = Math.min(result.confidence, 0.3);
+          result.summary =
+            `WARNING: OCR found ${ocrLeaks.join(", ")} still readable inside a redacted region. ` +
+            `Pixel regions: ${result.regionsRedacted}/${result.regionsChecked} confirmed.`;
+        } else {
+          result.summary =
+            `${result.summary} OCR re-read the redacted regions and found no readable PII.`;
+        }
+      }
+    }
+  } catch {
+    // OCR is corroboration only — the pixel result above stands.
+  }
+
+  return { result, ocrLeaks };
+}
+
+/**
+ * Last-resort rebuild: paint the ORIGINAL pixels again and destroy every
+ * region with an opaque fill. Used when OCR proved a soft region was still
+ * readable. Nothing here inspects the original content — the output carries no
+ * signal about what was underneath, which is the whole point.
+ */
+async function rebuildWithOpaqueMasks(
+  originalCanvas: OffscreenCanvas,
+  regions: Array<{ x: number; y: number; width: number; height: number }>,
+  width: number,
+  height: number,
+): Promise<{ blob: Blob; dataUrl: string }> {
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+  ctx.drawImage(originalCanvas, 0, 0);
+  ctx.fillStyle = "#000000";
+  for (const region of regions) {
+    ctx.fillRect(region.x, region.y, region.width, region.height);
+  }
+  const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.92 });
+  return { blob, dataUrl: await blobToDataUrl(blob) };
+}
+
 /** Blob → data URL (used for the shipped JPEG and the OCR crop strip). */
 function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -726,8 +889,10 @@ chrome.runtime.onMessage.addListener(
       height?: number;
       sensitiveRegions?: SensitiveRegion[];
       dpr?: number;
+      regionScale?: number;
+      regionOffsetY?: number;
       privacy?: {
-        blurFaces: boolean;
+        destroyFaces: boolean;
         maskCredentials: boolean;
         showRedactionLabels: boolean;
       };
@@ -750,6 +915,8 @@ chrome.runtime.onMessage.addListener(
         message.sensitiveRegions ?? [],
         message.dpr ?? 1,
         message.privacy,
+        message.regionScale ?? message.dpr ?? 1,
+        message.regionOffsetY ?? 0,
       )
         .then((result) => {
           // Send result back via sendMessage, NOT sendResponse.
@@ -783,6 +950,36 @@ chrome.runtime.onMessage.addListener(
       classifyInjection(message.text)
         .then((verdict) => sendResponse({ ok: true, verdict }))
         .catch((err) => sendResponse({ ok: false, verdict: null, error: String(err) }));
+      return true; // async
+    }
+
+    // ─── On-device ML self-test ───
+    // Loads each model AND runs one real inference, so the transcript can
+    // report "the model works" from evidence rather than from the presence of
+    // a file on disk. BlazeFace is reported from the same channel that the
+    // redaction path uses.
+    if (message.type === "ml-self-test") {
+      (async () => {
+        const out: Record<string, unknown> = {};
+        try {
+          out.ner = await warmUpNer();
+        } catch (err) {
+          out.ner = { ready: false, reason: err instanceof Error ? err.message : String(err) };
+        }
+        try {
+          out.guard = await warmUpGuard();
+        } catch (err) {
+          out.guard = { ready: false, reason: err instanceof Error ? err.message : String(err) };
+        }
+        let face = false;
+        try {
+          face = (await getBlazeFace()) !== null;
+        } catch {
+          face = false;
+        }
+        out.face = { ready: face };
+        sendResponse({ ok: true, result: out });
+      })();
       return true; // async
     }
 

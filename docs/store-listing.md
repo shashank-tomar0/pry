@@ -107,7 +107,7 @@ after launch (recipe in `docs/launch-kit.md` §A6).
 
 ## Pre-submission checklist
 
-1. `npm run verify` passes (324 pipeline + 27 tripwire + 2 OCR assertions) and
+1. `npm run verify` passes (390 pipeline + 27 tripwire + 6 OCR assertions) and
    `npm run build` is clean.
 2. `publish/pry-agent-1.0.0.zip` contains the full `dist/` contents — 80 entries,
    including `models/ner/onnx/model_quantized.onnx` and

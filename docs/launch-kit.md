@@ -30,6 +30,7 @@ npm run build         # every time src/ changes
 npm run verify        # the assertion suite; keep it green before demo
 node scripts/eval-ner.mjs   # real-weights proof the bundled NER extracts names
 node scripts/eval-guard.mjs # honest state of any guard checkpoint; greets nothing when no model is bundled
+node scripts/ocr-test.mjs   # real Tesseract on rendered images: word boxes + frame-text triage
 ```
 
 Load `dist/` as an unpacked extension, reload the extension, then verify the
@@ -103,7 +104,9 @@ worked.
 | ElevenLabs TTS verbal-audit narration | Free-tier premade voice reachable; the narration path produces samples | Validates with a read-page narration when TTS is enabled |
 | On-device ML (Tier 0): BlazeFace, NER, injection guard | Self-test lists which Tier-0 models are loaded; verify suite asserts bridge + offscreen plumbing | The self-test is the honest “is the brain working?” line |
 | Egress meter / wirelog / tripwire | Wirelog + tripwire aggregator verified in `npm run verify` (every outbound request and PII leak shape is audited) | Prerequisites for the “live egress tripwire radar” demo |
-| Privacy ledger + audit screenshots | Privacy ledger verified in `npm run verify` | The ledger holds the audit screenshot for reference |
+| Privacy ledger + audit screenshots | Privacy ledger verified in `npm run verify`; the detected-vs-boxed reconciliation and OCR triage policy are pinned in Scenario AL/AM | "Regions Redacted" counts painted pixel regions; the transcript's text-channel line counts tokenized/replaced values — two channels, two meanings. A detected value that could not be located on screen is reported (masked), never silently assumed covered |
+| Acting on rows with no element id (`click_text`) | Scenario AN pins the matcher, the tool's exposure to the planner, its routing to the page, and the safety gate (blind click refused, irreversible text still confirmed) | The Gmail run failed here: 80 element slots went to sidebar/toolbar/tabs, so no message row was in the page read and the planner re-read until the loop guard fired. Rows, results, cards and menu entries are now clickable by their visible text; the first loop detection injects that advice instead of ending the run |
+| Text inside images / canvas / video (OCR triage) | `node scripts/ocr-test.mjs` proves real Tesseract returns per-word boxes for an email rendered into an image, and that boxing them hides it from a re-read (6 OCR assertions) | On by default (`privacy.scanFrameText`). Runs on the already-redacted frame, so it can only find what no other channel covered. Costs one local OCR pass per capture; a very tall frame is triaged over at most 6 slices and reports PARTIAL rather than implying full coverage |
 
 ### Scribe lifecycle states (free-tier, with a working key)
 

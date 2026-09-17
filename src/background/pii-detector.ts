@@ -28,7 +28,7 @@ export interface BoundingBox {
 }
 
 export interface DetectedPII {
-  kind: "face" | "credential" | "id_number" | "api_key" | "pii_text";
+  kind: "face" | "credential" | "id_number" | "api_key" | "pii_text" | "image_text";
   /** Bounding box for visual redaction (faces). */
   box?: BoundingBox;
   /** The original value that was detected (for DOM-based PII). */

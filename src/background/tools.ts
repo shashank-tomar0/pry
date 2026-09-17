@@ -30,6 +30,25 @@ export const TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: "click_text",
+    description:
+      "Click whatever visible text on screen matches, e.g. an inbox row, a search " +
+      "result, a list item or a menu entry. Use this when the thing you need to " +
+      "click has no element id in the page read — rows and cards often have none. " +
+      "Quote text you can actually see; the topmost match wins, and `index` picks " +
+      "the next match down when several match equally.",
+    parameters: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Visible text of the target, e.g. the row's sender and subject" },
+        index: { type: "number", description: "0-based position among equally-good matches, topmost first" },
+        reason: { type: "string", description: "One short phrase: why this click" },
+      },
+      required: ["text", "reason"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "type",
     description:
       "Type text into a text field, replacing whatever is already there. Set " +
@@ -165,6 +184,7 @@ export const TOOLS: ToolSpec[] = [
 /** Actions that run in the page rather than against the tabs API. */
 export const PAGE_ACTIONS = new Set([
   "click",
+  "click_text",
   "type",
   "select",
   "scroll",

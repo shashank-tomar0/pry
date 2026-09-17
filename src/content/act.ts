@@ -1,6 +1,13 @@
 import type { ActionResult, AgentAction } from "../shared/types";
 import { lookup, snapshot } from "./perceive";
 import { settle, CLICK_CEILING } from "./settle";
+import {
+  pickTextMatch,
+  isClickableTarget,
+  describeTextTarget,
+  normalizeForMatch,
+  type TextRun,
+} from "../shared/text-target";
 
 const fail = (detail: string): ActionResult => ({ ok: false, detail });
 const done = (detail: string): ActionResult => ({ ok: true, detail });
@@ -55,6 +62,199 @@ function findScroller(): HTMLElement | Element {
   }
 
   return doc;
+}
+
+/**
+ * Text runs on screen, each paired with the element a click should target.
+ *
+ * Two candidates are produced per text run: the run's own clickable container
+ * (the nearest `<a>`/`<button>`/`<tr>`/role=… ancestor), and — when the run has
+ * no such ancestor — the run itself. The container carries the row's full text,
+ * which is what lets "Meta — You're on the Muse waitlist" match even though the
+ * sender and the subject are separate spans.
+ */
+interface TextCandidate extends TextRun {
+  element: Element;
+  /** Static flags for the pure matcher / reporting. */
+  tag: string;
+  role: string | null;
+}
+
+/** Caps keep the walk bounded on a huge page (a Gmail inbox is ~10k nodes). */
+const TEXT_TARGET_BUDGET_MS = 1500;
+const TEXT_TARGET_MAX_NODES = 6000;
+const TEXT_TARGET_MAX_RUNS = 400;
+/** How far up from a text node to look for the clickable container. */
+const TEXT_TARGET_CLIMB = 6;
+
+function roleOfElement(el: Element): string | null {
+  const explicit = el.getAttribute("role");
+  if (explicit) return explicit.toLowerCase();
+  const tag = el.tagName.toLowerCase();
+  if (tag === "a" && el.hasAttribute("href")) return "link";
+  if (tag === "button") return "button";
+  if (tag === "option") return "option";
+  return null;
+}
+
+/**
+ * The element that owns a run for clicking purposes.
+ *
+ * Climbing is capped and only accepts containers whose whole text stays short
+ * enough to be a label or a row — otherwise a wrapper `<div>` around the entire
+ * inbox would "own" every message and a click would land in the middle of the
+ * page instead of on the row the text belongs to.
+ */
+function clickableOwner(node: Node): Element | null {
+  let el: Element | null = node.parentElement;
+  let fallback: Element | null = null;
+  for (let depth = 0; el && depth < TEXT_TARGET_CLIMB; depth++, el = el.parentElement) {
+    const tag = el.tagName.toLowerCase();
+    if (tag === "body" || tag === "html" || tag === "main") break;
+    const owner = isClickableTarget(tag, roleOfElement(el), el.hasAttribute("tabindex"));
+    const textLength = (el.textContent ?? "").trim().length;
+    if (owner && textLength <= 240) return el;
+    if (!fallback && textLength <= 240) fallback = el;
+  }
+  return fallback;
+}
+
+/**
+ * Measure visible text runs and the elements that own them.
+ *
+ * Text-node walking (not `innerText`) on purpose: a range gives the exact box
+ * of the words the planner quoted, and skipping off-screen runs means index 0
+ * is the topmost thing the user can actually see.
+ */
+function collectTextCandidates(): TextCandidate[] {
+  const runs: TextCandidate[] = [];
+  const deadline = performance.now() + TEXT_TARGET_BUDGET_MS;
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let node: Node | null;
+  let visited = 0;
+
+  while ((node = walker.nextNode())) {
+    if (runs.length >= TEXT_TARGET_MAX_RUNS) break;
+    if (++visited > TEXT_TARGET_MAX_NODES || performance.now() > deadline) break;
+    const text = (node.textContent ?? "").trim();
+    if (text.length < 2) continue;
+    // Script/style text is never visible; skip it rather than measuring it.
+    const parentTag = node.parentElement?.tagName.toLowerCase();
+    if (!parentTag || parentTag === "script" || parentTag === "style" || parentTag === "noscript") continue;
+
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const rects = Array.from(range.getClientRects()).filter((r) => r.width > 0 && r.height > 0);
+      range.detach?.();
+      for (const rect of rects) {
+        if (rect.top >= innerHeight || rect.bottom <= 0) continue; // off-screen
+        if (rect.left >= innerWidth || rect.right <= 0) continue;
+        const owner = clickableOwner(node);
+        if (!owner) continue;
+        runs.push({
+          text,
+          x: Math.round(rect.left),
+          y: Math.round(rect.top),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          element: owner,
+          tag: owner.tagName.toLowerCase(),
+          role: roleOfElement(owner),
+        });
+      }
+    } catch {
+      // A detached or unmeasurable node — skip it and keep walking.
+    }
+  }
+
+  // A container's OWN text is the best candidate for a row-level query: it is
+  // how "Meta You're on the Muse waitlist" matches even though the sender and
+  // subject are separate text nodes. Dropped for nodes whose text is already
+  // just that container's text (the single-span case).
+  const byOwner = new Map<Element, TextCandidate>();
+  const textsByOwner = new Map<Element, string[]>();
+  for (const run of runs) {
+    if (!byOwner.has(run.element)) byOwner.set(run.element, run);
+    const texts = textsByOwner.get(run.element);
+    if (!texts) textsByOwner.set(run.element, [run.text]);
+    else if (texts[texts.length - 1] !== run.text) texts.push(run.text);
+  }
+  const containerRuns: TextCandidate[] = [];
+  for (const [element, sample] of byOwner) {
+    // Joined from the MEASURED runs rather than `textContent`, and joined with
+    // a space. Minified app markup (Gmail) has no whitespace text nodes between
+    // cells, so textContent gives "MetaYou're on the Muse waitlist1:19 AM" —
+    // which a planner quoting the row naturally, with spaces, cannot match.
+    const text = (textsByOwner.get(element) ?? [sample.text]).join(" ");
+    if (text.length < 2 || text.length > 240) continue;
+    if (text === sample.text) continue;
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    if (rect.top >= innerHeight || rect.bottom <= 0) continue;
+    containerRuns.push({
+      text,
+      x: Math.round(rect.left),
+      y: Math.round(rect.top),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+      element,
+      tag: element.tagName.toLowerCase(),
+      role: roleOfElement(element),
+    });
+  }
+
+  return [...containerRuns, ...runs];
+}
+
+/**
+ * Click whatever on screen says `query`.
+ *
+ * The capability this adds: element ids only exist for elements the page read
+ * selected, and a row driven by a delegated handler has no id to give. The
+ * planner can always see the text, so the text becomes the handle.
+ */
+async function clickByText(
+  query: string,
+  index: number,
+  settleCeiling: number,
+): Promise<ActionResult> {
+  const wanted = query.trim();
+  if (wanted.length < 2) {
+    return fail("click_text needs at least 2 characters of visible text to match.");
+  }
+  const candidates = collectTextCandidates();
+  if (candidates.length === 0) {
+    return fail("No visible text could be measured on this page. Call read_page to see what is there.");
+  }
+  const match = pickTextMatch(candidates, wanted, index);
+  if (!match) {
+    const sample = candidates
+      .slice(0, 6)
+      .map((c) => JSON.stringify(normalizeForMatch(c.text).slice(0, 28)))
+      .join(", ");
+    return fail(
+      `No visible text on screen matches ${JSON.stringify(wanted)}. ` +
+      `Text measured on this frame starts with: ${sample}. ` +
+      `If you are looking for something you can SEE but it is inside another site's popup, ` +
+      `player or embedded frame, it is not reachable from here: use navigate with the target's ` +
+      `URL instead. Otherwise call read_page for the full list.`,
+    );
+  }
+
+  const target = match.run.element;
+  await bringIntoView(target);
+  const reaction = watchMutations();
+  realClick(target);
+  await settle({ ceiling: settleCeiling });
+  const updates = reaction.count();
+  reaction.stop();
+
+  const what = describeTextTarget(match.run.text, match.run.tag, match.run.role);
+  const verdict = updates > 0
+    ? ` Page reacted (${updates} DOM updates).`
+    : " NO visible page reaction — the text may be non-interactive, or the click missed. Call read_page to confirm.";
+  return done(`Clicked ${what} (${match.reason} match).${verdict}`);
 }
 
 function describe(el: Element): string {
@@ -288,6 +488,15 @@ export async function act(action: AgentAction): Promise<ActionResult> {
           ? ` Page reacted (${updates} DOM updates).`
           : " NO visible page reaction — the click may have missed or the control is inert. Call read_page to confirm the state before retrying.";
         return done(`Clicked ${describe(el)}.${verdict}`);
+      }
+
+      case "click_text": {
+        // The handle that exists when no element id does: inbox rows, search
+        // results, list items and menu entries are often not in the page read
+        // at all, but their text is always visible.
+        const text = typeof input.text === "string" ? input.text : "";
+        const index = typeof input.index === "number" ? input.index : 0;
+        return await clickByText(text, index, CLICK_CEILING);
       }
 
       case "type": {

@@ -33,8 +33,8 @@ const PHONE_RE = /(?<!\d)(?:\+91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?!\d)/g;
 /** Honorific followed by capitalised name (Mr. John Doe, Dr. Jane Smith, etc.) */
 const HONORIFIC_NAME_RE = /\b(?:Mr\.|Mrs\.|Ms\.|Miss|Dr\.|Prof\.|Shri|Smt\.)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}\b/g;
 
-/** Cue phrase followed by name (Name: John Doe, Patient: Jane Smith, etc.) */
-const CUE_NAME_RE = /\b(?:Name|Patient|Customer|Employee|Cardholder|Account\s+Holder)\s*:\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b/gi;
+/** Cue phrase followed by name (Name: John Doe, From: Jane Smith, etc.) */
+const CUE_NAME_RE = /\b(?:Name|Patient|Customer|Employee|Cardholder|Account\s+Holder|From|To|Sender|Recipient|Author|User|Contact)\s*:\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b/gi;
 
 /** Checksum-validated ID shapes (formatted or raw where unambiguous). */
 const ID_SHAPES: Array<{ re: RegExp; label: string; validate: (v: string) => boolean }> = [

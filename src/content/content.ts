@@ -12,7 +12,7 @@
 
 import type { ContentRequest, ActionResult } from "../shared/types";
 import { act } from "./act";
-import { snapshot, getSensitiveRegions, locateSpans } from "./perceive";
+import { snapshot, getSensitiveRegions, locateSpans, locateElements } from "./perceive";
 import { beginFullPageCapture, scrollToY, restoreFullPageCapture } from "./fullpage";
 
 chrome.runtime.onMessage.addListener(
@@ -69,6 +69,23 @@ chrome.runtime.onMessage.addListener(
           ok: true,
           detail: "located-spans",
           sensitiveRegions: locateSpans((request as { spans?: string[] }).spans ?? []),
+          dpr: window.devicePixelRatio || 1,
+          scrollY: Math.round(window.scrollY),
+          viewportWidth: window.innerWidth,
+        });
+        return false;
+
+      case "locate-elements":
+        // Detector→pixel bridge: PII the text channels found inside an element
+        // (aria-label, title, input value) has no text node to measure, so it
+        // is located by its registry id instead. Without this the item is
+        // tokenized for the model but stays readable in the frame.
+        sendResponse({
+          ok: true,
+          detail: "located-elements",
+          sensitiveRegions: locateElements(
+            (request as { targets?: Array<{ selector: string; value?: string }> }).targets ?? [],
+          ),
           dpr: window.devicePixelRatio || 1,
           scrollY: Math.round(window.scrollY),
           viewportWidth: window.innerWidth,

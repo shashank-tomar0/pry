@@ -37,6 +37,7 @@ const destroyFacesEl = $<HTMLInputElement>("destroyFaces");
 const maskCredentialsEl = $<HTMLInputElement>("maskCredentials");
 const tokenizePIIEl = $<HTMLInputElement>("tokenizePII");
 const showRedactionLabelsEl = $<HTMLInputElement>("showRedactionLabels");
+const scanFrameTextEl = $<HTMLInputElement>("scanFrameText");
 
 // Vision elements
 const visionEnabledEl = $<HTMLInputElement>("visionEnabled");
@@ -132,6 +133,9 @@ function renderAll(): void {
   maskCredentialsEl.checked = settings.privacy.maskCredentials;
   tokenizePIIEl.checked = settings.privacy.tokenizePII;
   showRedactionLabelsEl.checked = settings.privacy.showRedactionLabels;
+  // Installs saved before this existed have no stored value; the default (on)
+  // is what the checkbox must show, and normaliseSettings already supplies it.
+  scanFrameTextEl.checked = settings.privacy.scanFrameText;
 
   // Vision.
   visionEnabledEl.checked = settings.vision.enabled;
@@ -166,6 +170,7 @@ function captureFields(): void {
   settings.privacy.maskCredentials = maskCredentialsEl.checked;
   settings.privacy.tokenizePII = tokenizePIIEl.checked;
   settings.privacy.showRedactionLabels = showRedactionLabelsEl.checked;
+  settings.privacy.scanFrameText = scanFrameTextEl.checked;
 }
 
 // ─── Event Listeners ───────────────────────────────────────────────────────

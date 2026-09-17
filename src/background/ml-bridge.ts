@@ -9,6 +9,9 @@
 
 import type { NerSpanInput } from "./detector-v2";
 import { ensureOffscreenDocument } from "./offscreen-doc";
+import { sanitizePiiTargets, type PiiTarget } from "../shared/redaction-reconciliation";
+
+export type { PiiTarget };
 
 /**
  * Budget for one offscreen ML round trip (timer starts once the document
@@ -116,6 +119,36 @@ export function getActiveNerSpans(): string[] {
   // Copy: callers (the capture path) must never be able to mutate the state
   // that the next turn's screenshot depends on.
   return [...activeNerSpans];
+}
+
+// ─── Detector → pixel bridge ────────────────────────────────────────────────
+// The same disconnect the NER bridge closed, for the detectors' own findings.
+// The text channels read MORE than rendered text nodes: accessible names,
+// element values and attributes. An email sitting in an account chip's
+// aria-label was therefore detected, tokenized for the model — and left fully
+// readable in the screenshot, because the pixel channel only knew how to box
+// text nodes and form fields. On a real Gmail inbox that showed up as
+// "2 PII detected / 0 items redacted / nothing to verify" while the raw address
+// was plainly visible in the BEFORE/AFTER proof image.
+//
+// Values are located as literal text; selectors resolve to the element's box.
+// Either channel may be empty.
+
+// `PiiTarget` and the target hygiene live in shared/redaction-reconciliation
+// so the policy is unit-testable without chrome or a DOM.
+let activePiiTargets: PiiTarget[] = [];
+
+/**
+ * Remember what the text channels just found, so the next capture can box it.
+ * Values are length-bounded and selectors must match the `[data-pry-id="N"]`
+ * shape our own detectors emit — nothing else is forwarded to a page.
+ */
+export function setActivePiiTargets(targets: PiiTarget[] = []): void {
+  activePiiTargets = sanitizePiiTargets(targets);
+}
+
+export function getActivePiiTargets(): PiiTarget[] {
+  return activePiiTargets.map((t) => ({ ...t }));
 }
 
 export interface MlSelfTest {

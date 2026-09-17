@@ -347,6 +347,11 @@ function setActivePanel(panelId: PanelId | null): void {
   switch (target) {
     case "privacy-audit":
       privacyAuditEl.classList.remove("hidden");
+      // Refresh the ledger here, not from the learning dashboard: the ledger is
+      // a privacy artefact and this is the panel a user opens to see one. It
+      // used to be reachable only from the learning render path (its element
+      // even lived in that panel), so PRIVACY AUDIT appeared to have no ledger.
+      void loadLedger();
       break;
     case "learning-dashboard":
       learningDashboardEl.classList.remove("hidden");
@@ -518,6 +523,9 @@ const KIND_EMOJI: Record<string, string> = {
   api_key: "🗝️",
   pii_text: "📝",
   input_field: "⌨",
+  // PII read out of the frame's pixels — text inside an image, canvas, video
+  // or PDF viewer, which no DOM channel can see.
+  image_text: "🖼️",
 };
 
 function renderPrivacyAudit(audit: {
@@ -543,6 +551,15 @@ function renderPrivacyAudit(audit: {
     confidence: number;
     summary: string;
     timestamp: number;
+    escalated?: boolean;
+    /** What triggered the rebuild — kept apart from what is still leaked. */
+    escalationReasons?: string[];
+    attack?: {
+      ran: boolean;
+      reconstructableRegions: number;
+      uncoveredFaces: number;
+      details: string[];
+    };
   };
 }): void {
   // Summary stats.
@@ -555,7 +572,7 @@ function renderPrivacyAudit(audit: {
     </div>
     <div class="audit-stat">
       <span class="number">${audit.totalRedacted}</span>
-      <span class="label">Items Redacted</span>
+      <span class="label">Regions Redacted</span>
     </div>
     <div class="audit-stat">
       <span class="number">${uniqueTokenCount}</span>
@@ -571,13 +588,36 @@ function renderPrivacyAudit(audit: {
     const leaked = v.leakedPatterns.length > 0
       ? `<div class="verify-leaks">${v.leakedPatterns.map(escapeHtml).join("<br/>")}</div>`
       : "";
+    // The adversarial line states what was PROBED as well as what was found, so
+    // "attacked and clean" is distinguishable from "not attacked". A pass that
+    // cannot be told apart from no pass is not evidence of anything.
+    const attack = v.attack;
+    const attackLine = !attack
+      ? `<div class="verify-meta warn-meta">Adversarial re-check: not run on this frame.</div>`
+      : attack.reconstructableRegions === 0 && attack.uncoveredFaces === 0
+        ? `<div class="verify-meta">Adversarial re-check: attacked the shipped pixels — ${attack.ran ? "no recoverable blur, no uncovered face" : "probe did not complete"}.</div>`
+        : `<div class="verify-meta warn-meta">Adversarial re-check found ${attack.reconstructableRegions} recoverable blur(s)` +
+          `${attack.uncoveredFaces > 0 ? ` and ${attack.uncoveredFaces} face(s) the pipeline had not covered` : ""} — remediated and re-verified.</div>`;
+    const attackDetails = attack && attack.details.length > 0
+      ? `<div class="verify-leaks">${attack.details.map(escapeHtml).join("<br/>")}</div>`
+      : "";
+    // An escalated frame's own leak list is empty BY DESIGN (the leaks were
+    // destroyed), so without this the panel showed a clean pass with no trace of
+    // what the first paint got wrong. Amber, and separate from the open-leak red
+    // list above, because a remediated finding is not an active leak.
+    const escalation = v.escalationReasons && v.escalationReasons.length > 0
+      ? `<div class="verify-escalation">Rebuilt before sending — ${v.escalationReasons.map(escapeHtml).join("<br/>")}</div>`
+      : "";
     verificationEl.innerHTML = `
       <div class="verify-chip ${ok ? "ok" : "warn"}">
-        <span class="verify-badge">${ok ? "✓ VERIFIED" : "⚠ WARNING"}</span>
+        <span class="verify-badge">${v.escalated ? "↻ ESCALATED + VERIFIED" : ok ? "✓ VERIFIED" : "⚠ WARNING"}</span>
         <span class="verify-summary">${escapeHtml(v.summary)}</span>
       </div>
       <div class="verify-meta">re-OCR re-read the shipped image · ${v.regionsRedacted}/${v.regionsChecked} regions confirmed redacted · ${Math.round(v.confidence * 100)}% pixel confidence</div>
+      ${attackLine}
       ${leaked}
+      ${attackDetails}
+      ${escalation}
     `;
   } else if (audit.verification) {
     // Zero regions flagged: nothing was measured, so this is neither a pass
@@ -1226,9 +1266,6 @@ function renderLearningDashboard(stats: {
   } else {
     reflectionEl.innerHTML = "";
   }
-
-  // Privacy ledger.
-  loadLedger();
 }
 
 // ─── Privacy Ledger Display ────────────────────────────────────────────────
@@ -1237,18 +1274,31 @@ async function loadLedger(): Promise<void> {
   const ledgerEl = $("ledger-section");
   const response = (await send({ kind: "get-ledger" })) as any;
   if (!response?.ledgerSummary) {
-    ledgerEl.innerHTML = "";
+    ledgerEl.innerHTML = `<h4>Privacy Ledger</h4><p class="empty-sub">Ledger unavailable — the service worker did not answer. Run a task, then reopen this panel.</p>`;
     return;
   }
   const ls = response.ledgerSummary;
 
-  const chainClass = ls.chainValid ? "verified" : "tampered";
-  const chainLabel = ls.chainValid ? "INTACT" : "TAMPERED";
+  // Three states, not two. "Every digest verified" and "the head's link cannot
+  // be checked because older entries were trimmed" are different facts, and a
+  // badge that renders the second as INTACT is asserting something the check
+  // did not compute (which is what the previous link-only version did).
+  const hashesOk = ls.chainHashesIntact !== false;
+  const headUnknown = ls.chainHeadUnverifiable === true;
+  const chainClass = !hashesOk ? "tampered" : headUnknown ? "partial" : "verified";
+  const chainLabel = !hashesOk ? "TAMPERED" : headUnknown ? "INTACT*" : "INTACT";
+  const chainNote = !hashesOk
+    ? `Hash mismatch: ${escapeHtml((ls.chainReasons ?? [])[0] ?? "an entry does not match its recorded digest")}`
+    : headUnknown
+      ? "Every retained digest verified. Entries past the 500-entry cap were trimmed, so the oldest surviving link cannot be checked."
+      : "Every retained entry re-hashed and matched its recorded digest.";
+
+  const sessionEntries = typeof ls.sessionEntries === "number" ? ls.sessionEntries : 0;
 
   ledgerEl.innerHTML = `
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
       <h4>Privacy Ledger</h4>
-      <button class="btn btn-sm" id="btn-export-ledger" title="Download certified Merkle DAG audit proof as JSON" style="font-size: 11px; padding: 2px 8px; cursor: pointer;">
+      <button class="btn btn-sm" id="btn-export-ledger" title="Download the audit proof (entries + Merkle root over the retained window) as JSON" style="font-size: 11px; padding: 2px 8px; cursor: pointer;">
         📜 Export Proof
       </button>
     </div>
@@ -1256,6 +1306,10 @@ async function loadLedger(): Promise<void> {
       <div class="ledger-stat">
         <span class="number">${ls.totalEntries}</span>
         <span class="label">ENTRIES</span>
+      </div>
+      <div class="ledger-stat" title="Entries written by this session">
+        <span class="number">${sessionEntries}</span>
+        <span class="label">THIS SESSION</span>
       </div>
       <div class="ledger-stat">
         <span class="number">${ls.totalDetections}</span>
@@ -1278,6 +1332,8 @@ async function loadLedger(): Promise<void> {
         <span class="label">CHAIN</span>
       </div>
     </div>
+    <p class="empty-sub" style="margin: 6px 0 0;">${chainNote}</p>
+    <p class="empty-sub" style="margin: 2px 0 0;">Session ${escapeHtml(String(ls.sessionId ?? "unknown"))} · the ledger appends across sessions and holds no raw values.</p>
   `;
 
   $("btn-export-ledger")?.addEventListener("click", async () => {

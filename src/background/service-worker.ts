@@ -11,9 +11,10 @@ import { createTripwireAggregator } from "./tripwire-aggregator";
 import { normaliseSettings } from "../shared/types";
 import { regionMappingFor } from "../shared/region-mapping";
 import { VISION_SUPPORTED } from "./vision";
-import { tokenizer } from "./tokenizer";
+import { tokenizer, maskSample } from "./tokenizer";
 import { clearWire, wireRecords } from "./wire-log";
-import { getActiveNerSpans } from "./ml-bridge";
+import { getActiveNerSpans, getActivePiiTargets } from "./ml-bridge";
+import { findUnlocatedValues } from "../shared/redaction-reconciliation";
 import { ensureOffscreenDocument } from "./offscreen-doc";
 import { runTask } from "./agent";
 import { createPlanner } from "./providers";
@@ -23,7 +24,8 @@ import { getTrajectories, recordTrajectory } from "./trajectories";
 import { saveSession, getSessions, deleteSession, clearHistory } from "./history";
 import { recordExperience, getMemoryStats, getExperiencesForDomain } from "./experience-memory";
 import { reflectOnRun } from "./reflection";
-import { getLedgerSummary, recordRedaction } from "./privacy-ledger";
+import { clearLedger, getLedgerSummary, recordRedaction } from "./privacy-ledger";
+import { applyCaptureEvidence } from "../shared/screenshot-protection";
 import { applyReflectionResults, getLearnedRules, getRulesSummary } from "./learned-rules";
 import type { RunExperience } from "./experience-memory";
 
@@ -198,7 +200,39 @@ async function warmOffscreen(): Promise<void> {
  * is driving — not whatever tab happens to be focused (which would redact and
  * egress the wrong page's pixels if the user switches tabs mid-run).
  */
-async function captureVisibleTab(tabId: number): Promise<{ dataUrl: string; width: number; height: number } | null> {
+type CaptureGeometry = {
+  url: string; scrollX: number; scrollY: number;
+  viewportWidth: number; viewportHeight: number; dpr: number;
+};
+
+async function captureGeometry(tabId: number): Promise<CaptureGeometry | null> {
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({
+        url: location.href, scrollX: window.scrollX, scrollY: Math.round(window.scrollY),
+        viewportWidth: window.innerWidth, viewportHeight: window.innerHeight,
+        dpr: window.devicePixelRatio,
+      }),
+    });
+    return result?.result ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// The capture-protection assembly (formerly `downgradeCaptureProtection`) is
+// `applyCaptureEvidence` in shared/screenshot-protection.ts. It moved because
+// the old helper could only ever WEAKEN evidence: it ran only when there were
+// reasons, and hardcoded every flag false including `mappingValid`, so a
+// verified mapping was reported invalid and the object could never satisfy the
+// egress guard. Assembly now composes the offscreen half with the two facts
+// only this process holds, and geometry validity comes from the caller.
+
+async function captureVisibleTab(tabId: number): Promise<{
+  dataUrl: string; width: number; height: number;
+  geometry: CaptureGeometry | null; captureVerified: boolean;
+} | null> {
   try {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab?.id || !tab.windowId) return null;
@@ -220,7 +254,13 @@ async function captureVisibleTab(tabId: number): Promise<{ dataUrl: string; widt
     }
 
     try {
+      const before = await captureGeometry(tabId);
+      const [activeBefore] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+      if (activeBefore?.id !== tabId) return null;
       const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+      const [activeAfter] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+      if (activeAfter?.id !== tabId) return null;
+      const after = await captureGeometry(tabId);
 
       // Get image dimensions by loading into an offscreen canvas.
       const response = await fetch(dataUrl);
@@ -230,7 +270,14 @@ async function captureVisibleTab(tabId: number): Promise<{ dataUrl: string; widt
       const height = bitmap.height;
       bitmap.close();
 
-      return { dataUrl, width, height };
+      const captureVerified = Boolean(before && after &&
+        JSON.stringify(before) === JSON.stringify(after) &&
+        Number.isFinite(after.scrollX) && Number.isFinite(after.scrollY) &&
+        after.scrollY >= 0 && Number.isFinite(after.dpr) && after.dpr > 0 &&
+        after.viewportWidth > 0 && after.viewportHeight > 0 &&
+        Math.abs(width - after.viewportWidth * after.dpr) <= 1 &&
+        Math.abs(height - after.viewportHeight * after.dpr) <= 1);
+      return { dataUrl, width, height, geometry: after, captureVerified };
     } finally {
       if (previousActiveId !== null) {
         await chrome.tabs.update(previousActiveId, { active: true }).catch(() => undefined);
@@ -260,6 +307,7 @@ async function processScreenshot(
     destroyFaces: boolean;
     maskCredentials: boolean;
     showRedactionLabels: boolean;
+    scanFrameText?: boolean;
   },
   /**
    * Maps region coordinates onto THIS image. Viewport captures use the DPR
@@ -314,6 +362,10 @@ async function processScreenshot(
       regionScale,
       regionOffsetY,
       privacy,
+      // Names the model already found on this page travel with the frame so
+      // in-image text triage can recognise them: a bare name in a photo has no
+      // pattern to match, but it does have this.
+      knownSpans: getActiveNerSpans(),
     });
   });
 }
@@ -321,11 +373,11 @@ async function processScreenshot(
 /**
  * Get sensitive element positions from the content script.
  * Returns bounding boxes of password fields, credit cards, ID numbers, etc.
- * Every round trip is bounded — a hung content script degrades to "no
- * regions" (capture still proceeds) instead of hanging the run forever.
+ * Every round trip is bounded. Missing regions remain available as a local
+ * preview failure, but must downgrade capture protection before egress.
  */
 async function getSensitiveRegions(tabId: number): Promise<{
-  regions: Array<{ x: number; y: number; width: number; height: number; kind: string; label: string }>;
+  regions: Array<{ x: number; y: number; width: number; height: number; kind: string; label: string; value?: string }>;
   dpr: number;
   /** Viewport scroll (CSS px) when the regions were measured — full-page mapping. */
   scrollY: number;
@@ -378,15 +430,28 @@ async function getSensitiveRegions(tabId: number): Promise<{
       await new Promise((r) => setTimeout(r, 100));
     }
 
-    // Fire both region sources in parallel: the DOM/regex channel AND the
-    // NER→pixel bridge (model-found spans located in painted text). locateSpans
-    // only returns rects where that exact text is visible, so spans left over
-    // from a previous page can never over-redact the current one.
+    // Fire the region sources in parallel: the DOM/regex channel, the
+    // NER→pixel bridge (model-found spans located in painted text), and the
+    // detector→pixel bridge (the text channels' own findings, located as text
+    // OR by element, since accessible names and attributes have no text node).
+    // locateSpans/locateElements only return rects where that exact item is
+    // present now, so a value left over from a previous page can never
+    // over-redact the current one.
     const activeNerSpans = getActiveNerSpans();
-    let [result, nerResult] = await Promise.all([
+    const piiTargets = getActivePiiTargets();
+    // One call carries both: NER spans and the detectors' literal values.
+    const locateValues = [...new Set([
+      ...activeNerSpans,
+      ...piiTargets.map((t) => t.value).filter((v): v is string => Boolean(v)),
+    ])];
+    const elementTargets = piiTargets.filter((t) => t.selector) as Array<{ selector: string; value?: string }>;
+    let [result, nerResult, elementResult] = await Promise.all([
       callContent({ kind: "get-sensitive-regions" }),
-      activeNerSpans.length > 0
-        ? callContent({ kind: "locate-spans", spans: activeNerSpans })
+      locateValues.length > 0
+        ? callContent({ kind: "locate-spans", spans: locateValues })
+        : Promise.resolve(null),
+      elementTargets.length > 0
+        ? callContent({ kind: "locate-elements", targets: elementTargets })
         : Promise.resolve(null),
     ]);
 
@@ -411,7 +476,7 @@ async function getSensitiveRegions(tabId: number): Promise<{
       return { regions: [], dpr: 1, scrollY: 0, viewportWidth: 0, failure: why };
     }
     const value = result.value as { sensitiveRegions?: unknown[]; dpr?: number; scrollY?: number; viewportWidth?: number };
-    if (!value?.sensitiveRegions) {
+    if (!Array.isArray(value?.sensitiveRegions)) {
       console.log("[PRY] No sensitive regions returned from content script");
       return {
         regions: [],
@@ -421,21 +486,57 @@ async function getSensitiveRegions(tabId: number): Promise<{
         failure: "the content script returned no region list",
       };
     }
-    const regions = value.sensitiveRegions as Array<{
-      x: number; y: number; width: number; height: number; kind: string; label: string;
+    const failures: string[] = [];
+    // The current wire format cannot attribute results to selectors. A value
+    // found elsewhere (or several boxes for one target) cannot prove coverage.
+    if (elementTargets.length > 0) {
+      failures.push("dom-selector-coverage-unverified");
+    }
+    const checkLocator = (reply: typeof nerResult, required: boolean, name: string) => {
+      if (!required) return;
+      const data = reply?.ok ? reply.value as typeof value | null : null;
+      if (!Array.isArray(data?.sensitiveRegions)) failures.push(`${name}-unavailable`);
+      if (!data || data.dpr !== value.dpr || data.scrollY !== value.scrollY ||
+          data.viewportWidth !== value.viewportWidth) failures.push(`${name}-geometry-mismatch`);
+    };
+    checkLocator(nerResult, locateValues.length > 0, "dom-span-locator");
+    checkLocator(elementResult, elementTargets.length > 0, "dom-element-locator");
+    const regions = [...value.sensitiveRegions] as Array<{
+      x: number; y: number; width: number; height: number; kind: string; label: string; value?: string;
     }>;
     let nerFound = 0;
-    if (nerValue?.sensitiveRegions) {
+    if (Array.isArray(nerValue?.sensitiveRegions)) {
       nerFound = nerValue.sensitiveRegions.length;
       regions.push(...(nerValue.sensitiveRegions as typeof regions));
     }
-    console.log(`[PRY] Content script found ${regions.length} sensitive regions (${nerFound} from on-device NER), DPR=${value.dpr}`);
+    let elementFound = 0;
+    if (elementResult?.ok) {
+      const elValue = elementResult.value as { sensitiveRegions?: unknown[] } | null;
+      if (Array.isArray(elValue?.sensitiveRegions)) {
+        elementFound = elValue.sensitiveRegions.length;
+        regions.push(...(elValue.sensitiveRegions as typeof regions));
+      }
+    }
+    console.log(`[PRY] Content script found ${regions.length} sensitive regions ` +
+      `(${nerFound} from on-device NER, ${elementFound} located by detector element), DPR=${value.dpr}`);
+    const validRegions = regions.filter((region) => region &&
+      [region.x, region.y, region.width, region.height].every(Number.isFinite) &&
+      region.width > 0 && region.height > 0);
+    if (validRegions.length !== regions.length) failures.push("dom-region-geometry-invalid");
+    if (findUnlocatedValues(locateValues.map((value) => ({ value })), validRegions).length > 0) {
+      failures.push("dom-targets-unresolved");
+    }
+    if (!Number.isFinite(value.dpr) || (value.dpr ?? 0) <= 0 ||
+        !Number.isFinite(value.viewportWidth) || (value.viewportWidth ?? 0) <= 0 ||
+        !Number.isFinite(value.scrollY) || (value.scrollY ?? -1) < 0) {
+      failures.push("dom-capture-geometry-missing");
+    }
     return {
-      regions,
-      dpr: value.dpr ?? 1,
-      scrollY: value.scrollY ?? 0,
-      viewportWidth: value.viewportWidth ?? 0,
-      failure: null,
+      regions: validRegions,
+      dpr: value.dpr ?? Number.NaN,
+      scrollY: value.scrollY ?? Number.NaN,
+      viewportWidth: value.viewportWidth ?? Number.NaN,
+      failure: failures.length ? failures.join(", ") : null,
     };
   } catch (err) {
     console.warn("[PRY] getSensitiveRegions failed:", err);
@@ -467,16 +568,21 @@ export async function captureAndProcessScreenshot(
   let rawDataUrl: string | null = null;
   let width = 0;
   let height = 0;
+  let capturedFullPage = false;
+  let captureVerified = false;
+  let geometry: CaptureGeometry | null = null;
 
   if (fullPage) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (tab && tab.windowId) {
       const { captureAndStitchFullPage } = await import("./stitch");
-      const stitchRes = await captureAndStitchFullPage(tabId, tab.windowId);
+      const stitchRes = await captureAndStitchFullPage(tabId, tab.windowId).catch(() => null);
       if (stitchRes) {
         rawDataUrl = stitchRes.dataUrl;
         width = stitchRes.width;
         height = stitchRes.height;
+        capturedFullPage = true;
+        captureVerified = stitchRes.captureVerified === true;
       }
     }
   }
@@ -487,6 +593,8 @@ export async function captureAndProcessScreenshot(
     rawDataUrl = captured.dataUrl;
     width = captured.width;
     height = captured.height;
+    geometry = captured.geometry;
+    captureVerified = captured.captureVerified;
   }
 
   // Sensitive regions + DPR come from the SAME tab we captured.
@@ -508,6 +616,41 @@ export async function captureAndProcessScreenshot(
   const dpr = sensitiveData?.dpr ?? 1;
   const sensitiveRegions = sensitiveData?.regions ?? [];
 
+  // ─── Detected vs actually boxed ───
+  // The text channels read MORE than rendered text: accessible names, element
+  // values, attributes. A value the pixel channel could not place anywhere is
+  // the exact failure this check exists for — it was tokenized for the planner
+  // but stays readable in the frame. Silence about it is how a Gmail inbox
+  // shipped "2 detected / 0 redacted" with the address plainly visible.
+  // Reported, not hidden: an item we cannot locate is a real, residual leak.
+  // A failed region collection is reported separately (see above) — here it
+  // would just produce noise for every detected value.
+  const unlocated = sensitiveData?.failure
+    ? []
+    : findUnlocatedValues(getActivePiiTargets(), sensitiveRegions);
+  // Once per distinct set of leftovers: the same unlocatable name on every
+  // frame of one page is one honest warning, not a wall of them.
+  const unlocatedSignature = unlocated.join("\u0000");
+  if (unlocated.length > 0 && unlocatedSignature !== lastUnlocatedSignature) {
+    lastUnlocatedSignature = unlocatedSignature;
+    // Mask the sample — a warning about leaked PII must not leak it again.
+    const samples = unlocated.slice(0, 3).map(maskSample);
+    console.log(`[PRY] ${unlocated.length} detected item(s) could not be located on screen:`, unlocated);
+    emit({
+      kind: "entry",
+      entry: {
+        id: `unlocated-${Date.now()}`,
+        role: "system",
+        text:
+          `Privacy warning: ${unlocated.length} detected item(s) (${samples.join(", ")}) were found in the page but could not be located on screen, ` +
+          `so they stay readable in this frame even though the planner only saw a token. ` +
+          `Items inside images, canvas or an off-screen element land here.`,
+      },
+    });
+  } else if (unlocated.length === 0) {
+    lastUnlocatedSignature = "";
+  }
+
   // Region→image mapping. Regions are measured in VIEWPORT CSS pixels; a
   // viewport capture is viewport×DPR, so scale = DPR. A stitched full-page
   // capture is the whole PAGE drawn at (canvasWidth / tileWidth) of each
@@ -516,13 +659,41 @@ export async function captureAndProcessScreenshot(
   // offset. Getting this wrong put every text-PII black box at the wrong y in
   // full-page mode (the "faces blurred but text PII elsewhere" ledger view).
   // Shared with the inspector's capture path so the two can never disagree.
-  const { scale: regionScale, offsetY: regionOffsetY, mapped: fullPageImage } = regionMappingFor({
+  const mapping = regionMappingFor({
     imageWidth: width,
-    dpr,
-    viewportWidth: sensitiveData?.viewportWidth ?? 0,
-    scrollY: sensitiveData?.scrollY ?? 0,
-    fullPage: Boolean(fullPage),
+    imageHeight: height,
+    dpr: sensitiveData?.dpr ?? Number.NaN,
+    viewportWidth: sensitiveData?.viewportWidth ?? Number.NaN,
+    scrollY: sensitiveData?.scrollY ?? Number.NaN,
+    fullPage: capturedFullPage,
   });
+  const { scale: regionScale, offsetY: regionOffsetY, mapped: fullPageImage } = mapping;
+  const captureReasons = [...mapping.reasons];
+  // Geometry is verified only when the mapping resolved AND the capture was
+  // confirmed against the page state it was measured from. Tracked as its own
+  // fact rather than inferred from "no reasons were added", because the reason
+  // list also carries coverage problems that are not geometry problems.
+  let geometryConfirmed = mapping.valid && captureVerified;
+  if (!captureVerified) captureReasons.push("capture-verification-missing");
+  const textComplete = Boolean(sensitiveData) && !sensitiveData!.failure;
+  if (!textComplete) {
+    captureReasons.push(`dom-coverage-incomplete: ${sensitiveData?.failure ?? "no response"}`);
+  }
+  if (unlocated.length > 0) captureReasons.push("dom-targets-unresolved");
+  if (capturedFullPage) {
+    // Restored-viewport boxes do not establish coverage of every captured tile.
+    captureReasons.push("fullpage-dom-coverage-unverified");
+  } else {
+    const measuredGeometry = await captureGeometry(tabId);
+    if (!geometry || !measuredGeometry ||
+        JSON.stringify(geometry) !== JSON.stringify(measuredGeometry) ||
+        geometry.dpr !== sensitiveData?.dpr ||
+        geometry.viewportWidth !== sensitiveData?.viewportWidth ||
+        geometry.scrollY !== sensitiveData?.scrollY) {
+      captureReasons.push("capture-dom-geometry-unverified");
+      geometryConfirmed = false;
+    }
+  }
 
   console.log(`[PRY] Screenshot (tab ${tabId}): ${width}x${height} @ ${dpr}x DPR, ${sensitiveRegions.length} sensitive regions found` +
     (fullPageImage ? `, region scale ${regionScale.toFixed(3)}, offset y ${Math.round(regionOffsetY)}px` : ""));
@@ -533,14 +704,29 @@ export async function captureAndProcessScreenshot(
       destroyFaces: privacy.destroyFaces,
       maskCredentials: privacy.maskCredentials,
       showRedactionLabels: privacy.showRedactionLabels,
+      scanFrameText: privacy.scanFrameText,
     },
     regionScale,
     regionOffsetY,
   );
+  // Assemble the egress evidence: the offscreen half (its own scan results)
+  // plus the two facts only this process holds — whether the DOM text channel
+  // completed and whether the region→image geometry was verified. Without this
+  // the object stayed `undefined`, screenshotSendDecision returned
+  // "Protection evidence missing" for every frame, and vision could never ship.
+  processed.protection = applyCaptureEvidence(processed.protection, {
+    textComplete,
+    mappingValid: geometryConfirmed,
+    reasons: captureReasons,
+  });
   return { original: rawDataUrl, processed };
 }
 
 // ─── Privacy Audit Collector ────────────────────────────────────────────────
+
+/** Signature of the last "could not locate this" warning, so it fires once. */
+let lastUnlocatedSignature = "";
+
 
 interface AuditEntry {
   original?: string;
@@ -947,6 +1133,12 @@ chrome.runtime.onMessage.addListener(
           await clearExperienceMemory();
           await clearLearnedRules();
           await chrome.storage.local.remove(LAST_REFLECTION_KEY);
+          // The panel's button says "Reset learning memory (experiences + rules
+          // + ledger)" and this handler did not clear the ledger, so the audit
+          // trail was the one thing a reset could never reset: it grew to its
+          // 500-entry cap forever and every exported proof carried runs the
+          // user believed they had wiped.
+          await clearLedger();
           sendResponse({ ok: true });
         })();
         return true;
@@ -1053,15 +1245,17 @@ chrome.runtime.onMessage.addListener(
             let width = 0;
             let height = 0;
             let tilesCount = 1;
+            let capturedFullPage = false;
 
             if (fullPage) {
               const { captureAndStitchFullPage } = await import("./stitch");
-              const stitchRes = await captureAndStitchFullPage(tabId, tab.windowId);
+              const stitchRes = await captureAndStitchFullPage(tabId, tab.windowId).catch(() => null);
               if (stitchRes) {
                 rawDataUrl = stitchRes.dataUrl;
                 width = stitchRes.width;
                 height = stitchRes.height;
                 tilesCount = stitchRes.tiles;
+                capturedFullPage = true;
               }
             }
 
@@ -1100,9 +1294,14 @@ chrome.runtime.onMessage.addListener(
               imageWidth: width,
               dpr,
               viewportWidth: sensitiveData?.viewportWidth ?? 0,
-              scrollY: sensitiveData?.scrollY ?? 0,
-              fullPage,
+              scrollY: sensitiveData?.scrollY ?? Number.NaN,
+              fullPage: capturedFullPage,
+              imageHeight: height,
             });
+            if (!inspectorMapping.valid || !sensitiveData || sensitiveData.failure) {
+              throw new Error("Screenshot mapping unavailable: " +
+                (sensitiveData?.failure ?? inspectorMapping.reasons.join(", ")));
+            }
             const processed = await processScreenshot(
               rawDataUrl,
               width,

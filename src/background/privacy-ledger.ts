@@ -41,9 +41,43 @@ export interface PrivacyLedger {
     totalRedactions: number;
     totalActions: number;
     verificationPassed: boolean;
-    /** Whether the chain is valid (no tampering). */
+    /** Whether the chain is valid (every digest and every retained link). */
     chainValid: boolean;
+    /** Whether every retained entry still hashes to its recorded digest. */
+    chainHashesIntact: boolean;
+    /**
+     * True when older entries were trimmed, so the first kept entry's link to
+     * its predecessor cannot be checked. Distinct from `chainValid`: an
+     * unverifiable link is not evidence of tampering, and reporting it as
+     * either INTACT or TAMPERED would be a claim we cannot back.
+     */
+    chainHeadUnverifiable: boolean;
+    /** Entries written by the CURRENT session, out of `entries.length`. */
+    sessionEntries: number;
   };
+}
+
+/**
+ * Result of re-deriving the ledger's integrity from the stored bytes.
+ *
+ * `valid` means every retained entry hashes to its recorded digest AND every
+ * retained link matches. The head link is reported separately because a trimmed
+ * log genuinely cannot answer it — conflating "cannot check" with "tampered"
+ * would make the badge cry wolf, and conflating it with "intact" would be the
+ * vacuous check this replaces.
+ */
+export interface ChainVerification {
+  hashesIntact: boolean;
+  linksIntact: boolean;
+  valid: boolean;
+  entries: number;
+  /** `seq` of the first entry whose digest did not match, when one did not. */
+  firstBadSeq?: number;
+  /** True when entries were trimmed, so the head's link is unverifiable. */
+  headLinkUnverifiable: boolean;
+  /** True when the retained head is not the first entry ever written. */
+  trimmed: boolean;
+  reasons: string[];
 }
 
 // ─── Storage ────────────────────────────────────────────────────────────────
@@ -55,6 +89,15 @@ interface LedgerStore {
   entries: LedgerEntry[];
   entryCounter: number;
   lastHash: string;
+  /**
+   * Session boundary, written by `initLedger()` at the start of each run.
+   * Optional because stores written before this existed have no boundary, and
+   * an upgrade must not make an existing ledger unreadable.
+   */
+  sessionId?: string;
+  sessionStartedAt?: number;
+  /** `seq` the current session started at (its first entry's seq). */
+  sessionStartSeq?: number;
 }
 
 /**
@@ -100,12 +143,41 @@ async function sha256(message: string): Promise<string> {
 // ─── Ledger Implementation ──────────────────────────────────────────────────
 
 /**
+ * The exact bytes a `LedgerEntry.hash` is a digest of.
+ *
+ * One function, used by both the writer and the verifier, because the digest is
+ * over a JSON string and JSON preserves key ORDER: if the two ever assembled
+ * this object separately, every entry would fail verification for a reason that
+ * has nothing to do with tampering.
+ */
+function hashContent(entry: Pick<LedgerEntry, "seq" | "timestamp" | "type" | "data" | "prevHash">): string {
+  return JSON.stringify({
+    seq: entry.seq,
+    timestamp: entry.timestamp,
+    type: entry.type,
+    data: entry.data,
+    prevHash: entry.prevHash,
+  });
+}
+
+/**
  * Initialize the ledger for a new session.
- * Loads existing entries from storage and resets for a new session.
+ *
+ * Entry history is APPENDED, not cleared: the ledger is meant to grow across
+ * sessions. What this writes is the boundary of the new session, because
+ * `sessionId` used to be derived from the FIRST ENTRY EVER WRITTEN — so it never
+ * changed, one "session" covered the lifetime of the install, and a per-session
+ * audit proof could not be produced from it at all.
  */
 export async function initLedger(): Promise<void> {
-  // We don't clear existing entries - we append to them.
-  // This way the ledger grows across sessions.
+  const sessionId = `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  await enqueue(async () => {
+    const store = await loadStore();
+    store.sessionId = sessionId;
+    store.sessionStartedAt = Date.now();
+    store.sessionStartSeq = store.entryCounter + 1;
+    await saveStore(store);
+  });
 }
 
 /**
@@ -122,8 +194,7 @@ export async function addEntry(
     const timestamp = Date.now();
 
     // Build the content to hash (excluding hash fields).
-    const content = JSON.stringify({ seq, timestamp, type, data, prevHash: store.lastHash });
-    const hash = await sha256(content);
+    const hash = await sha256(hashContent({ seq, timestamp, type, data, prevHash: store.lastHash }));
 
     const entry: LedgerEntry = {
       seq,
@@ -197,71 +268,132 @@ export async function recordVerification(passed: boolean, regionsChecked: number
 }
 
 /**
- * Get the complete ledger with chain integrity verification.
+ * Re-derive the ledger's integrity from the stored bytes.
+ *
+ * Every retained entry is re-hashed, INCLUDING the first one. The previous
+ * check seeded its expected previous-hash from the stored head (`prevHash =
+ * entries[0].prevHash`), so the comparison for entry 0 was tautological and a
+ * tampered head was structurally invisible — and `getLedgerSummary`, the
+ * function behind the panel's "CHAIN INTACT" badge, re-hashed nothing at all
+ * and only walked links. A badge that asserts more than it computed is worse
+ * than no badge.
  */
-export async function getLedger(): Promise<PrivacyLedger> {
-  const store = await loadStore();
-  const summary = {
+export async function verifyLedgerChain(entries: LedgerEntry[]): Promise<ChainVerification> {
+  const reasons: string[] = [];
+  let hashesIntact = true;
+  let linksIntact = true;
+  let firstBadSeq: number | undefined;
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const expected = await sha256(hashContent(entry));
+    if (expected !== entry.hash) {
+      hashesIntact = false;
+      if (firstBadSeq === undefined) firstBadSeq = entry.seq;
+      // Do NOT push a reason per entry: one tampered entry is one finding.
+      if (reasons.length === 0) {
+        reasons.push(`entry ${entry.seq} does not match its recorded digest`);
+      }
+    }
+    if (i > 0 && entry.prevHash !== entries[i - 1].hash) {
+      linksIntact = false;
+      if (reasons.length === 0) {
+        reasons.push(`entry ${entry.seq} does not link to entry ${entries[i - 1].seq}`);
+      }
+    }
+  }
+
+  const trimmed = entries.length > 0 && entries[0].seq > 1;
+  if (trimmed && reasons.length === 0) {
+    reasons.push(`head link unverifiable: ${entries[0].seq - 1} earlier entr(ies) were trimmed`);
+  }
+
+  return {
+    hashesIntact,
+    linksIntact,
+    valid: hashesIntact && linksIntact,
+    entries: entries.length,
+    firstBadSeq,
+    headLinkUnverifiable: trimmed,
+    trimmed,
+    reasons,
+  };
+}
+
+/** Counts by entry type, shared by both readers. */
+function tally(entries: LedgerEntry[]): {
+  totalSnapshots: number;
+  totalDetections: number;
+  totalTokensCreated: number;
+  totalRedactions: number;
+  totalActions: number;
+  verificationPassed: boolean;
+} {
+  const totals = {
     totalSnapshots: 0,
     totalDetections: 0,
     totalTokensCreated: 0,
     totalRedactions: 0,
     totalActions: 0,
     verificationPassed: true,
-    chainValid: true,
   };
-
-  // Verify chain integrity.
-  let prevHash = store.entries.length > 0 && store.entries[0].seq > 1
-    ? store.entries[0].prevHash
-    : "0".repeat(64);
-  for (const entry of store.entries) {
-    // Check chain link.
-    if (entry.prevHash !== prevHash) {
-      summary.chainValid = false;
-    }
-
-    // Verify hash.
-    const content = JSON.stringify({
-      seq: entry.seq,
-      timestamp: entry.timestamp,
-      type: entry.type,
-      data: entry.data,
-      prevHash: entry.prevHash,
-    });
-    const expectedHash = await sha256(content);
-    if (expectedHash !== entry.hash) {
-      summary.chainValid = false;
-    }
-
-    // Count by type.
+  for (const entry of entries) {
     switch (entry.type) {
-      case "snapshot": summary.totalSnapshots++; break;
-      case "detection": summary.totalDetections += (entry.data.count as number) ?? 0; break;
-      case "tokenize": summary.totalTokensCreated += (entry.data.count as number) ?? 0; break;
-      case "redact": summary.totalRedactions += (entry.data.redactedCount as number) ?? 0; break;
-      case "action": summary.totalActions++; break;
+      case "snapshot": totals.totalSnapshots++; break;
+      case "detection": totals.totalDetections += (entry.data.count as number) ?? 0; break;
+      case "tokenize": totals.totalTokensCreated += (entry.data.count as number) ?? 0; break;
+      case "redact": totals.totalRedactions += (entry.data.redactedCount as number) ?? 0; break;
+      case "action": totals.totalActions++; break;
       case "verification":
-        if (!entry.data.passed) summary.verificationPassed = false;
+        if (!entry.data.passed) totals.verificationPassed = false;
         break;
     }
-
-    prevHash = entry.hash;
   }
+  return totals;
+}
+
+/** Entries written by the current session, given the stored boundary. */
+function sessionEntries(store: LedgerStore): number {
+  const boundary = store.sessionStartSeq;
+  if (typeof boundary !== "number" || !Number.isFinite(boundary)) return 0;
+  return store.entries.filter((e) => e.seq >= boundary).length;
+}
+
+/**
+ * Get the complete ledger with chain integrity verification.
+ */
+export async function getLedger(): Promise<PrivacyLedger> {
+  const store = await loadStore();
+  const chain = await verifyLedgerChain(store.entries);
 
   return {
-    sessionId: `session-${store.entries[0]?.timestamp ?? Date.now()}`,
+    sessionId: store.sessionId ?? `session-${store.entries[0]?.timestamp ?? Date.now()}`,
     entries: store.entries,
-    summary,
+    summary: {
+      ...tally(store.entries),
+      chainValid: chain.valid,
+      chainHashesIntact: chain.hashesIntact,
+      chainHeadUnverifiable: chain.headLinkUnverifiable,
+      sessionEntries: sessionEntries(store),
+    },
   };
 }
 
 /**
- * Get just the summary (lighter than full getLedger, no chain verification).
+ * Get just the summary. Unlike the previous version this DOES verify the
+ * chain, because the panel renders its result as an integrity badge.
  */
 export async function getLedgerSummary(): Promise<{
   totalEntries: number;
   chainValid: boolean;
+  /** Every retained digest re-derived and matched. */
+  chainHashesIntact: boolean;
+  /** Older entries were trimmed, so the head link cannot be checked. */
+  chainHeadUnverifiable: boolean;
+  chainReasons: string[];
+  sessionId: string;
+  /** Entries written by the current session, out of `totalEntries`. */
+  sessionEntries: number;
   totalSnapshots: number;
   totalDetections: number;
   totalRedactions: number;
@@ -270,47 +402,35 @@ export async function getLedgerSummary(): Promise<{
 }> {
   const store = await loadStore();
   const entries = store.entries;
-  let totalSnapshots = 0;
-  let totalDetections = 0;
-  let totalRedactions = 0;
-  let totalActions = 0;
-
-  // Quick chain check (just links, no hash re-verification for speed).
-  // Seed from the first kept entry when older entries were trimmed by the
-  // MAX_ENTRIES cap — a truncated chain's first link points at a dropped
-  // entry, and seeding "0…0" would report TAMPERED forever after entry 501.
-  let chainValid = true;
-  let prevHash =
-    entries.length > 0 && entries[0].seq > 1 ? entries[0].prevHash : "0".repeat(64);
-  for (const entry of entries) {
-    if (entry.prevHash !== prevHash) {
-      chainValid = false;
-    }
-    switch (entry.type) {
-      case "snapshot": totalSnapshots++; break;
-      case "detection": totalDetections += (entry.data.count as number) ?? 0; break;
-      case "redact": totalRedactions += (entry.data.redactedCount as number) ?? 0; break;
-      case "action": totalActions++; break;
-    }
-    prevHash = entry.hash;
-  }
+  const chain = await verifyLedgerChain(entries);
+  const totals = tally(entries);
 
   return {
     totalEntries: entries.length,
-    chainValid,
-    totalSnapshots,
-    totalDetections,
-    totalRedactions,
-    totalActions,
+    chainValid: chain.valid,
+    chainHashesIntact: chain.hashesIntact,
+    chainHeadUnverifiable: chain.headLinkUnverifiable,
+    chainReasons: chain.reasons,
+    sessionId: store.sessionId ?? `session-${entries[0]?.timestamp ?? Date.now()}`,
+    sessionEntries: sessionEntries(store),
+    totalSnapshots: totals.totalSnapshots,
+    totalDetections: totals.totalDetections,
+    totalRedactions: totals.totalRedactions,
+    totalActions: totals.totalActions,
     lastEntryType: entries.length > 0 ? entries[entries.length - 1].type : null,
   };
 }
 
 /**
- * Cryptographic Merkle Proof Generation:
- * Computes a Merkle DAG root from all entry hashes in the ledger.
- * This provides mathematically verifiable, tamper-evident proof
- * suitable for GDPR / HIPAA audit compliance verification.
+ * Merkle root over the entry hashes of the RETAINED ledger window.
+ *
+ * Scope note, because it is easy to overstate: the root is computed over the
+ * entries currently held (capped at MAX_ENTRIES). Once the cap trims the log,
+ * the root changes, so this is a root over a moving window — not an append-only
+ * log's root. It proves that the entries you were given have not been altered;
+ * it does NOT prove that no entry was dropped, and callers must state the
+ * window (see `coverage` in exportCertifiedAuditProof) rather than presenting
+ * the root alone as a compliance artefact.
  */
 export async function computeMerkleRoot(): Promise<string> {
   const store = await loadStore();
@@ -336,19 +456,50 @@ export async function computeMerkleRoot(): Promise<string> {
 export async function exportCertifiedAuditProof(): Promise<{
   sessionId: string;
   generatedAt: number;
+  /** Total entries in the retained window (see `coverage`). */
   totalEntries: number;
+  /** Entries written by the CURRENT session, out of totalEntries. */
+  sessionEntries: number;
   merkleRoot: string;
+  /** True only when every retained digest and link verified. */
   chainValid: boolean;
+  chainHashesIntact: boolean;
+  chainHeadUnverifiable: boolean;
+  chainReasons: string[];
+  /**
+   * What the proof actually covers. Without this the consumer of the file has
+   * no way to know the root is over a trimmed window, or that the head link is
+   * unverifiable because earlier entries were dropped to the cap.
+   */
+  coverage: {
+    retainedFromSeq: number | null;
+    retainedToSeq: number | null;
+    trimmed: boolean;
+    maxEntries: number;
+  };
   entries: LedgerEntry[];
 }> {
+  const store = await loadStore();
   const ledger = await getLedger();
   const merkleRoot = await computeMerkleRoot();
+  const first = store.entries[0];
+  const last = store.entries[store.entries.length - 1];
   return {
     sessionId: ledger.sessionId,
     generatedAt: Date.now(),
     totalEntries: ledger.entries.length,
+    sessionEntries: ledger.summary.sessionEntries,
     merkleRoot,
     chainValid: ledger.summary.chainValid,
+    chainHashesIntact: ledger.summary.chainHashesIntact,
+    chainHeadUnverifiable: ledger.summary.chainHeadUnverifiable,
+    chainReasons: (await verifyLedgerChain(store.entries)).reasons,
+    coverage: {
+      retainedFromSeq: first ? first.seq : null,
+      retainedToSeq: last ? last.seq : null,
+      trimmed: Boolean(first && first.seq > 1),
+      maxEntries: MAX_ENTRIES,
+    },
     entries: ledger.entries,
   };
 }

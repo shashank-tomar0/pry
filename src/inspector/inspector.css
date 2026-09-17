@@ -10,6 +10,8 @@
   --color-hairline: #d2cbba;
   --color-accent: #e23829;
   --color-teal: #00888c;
+  /* Escalation: a recoverable redaction was found and destroyed. */
+  --color-amber: #9a6b12;
 
   --font-display: "Big Shoulders Display", sans-serif;
   --font-body: "Fraunces", Georgia, serif;
@@ -230,6 +232,16 @@ select {
   border-color: var(--color-accent);
 }
 .residual.dirty strong { color: var(--color-accent); }
+/* Escalated: neither a plain pass nor a leak. The auditor recovered something
+   from a soft redaction, destroyed it, and re-verified — the frame shown is the
+   rebuilt one, and the fact that the first paint was insufficient is exactly
+   what an audit exists to record. Amber, not red (the leak is remediated) and
+   not teal (nothing here was "clean" on the first attempt). */
+.residual.escalated {
+  background: #fff8e6;
+  border-color: var(--color-amber);
+}
+.residual.escalated strong { color: var(--color-amber); }
 .residual strong {
   font-family: var(--font-display);
   font-size: 18px;

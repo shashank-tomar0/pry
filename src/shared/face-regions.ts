@@ -38,7 +38,7 @@ export interface FaceBox {
 export const FACE_DUPLICATE_COVERAGE = 0.3;
 
 /** How many skin-colour additions are allowed on top of the model's boxes. */
-export const MAX_SKIN_FACE_ADDITIONS = 8;
+export const MAX_SKIN_FACE_ADDITIONS = 16;
 
 /** Intersection area of two rectangles (0 when they do not overlap). */
 export function overlapArea(a: FaceBox, b: FaceBox): number {

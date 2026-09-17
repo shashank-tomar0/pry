@@ -10,7 +10,7 @@ let registry: Element[] = [];
 
 const MAX_ELEMENTS = 80;
 const MAX_NAME = 60;
-const MAX_TEXT = 2000;
+const MAX_TEXT = 6000;
 
 const INTERACTIVE_SELECTOR = [
   "a[href]",
@@ -248,8 +248,9 @@ function valueOf(el: Element): string | undefined {
 /** Visible text of the main content area, for questions the DOM skeleton can't answer. */
 function pageText(): string {
   const main =
-    document.querySelector("main") ??
     document.querySelector("[role=main]") ??
+    document.querySelector("main") ??
+    document.querySelector("div.AO") ??
     document.querySelector("article") ??
     document.body;
   const text = clean((main as HTMLElement).innerText ?? "");
@@ -478,12 +479,59 @@ export function getSensitiveRegions(): SensitiveRegion[] {
   const idRegions = findTextRegions();
   regions.push(...idRegions);
 
-  // 4. Detect profile/avatar images that likely contain faces.
-  const profileImages = document.querySelectorAll('img[src*="avatar"], img[src*="profile"], img[src*="photo"], img[alt*="profile"], img[alt*="avatar"], [role="img"][aria-label*="profile"], [role="img"][aria-label*="avatar"]');
-  for (const el of Array.from(profileImages)) {
+  // 3b. Webmail and account contact chips (Gmail, Outlook sender/recipient spans)
+  const contactChips = document.querySelectorAll('[email], [data-hovercard-id*="@"], span.zF, span.bA4, span.yP');
+  for (const el of Array.from(contactChips)) {
+    if (processedElements.has(el)) continue;
     if (!isVisible(el)) continue;
     const rect = el.getBoundingClientRect();
-    if (rect.width < 20 || rect.height < 20) continue;
+    if (rect.width < 10 || rect.height < 5) continue;
+    processedElements.add(el);
+    const emailVal = el.getAttribute("email") || el.getAttribute("data-hovercard-id") || el.textContent?.trim() || "";
+    regions.push({
+      x: Math.round(rect.left),
+      y: Math.round(rect.top),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+      kind: "email_text",
+      label: "Sender/contact",
+      value: emailVal || undefined,
+    });
+  }
+
+  // 4. Detect profile/avatar images that likely contain faces across Google, YouTube, and the web.
+  const profileSelectors = [
+    'img[src*="avatar"]', 'img[src*="profile"]', 'img[src*="photo"]',
+    'img[alt*="profile" i]', 'img[alt*="avatar" i]',
+    '[role="img"][aria-label*="profile" i]', '[role="img"][aria-label*="avatar" i]',
+    // Google Account avatars (Gmail, Google, Docs, Drive)
+    'img[src*="googleusercontent.com"]',
+    'a[aria-label*="Google Account" i] img',
+    '[aria-label*="Google Account" i] img',
+    'img.gb_m', '.gb_Fa img', '.gb_d img',
+    // YouTube user and channel avatars
+    'img[src*="yt3.ggpht.com"]',
+    '#avatar-btn img', '#avatar-link img', 'yt-img-shadow img',
+    // Social / CDNs
+    'img[src*="githubusercontent.com"]',
+    'img[src*="gravatar.com"]',
+    'img[src*="twimg.com/profile_images"]',
+    'img[src*="licdn.com/dms/image"]',
+    'img[src*="cdn.discordapp.com/avatars"]',
+    // Class names and data attributes
+    'img[class*="avatar" i]', 'img[class*="profile" i]', 'img[class*="user-photo" i]',
+    '[data-testid*="avatar" i] img', '[data-testid*="profile" i] img',
+    // Wrapper account buttons
+    'button[aria-label*="profile" i] img', 'button[aria-label*="avatar" i] img',
+    'button[aria-label*="account" i] img',
+    'a[aria-label*="profile" i] img', 'a[aria-label*="account" i] img',
+  ];
+  const profileImages = document.querySelectorAll(profileSelectors.join(", "));
+  for (const el of Array.from(profileImages)) {
+    if (processedElements.has(el)) continue;
+    if (!isVisible(el)) continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 16 || rect.height < 16) continue;
     // Only square-ish images (aspect ratio 0.5-2.0) are likely faces.
     const aspect = rect.width / rect.height;
     if (aspect < 0.5 || aspect > 2.0) continue;
@@ -496,6 +544,36 @@ export function getSensitiveRegions(): SensitiveRegion[] {
       kind: "face",
       label: "Profile/avatar image",
     });
+  }
+
+  // 4b. Circular avatar detector for modern web apps with CSS rounded avatars
+  const candidateCircular = document.querySelectorAll('img, [role="img"]');
+  for (const el of Array.from(candidateCircular)) {
+    if (processedElements.has(el)) continue;
+    if (!isVisible(el)) continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 18 || rect.width > 120 || rect.height < 18 || rect.height > 120) continue;
+    const isSquare = Math.abs(rect.width - rect.height) <= 6;
+    if (!isSquare) continue;
+
+    try {
+      const style = window.getComputedStyle(el);
+      const isCircular = style.borderRadius === "50%" || style.borderRadius.includes("9999px");
+      const inAccountNav = el.closest('header, nav, [role="banner"], [aria-label*="account" i], [aria-label*="user" i], [aria-label*="profile" i], #masthead, .gb_d') !== null;
+      if (isCircular && inAccountNav) {
+        processedElements.add(el);
+        regions.push({
+          x: Math.round(rect.left),
+          y: Math.round(rect.top),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          kind: "face",
+          label: "Profile/avatar image",
+        });
+      }
+    } catch {
+      // getComputedStyle error guard
+    }
   }
 
   // On-screen receipt (the user-facing box): shows how many sensitive items
@@ -602,6 +680,9 @@ export function locateSpans(spans: string[]): SensitiveRegion[] {
               height: Math.round(rect.height),
               kind: "ner_text",
               label: `NER: ${span.slice(0, 24)}`,
+              // The literal value, so the service worker can reconcile
+              // "detected" against "actually boxed" and report the items that
+              // could not be located instead of claiming full coverage.
               value: span,
             });
           }
@@ -626,6 +707,73 @@ export function locateSpans(spans: string[]): SensitiveRegion[] {
   }
 
   return regions;
+}
+
+/**
+ * Element-anchored regions for detector-found PII.
+ *
+ * Text-node scanning cannot see PII that lives somewhere else: an account
+ * chip's `aria-label` ("Google Account: Ada Lovelace (ada@example.com)"), a
+ * `title` attribute, an input's current value. The text channels see those —
+ * `snapshot()` reads accessible names, values and attributes, and the
+ * detectors flag them — but the pixel channel had no way to draw a box for
+ * them. The item was therefore tokenized for the model while staying fully
+ * readable in the screenshot: exactly the "2 detected, 0 redacted" ledger.
+ *
+ * The detector carries the element's registry id (the same id `act.ts` drives
+ * through `resolveElement`), so this resolves it to a live element and returns
+ * its box. Ids are validated, capped, and re-checked for connectivity — a
+ * stale id from a previous page can never paint a box on this one.
+ */
+export function locateElements(targets: PiiElementTarget[]): SensitiveRegion[] {
+  const regions: SensitiveRegion[] = [];
+  const wanted = (targets ?? []).slice(0, 24);
+  if (wanted.length === 0) return regions;
+
+  for (const target of wanted) {
+    const id = elementIdFromSelector(target?.selector ?? "");
+    if (id === null) continue;
+    const el = registry[id];
+    // `isConnected` rejects an element the page has since replaced; the id
+    // space is rebuilt on every snapshot, so this is the cheapest staleness
+    // check available.
+    if (!el || !el.isConnected || !isVisible(el)) continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) continue;
+    if (rect.top >= innerHeight || rect.bottom <= 0) continue;
+    regions.push({
+      x: Math.round(rect.left),
+      y: Math.round(rect.top),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+      kind: "pii_field",
+      label: `Detected PII element [${id}]`,
+      // Carried through so the service worker can attribute this box to the
+      // value it covers, instead of reporting the value as unlocatable.
+      value: target.value,
+    });
+  }
+
+  return regions;
+}
+
+/** One element to box, with the value the detector read out of it. */
+export interface PiiElementTarget {
+  selector: string;
+  value?: string;
+}
+
+/**
+ * Split an element selector produced by the detector (`[data-pry-id="12"]`)
+ * back into its registry id. Selectors are generated by our own code, but they
+ * arrive over a message channel, so anything else is rejected rather than
+ * trusted.
+ */
+export function elementIdFromSelector(selector: string): number | null {
+  const match = /^\[data-pry-id="(\d{1,6})"\]$/.exec(selector.trim());
+  if (!match) return null;
+  const id = Number(match[1]);
+  return Number.isInteger(id) ? id : null;
 }
 
 function getSensitiveKind(el: Element): string {

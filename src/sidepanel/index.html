@@ -130,7 +130,6 @@
       <div id="learning-lessons" class="learning-lessons"></div>
       <div id="learning-trajectories" class="learning-trajectories"></div>
       <div id="learning-reflection" class="learning-reflection"></div>
-      <div id="ledger-section" class="ledger-section"></div>
     </div>
 
     <!-- ─── Privacy Audit Panel ─────────────────────────────────────── -->
@@ -144,6 +143,11 @@
       <div id="audit-screenshots" class="audit-screenshots"></div>
       <div id="audit-detections" class="audit-detections"></div>
       <div id="audit-tokens" class="audit-tokens"></div>
+      <!-- The ledger belongs with the privacy surface, not the learning one.
+           It used to live inside #learning-dashboard, and loadLedger() was only
+           reachable from the learning render path, so opening PRIVACY AUDIT
+           showed no ledger at all. -->
+      <div id="ledger-section" class="ledger-section"></div>
     </div>
 
     <!-- Zoom lightbox: click any audit image to inspect it at full size.

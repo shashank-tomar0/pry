@@ -1134,6 +1134,21 @@ body::after {
   font-size: 8px;
   color: #b91c1c;
 }
+/* A finding from the adversarial pass. Amber, not red: the escalation already
+   remediated it, so this is a record of what was caught, not an open leak — the
+   two states must not look alike in an audit panel. */
+.verify-meta.warn-meta {
+  color: #9a6b12;
+}
+/* Why a frame was rebuilt before shipping. Amber, and deliberately distinct
+   from the red open-leak list: this is what the first paint got wrong, already
+   remediated in the bytes on screen. */
+.verify-escalation {
+  margin-top: 3px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  color: #9a6b12;
+}
 
 /* Zoom lightbox. */
 .zoom-modal {
@@ -1576,6 +1591,10 @@ body::after {
 }
 .ledger-stat .number.verified { color: var(--color-teal); }
 .ledger-stat .number.tampered { color: var(--color-accent); }
+/* Partial: every retained digest verified, but entries past the cap were
+   trimmed so the oldest surviving link is unverifiable. Neither INTACT nor
+   TAMPERED is an honest label for that, so it gets its own colour. */
+.ledger-stat .number.partial { color: #b45309; }
 
 .ledger-entries {
   max-height: 120px;

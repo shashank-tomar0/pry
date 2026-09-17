@@ -19,13 +19,16 @@ import type {
   TranscriptEntry,
   VerificationResult,
 } from "../shared/types";
+import { sendProtectedScreenshot } from "../shared/screenshot-egress";
+import type { ProcessedScreenshotResult } from "../shared/types";
+
 import { SYSTEM_PROMPT, SYSTEM_PROMPT_LOCAL, taskPrompt } from "./prompt";
 import { TOOLS, PAGE_ACTIONS } from "./tools";
 import { TabController, execute, isRestricted } from "./executor";
 import { detectInjection, gate } from "./safety";
 import { detectAllPIIDetailed } from "./pii-detector";
 import { redactSnapshot } from "./redaction";
-import { tokenizer, repairTokenConcatenation } from "./tokenizer";
+import { tokenizer, repairTokenConcatenation, maskSample, buildTokenLegend } from "./tokenizer";
 import { tryDeterministic } from "./deterministic";
 import { createPlanner } from "./providers";
 import type { ConvMessage, ToolOutcome } from "./providers/types";
@@ -41,7 +44,8 @@ import type { DetectedPII } from "./pii-detector";
 import { observeWithVision, VISION_SUPPORTED, VISION_DEFAULT_MODELS } from "./vision";
 import { recordWire, tokensIn, scanForLeaks } from "./wire-log";
 import { matchPiiInText } from "../shared/text-pii-patterns";
-import { requestMlNer, requestMlGuard, setActiveNerSpans, probeMlFiles, selfTestMl } from "./ml-bridge";
+import { requestMlNer, requestMlGuard, setActiveNerSpans, setActivePiiTargets, type PiiTarget, probeMlFiles, selfTestMl } from "./ml-bridge";
+import { appSwitcherRefusal } from "../shared/route-guard";
 import { fuseDetections, type NerSpanInput } from "./detector-v2";
 import {
   initLedger, recordSnapshot, recordDetections,
@@ -178,6 +182,7 @@ const AUDIT_KIND_LABELS: Record<string, string> = {
   api_key: "API key",
   pii_text: "PII text",
   face: "Face",
+  image_text: "PII in image (OCR)",
 };
 
 /** Map DOM sanitize detections into the audit shape so the proof view shows
@@ -204,9 +209,20 @@ function sanitizeSnapshot(
 ): {
   sanitized: PageSnapshot;
   piiCount: number;
+  /** Splits of `piiCount`: vault-tokenized items vs [REDACTED] replacements. */
+  tokenCount: number;
+  textRedactedCount: number;
   detections: Array<{ kind: string; method: string; confidence: number }>;
   suppressed: Array<{ kind: string; method: string; confidence: number; value?: string }>;
   rejected: Array<{ kind: string; method: string; confidence: number; value?: string }>;
+  /**
+   * What the detectors kept this snapshot, as value/selector pairs. The
+   * screenshot path needs them: the text channels read accessible names,
+   * element values and attributes, which the pixel channel cannot see on its
+   * own. Without them a detected item is tokenized for the model but stays
+   * readable in the frame ("2 detected / 0 redacted").
+   */
+  piiTargets: PiiTarget[];
 } {
   // 1. Detect PII: validated regex patterns + contextual analysis. Aadhaar
   //    lookalikes that fail Verhoeff and card lookalikes that fail Luhn are
@@ -306,6 +322,8 @@ function sanitizeSnapshot(
       text,
     },
     piiCount: tokenized.tokenCount + redactedCount,
+    tokenCount: tokenized.tokenCount,
+    textRedactedCount: redactedCount,
     detections: [
       ...keptRegex.map((d) => ({ kind: d.kind, method: "regex", confidence: d.confidence })),
       ...keptContextual.map((d) => ({ kind: d.kind, method: "contextual", confidence: d.confidence })),
@@ -318,6 +336,12 @@ function sanitizeSnapshot(
       confidence: r.confidence,
       value: r.value,
     })),
+    // What the detectors kept (tokenized or [REDACTED] in the text channel),
+    // each with the element it came from when there was one — the capture path
+    // locates these as text and/or as an element box.
+    piiTargets: [...keptRegex, ...keptContextual]
+      .map((d) => ({ value: d.value, selector: d.elementSelector }))
+      .filter((t) => Boolean(t.value || t.selector)),
   };
 }
 
@@ -439,20 +463,26 @@ export async function runTask(
    * description into `fallback`. Best-effort by design: any failure degrades
    * to the DOM-only observation and never blocks the run.
    */
-  async function observeScreen(redactedDataUrl: string, fallback: string): Promise<string> {
-    if (!visionEnabled || !visionApiKey) return fallback;
+  async function observeScreen(processed: ProcessedScreenshotResult, fallback: string): Promise<{ text: string; shipped: boolean }> {
+    if (!visionEnabled || !visionApiKey || signal.aborted) return { text: fallback, shipped: false };
     const context = snapshot ? renderSnapshot(snapshot) : `URL: ${sanitizeUrl(tab.url ?? "")}`;
     try {
-      const vision = await observeWithVision(
-        settings.provider, visionModel, visionApiKey, redactedDataUrl, context, signal,
-      );
+      const outcome = await sendProtectedScreenshot(processed, (dataUrl) => observeWithVision(
+        settings.provider, visionModel, visionApiKey, dataUrl, context, signal,
+      ));
+      if (!outcome.sent) {
+        emit({ kind: "entry", entry: { id: nextId(), role: "system", text: `Screenshot withheld: ${outcome.reasons.join("; ")}. Continuing without image.` } });
+        return { text: fallback, shipped: false };
+      }
+      const vision = outcome.value;
       sessionEgressBytes += vision.bytes;
       estimatedTokens += Math.ceil(vision.bytes / 4);
       emit({ kind: "egress", bytes: sessionEgressBytes });
-      return `${fallback}\n\n[VLM observation (${vision.model}): ${vision.text}]`;
-    } catch (error) {
-      const reason = error instanceof Error ? error.message.slice(0, 140) : "vision unavailable";
-      return `${fallback}\n\n[VLM observation unavailable: ${reason}]`;
+      return { text: `${fallback}\n\n[VLM observation (${vision.model}): ${vision.text}]`, shipped: true };
+    } catch {
+      // A provider error may occur after request bytes left. Do not infer
+      // "not sent" from an empty response or put provider error bodies in context.
+      return { text: fallback, shipped: true };
     }
   }
 
@@ -675,9 +705,13 @@ export async function runTask(
     // Tier-0 models score THIS page (see refreshTier0).
     await refreshTier0(snapshot.text);
 
-    const { sanitized, piiCount, detections, suppressed, rejected } = sanitizeSnapshot(snapshot, sanitizeCtx);
+    const { sanitized, piiCount, tokenCount, textRedactedCount, detections, suppressed, rejected, piiTargets } = sanitizeSnapshot(snapshot, sanitizeCtx);
     snapshot = sanitized;
     lastDomDetections = detections;
+    // Hand the pixel channel the same items the text channel just found —
+    // otherwise an email the detector read out of an aria-label is tokenized
+    // for the model while staying readable in the screenshot.
+    setActivePiiTargets(piiTargets);
 
     // Record detections in privacy ledger.
     if (detections.length > 0) {
@@ -728,12 +762,19 @@ export async function runTask(
     }
 
     if (piiCount > 0) {
+      // Say which channel did what. This used to read "detected and redacted
+      // N sensitive item(s)", which was true of the TEXT channel and was read
+      // as a claim about the pixels — so a frame with 0 black boxes next to a
+      // "redacted 2" line looked like the pipeline lying rather than like two
+      // different channels. Pixel redaction is reported by the capture path.
       emit({
         kind: "entry",
         entry: {
           id: nextId(),
           role: "system",
-          text: `Privacy: detected and redacted ${piiCount} sensitive item(s) from page context.`,
+          text:
+            `Privacy (text channel): ${piiCount} sensitive item(s) in page context — ` +
+            `${tokenCount} tokenized for the planner, ${textRedactedCount} replaced with [REDACTED] in the text it reads.`,
         },
       });
     }
@@ -783,8 +824,9 @@ export async function runTask(
         // shipped instead of assuming it did.
         let shippedToModel = false;
         if (visionEnabled && visionApiKey && !signal.aborted) {
-          initialVisionNote = await observeScreen(processed.redactedDataUrl, "");
-          shippedToModel = initialVisionNote.length > 0;
+          const described = await observeScreen(processed, "");
+          initialVisionNote = described.text;
+          shippedToModel = described.shipped;
         }
 
         // Record for privacy audit — DOM textual detections AND visual ones,
@@ -806,14 +848,29 @@ export async function runTask(
 
   // Tokenize PII in the user's task (same vault as page PII).
   // This ensures the LLM sees <ORG_3> in both the task and the page.
-  const { task: tokenizedTask, tokenCount: taskTokenCount } = tokenizer.tokenizeTask(task);
+  const { task: tokenizedTask, tokenCount: taskTokenCount, newEntries: taskTokens } =
+    tokenizer.tokenizeTask(task);
   if (taskTokenCount > 0) {
+    // Name what was taken, in masked form. "tokenized 1 PII item" left the user
+    // unable to tell whether PRY had redacted their address or garbled their
+    // instruction — a redaction visible only as a count is indistinguishable
+    // from the agent misreading the request. maskSample keeps the raw value out
+    // of the transcript while making the SUBSTITUTION legible: the user sees
+    // which words of their own sentence the model never received.
+    const shown = taskTokens
+      .slice(0, 4)
+      .map((e) => `"${maskSample(e.original)}" → ${e.token}`)
+      .join(", ");
+    const more = taskTokens.length > 4 ? ` (+${taskTokens.length - 4} more)` : "";
     emit({
       kind: "entry",
       entry: {
         id: nextId(),
         role: "system",
-        text: `Task privacy: tokenized ${taskTokenCount} PII item(s) in your request.`,
+        text:
+          `Task privacy: ${taskTokenCount} value(s) replaced before the model saw your request — ` +
+          `${shown}${more}. The token is swapped back automatically when an action types it, ` +
+          `so the task still uses your real value.`,
       },
     });
   }
@@ -888,7 +945,14 @@ export async function runTask(
         (historyBlock ? `${historyBlock}\n\n` : "") +
         (lessonsBlock ? `${lessonsBlock}\n\n` : "") +
         (trajectoriesBlock ? `${trajectoriesBlock}\n\n` : "") +
-        taskPrompt(tokenizedTask, sanitizeUrl(tab.url ?? ""), sanitizeTextPII(tab.title ?? "")) +
+        taskPrompt(
+          tokenizedTask,
+          sanitizeUrl(tab.url ?? ""),
+          sanitizeTextPII(tab.title ?? ""),
+          // Built from the live vault, so it always matches the tokens actually
+          // in the task, and it never contains a value — only the category.
+          buildTokenLegend(taskTokens),
+        ) +
         (snapshot ? `\n\n--- Current page ---\n${renderSnapshot(snapshot)}` : "") +
         (initialVisionNote ? `\n\n${initialVisionNote}` : ""),
     },
@@ -901,6 +965,20 @@ export async function runTask(
   const recentActions: Array<{ name: string; input: string }> = [];
   const LOOP_THRESHOLD = 3;
   const LOOP_WINDOW = 5;
+  /**
+   * How many times the loop guard has already nudged this run.
+   *
+   * The first detection is a stuck PLANNER, not a stuck task: on a Gmail inbox
+   * the planner could not find a clickable message row, re-read the page three
+   * times looking for one, and the guard ended the whole run there — the task
+   * was still solvable, the planner just did not know which handle to use. The
+   * first detection therefore injects what it was missing and clears the
+   * history so the planner can act; only a repeat after that advice stops the
+   * run. maxSteps still bounds the worst case independently.
+   */
+  let loopNudges = 0;
+  /** How many times this run has told the planner to stop deliberating. */
+  let deliberationSteers = 0;
 
   function recordAction(name: string, input: Record<string, unknown>): void {
     // Sign click/type actions by the target's role+name, not the raw id:
@@ -1006,6 +1084,10 @@ export async function runTask(
     emit({ kind: "experience", experience } as unknown as AgentEvent);
     emit({ kind: "egress", bytes: sessionEgressBytes });
     tokenizer.clear();
+    // The run is over: the next task must not inherit this page's items to
+    // locate, or its first capture could box a name from the previous site.
+    setActivePiiTargets([]);
+    setActiveNerSpans([]);
   }
 
   for (let step = 0; step < settings.maxSteps; step++) {
@@ -1014,14 +1096,39 @@ export async function runTask(
     // The model plans against the snapshot rendered in the previous turn.
     lastRenderedElements = snapshot?.elements ?? [];
 
-    // Loop detection — if the agent is stuck repeating the same action, break.
+    // Loop detection — a stuck planner gets one chance to act on advice before
+    // the run is stopped, because "keep re-reading the page" is usually a
+    // missing-handle problem rather than an impossible task.
     if (isLooping()) {
+      const repeated = recentActions[recentActions.length - 1].name;
+      if (loopNudges === 0) {
+        loopNudges++;
+        recentActions.length = 0;
+        const advice = repeated === "read_page"
+          ? `Stop re-reading the page — you already have what it returned. Act on it: ` +
+            `if the thing you need to click has no element id (inbox rows, search results, ` +
+            `list items and cards usually have none), use click_text with the exact visible ` +
+            `text, e.g. {"text": "<sender and subject of the first row>"}. If the target is ` +
+            `below the fold, scroll first.`
+          : `Stop repeating "${repeated}" — it is not changing the page. Try a different ` +
+            `handle: click_text with the visible text of the target, scroll to bring it ` +
+            `into view, or re-read the page only if the page actually changed.`;
+        emit({
+          kind: "entry",
+          entry: {
+            id: nextId(),
+            role: "system",
+            text: `Loop detected: "${repeated}" repeated ${LOOP_THRESHOLD} times. ${advice}`,
+          },
+        });
+        continue;
+      }
       emit({
         kind: "entry",
         entry: {
           id: nextId(),
           role: "error",
-          text: `Loop detected: repeated "${recentActions[recentActions.length - 1].name}" ${LOOP_THRESHOLD} times. Stopping to prevent infinite loop. The page may need manual interaction.`,
+          text: `Loop detected again: "${repeated}" repeated ${LOOP_THRESHOLD} times after the retry advice. Stopping to prevent an infinite loop. The page may need manual interaction.`,
         },
       });
       finishTask();
@@ -1292,10 +1399,31 @@ export async function runTask(
 
     // Honest, reason-specific failure text (see turnCutShortMessage).
     const turnCutShortMessage = (
-      reason: "silent" | "ceiling",
+      reason: "silent" | "ceiling" | "deliberation",
       liveness: TurnLiveness,
       waitedMs: number,
     ): string => turnCutShortMessageFor(planner.label, reason, liveness, waitedMs, firstOutputBudgetMs);
+
+    // ─── Live reasoning status ───
+    // The reasoning block is display-capped (MAX_THOUGHT_CHARS), so past that
+    // cap nothing on screen moves while the model keeps thinking — which is
+    // indistinguishable from a freeze, and was reported as one. This line keeps
+    // ticking for as long as reasoning streams: elapsed time, how much, and the
+    // fact that no action has been taken yet.
+    let reasoningStartedAt = 0;
+    let reasoningStatusId: string | null = null;
+    let statusStopped = false;
+    const statusTicker = setInterval(() => {
+      if (statusStopped || reasoningStartedAt === 0 || thoughtChars === 0) return;
+      const seconds = Math.round((performance.now() - reasoningStartedAt) / 1000);
+      const text = `Reasoning… ${seconds}s · ${thoughtChars.toLocaleString()} chars · no action yet`;
+      if (!reasoningStatusId) {
+        reasoningStatusId = nextId();
+        emit({ kind: "entry", entry: { id: reasoningStatusId, role: "system", text } });
+      } else {
+        emit({ kind: "patch", id: reasoningStatusId, text });
+      }
+    }, 2000);
 
     // ─── Planner-wait ticker ───
     // A cold free-tier planner can legitimately take ~55-90s on its first turn
@@ -1306,7 +1434,7 @@ export async function runTask(
     // takes over as the liveness indicator and this line hands off to it. A
     // turn that starts producing output within the grace window never emits
     // the line at all.
-    const waitStart = performance.now();
+    let waitStart = performance.now();
     let waitEntryId: string | null = null;
     let waitSettled = false;
     const waitTimer = setInterval(() => {
@@ -1337,6 +1465,18 @@ export async function runTask(
     const settleWait = (outcome: "responded" | "failed" | "cancelled"): void => {
       waitSettled = true;
       clearInterval(waitTimer);
+      // Finalize the reasoning status line: it must stop ticking when the turn
+      // ends, and it must say how long the thinking actually took.
+      statusStopped = true;
+      clearInterval(statusTicker);
+      if (reasoningStatusId && reasoningStartedAt > 0) {
+        const seconds = Math.round((performance.now() - reasoningStartedAt) / 1000);
+        emit({
+          kind: "patch",
+          id: reasoningStatusId,
+          text: `Model reasoned for ${seconds}s (${thoughtChars.toLocaleString()} chars) before this turn ended.`,
+        });
+      }
       // Final flush, then collapse the reasoning block — the turn is over and
       // the transcript should hand attention back to actions and answers.
       flushPending();
@@ -1372,6 +1512,11 @@ export async function runTask(
           onThought: (delta) => {
             liveness.lastEventAt = performance.now();
             liveness.events++;
+            liveness.reasoningChars += delta.length;
+            if (liveness.reasoningStartedAt === 0) {
+              liveness.reasoningStartedAt = performance.now();
+              reasoningStartedAt = liveness.reasoningStartedAt;
+            }
             thoughtChars += delta.length;
             // The first reasoning token ends the wait ticker's job: the live
             // stream below is now the liveness indicator.
@@ -1391,6 +1536,8 @@ export async function runTask(
           firstOutputMs: firstOutputBudgetMs,
           idleMs: STREAM_IDLE_TIMEOUT_MS,
           maxMs: MAX_TURN_MS,
+          maxReasoningChars: MAX_REASONING_CHARS,
+          maxReasoningMs: MAX_REASONING_MS,
           onTimeout: () => turnAbort.abort(),
           messageFor: turnCutShortMessage,
         },
@@ -1426,7 +1573,28 @@ export async function runTask(
       // turned "this model reasons slowly" into an endless "retrying once…"
       // loop with the run never reaching a terminal state.
       const cutWhileStreaming = firstTurnLiveness.ended === "ceiling";
-      if (!isRetryablePlannerError(firstMessage) || cutWhileStreaming) {
+      const deliberated = firstTurnLiveness.ended === "deliberation";
+
+      // A deliberation cut is steered, not failed: the model has everything it
+      // needs and is stuck analysing instead of acting, so the next turn is the
+      // same conversation plus an explicit "act now" directive. Only if it
+      // deliberates AGAIN does the run stop (and then the message says why).
+      let steered = false;
+      if (deliberated && deliberationSteers === 0) {
+        deliberationSteers++;
+        steered = true;
+        emit({
+          kind: "entry",
+          entry: {
+            id: nextId(),
+            role: "system",
+            text:
+              `The planner reasoned for a long time without acting (${firstTurnLiveness.reasoningChars.toLocaleString()} chars). ` +
+              `Telling it to act on what it already has…`,
+          },
+        });
+        messages.push({ role: "user", content: ACT_NOW_DIRECTIVE });
+      } else if (!isRetryablePlannerError(firstMessage) || cutWhileStreaming) {
         settleWait("failed");
         errorCount++;
         emit({
@@ -1435,19 +1603,26 @@ export async function runTask(
         });
         finishTask();
         return;
+      } else {
+        // Transient stall (never produced a token, or the stream went quiet) —
+        // one automatic retry before giving up. The wait ticker deliberately
+        // keeps ticking across the retry: from the user's point of view this is
+        // still one continuous planner wait.
+        emit({
+          kind: "entry",
+          entry: {
+            id: nextId(),
+            role: "system",
+            text: `Planner stalled (${firstMessage.slice(0, 120)}) — retrying once…`,
+          },
+        });
       }
-      // Transient stall (never produced a token, or the stream went quiet) —
-      // one automatic retry before giving up. The wait ticker deliberately
-      // keeps ticking across the retry: from the user's point of view this is
-      // still one continuous planner wait.
-      emit({
-        kind: "entry",
-        entry: {
-          id: nextId(),
-          role: "system",
-          text: `Planner stalled (${firstMessage.slice(0, 120)}) — retrying once…`,
-        },
-      });
+      // Start a fresh wait line for the retry. Patching the first attempt's
+      // line made the transcript read backwards: the collapsed line said "gave
+      // no usable response in 180s" while sitting ABOVE the "retrying" notice
+      // that came after it.
+      waitEntryId = null;
+      waitStart = performance.now();
       try {
         turn = await runPlannerTurn(new AbortController(), newTurnLiveness());
         settleWait("responded");
@@ -1462,7 +1637,9 @@ export async function runTask(
             role: "error",
             text:
               (secondError instanceof Error ? secondError.message : String(secondError)) +
-              " Retried once and failed again — switch to a faster provider/model (Groq openai/gpt-oss-20b) in the options and rerun.",
+              (steered
+                ? " It was told to act on what it already had and still did not converge — make the step smaller, or switch to a faster model (Groq openai/gpt-oss-20b)."
+                : " Retried once and failed again — switch to a faster provider/model (Groq openai/gpt-oss-20b) in the options and rerun."),
           },
         });
         finishTask();
@@ -1666,6 +1843,22 @@ ${freshRendered}`,
       // patterns (cards, Aadhaar, PAN, API keys) see the real secret — not the
       // token the model was shown. Element-credential checks read name/role/
       // attrs from the tokenized snapshot and are unaffected.
+      // ROUTE GUARD: an app-switcher click is a dead end. The popup it opens is
+      // served in a cross-origin frame, so its tiles are invisible to both the
+      // page read and click_text — a live run clicked <a 'Google apps'> while
+      // trying to reach another site, then asked for text that could never be
+      // visible, and had no action left that could finish the route. Refused
+      // with the route that works instead of letting the planner discover this.
+      if (resolvedAction.name === "click") {
+        const clickedEl = snapshot?.elements.find((e) => e.id === resolvedAction.input.element_id);
+        const routeRefusal = appSwitcherRefusal(clickedEl?.name);
+        if (routeRefusal) {
+          emit({ kind: "patch", id: stepId, text: "Blocked — use a direct navigate instead.", pending: false });
+          results.push({ id: call.id, content: routeRefusal, isError: true });
+          continue;
+        }
+      }
+
       const decision = gate(resolvedAction, snapshot, settings.confirmRisky);
 
       if (decision.verdict === "refuse") {
@@ -1766,9 +1959,10 @@ ${freshRendered}`,
 
           // Apply privacy pipeline to fresh snapshot (checksum validation +
           // learned false-positive suppression included).
-          const { sanitized, piiCount, detections: freshDetections, suppressed: freshSuppressed, rejected: freshRejected } = sanitizeSnapshot(snapshot, sanitizeCtx);
+          const { sanitized, piiCount, detections: freshDetections, suppressed: freshSuppressed, rejected: freshRejected, piiTargets: freshPiiTargets } = sanitizeSnapshot(snapshot, sanitizeCtx);
           snapshot = sanitized;
           lastDomDetections = freshDetections;
+          setActivePiiTargets(freshPiiTargets);
 
           // Truncate fresh snapshots to avoid context overflow.
           if (isFreeTier) {
@@ -1850,9 +2044,9 @@ ${freshRendered}`,
                 // whether pixels actually left the browser.
                 let shippedToModel = false;
                 if (visionEnabled && visionApiKey && !signal.aborted) {
-                  const described = await observeScreen(processed.redactedDataUrl, observation);
-                  shippedToModel = described.length > 0;
-                  observation = described;
+                  const described = await observeScreen(processed, observation);
+                  shippedToModel = described.shipped;
+                  observation = described.text;
                 }
 
                 // Record for privacy audit — fresh DOM detections + visuals.
@@ -1961,11 +2155,54 @@ const STREAM_IDLE_TIMEOUT_MS = 30_000;
 const MAX_TURN_MS = 210_000;
 
 /**
+ * Deliberation guard.
+ *
+ * A reasoning model can emit chain-of-thought faster than it converges. The
+ * reported stall: the planner streamed well past the display cap (6 000 chars)
+ * deliberating about which element was "the first email", never emitted a tool
+ * call, and nothing cut it — the silence window never trips while reasoning is
+ * flowing, so the run sat inside one turn until the 210 s ceiling with the
+ * panel showing a truncated, unmoving block.
+ *
+ * A turn that has reasoned this far without acting is not converging, whatever
+ * the clock says. It is cut, and the cut is not reported as a failure: the next
+ * turn carries a directive telling the model to act with what it already has.
+ * The thresholds sit at 2× the display cap / 90 s so a genuinely deep but
+ * productive turn is not interrupted.
+ */
+const MAX_REASONING_CHARS = 12_000;
+const MAX_REASONING_MS = 90_000;
+/** Below this, a long turn is slow rather than over-deliberating — let it run. */
+const MIN_REASONING_CHARS_FOR_TIME_CUT = 1_000;
+
+/**
+ * What the steered turn is told. Short, imperative, and it names the two
+ * handles this situation actually needs: act now, and use click_text when the
+ * target has no element id (which is the usual reason for the deliberation in
+ * the first place).
+ */
+export const ACT_NOW_DIRECTIVE =
+  "You have spent too long reasoning without acting. Stop deliberating and act now: " +
+  "respond with exactly ONE tool call, or with a short final answer if the task is already complete. " +
+  "Use what you already have — do not re-read the page to look for something again. " +
+  "If the thing you need to click has no element id (inbox rows, search results, list items, " +
+  "cards, menu entries usually have none), call click_text with the exact visible text of the target.";
+
+/**
  * Stall/transient failure classifiers — these warrant one automatic retry.
  * Everything else (bad model, rejected key, malformed request) is not retried.
  */
 export function isRetryablePlannerError(message: string): boolean {
-  return /did not respond within|rate.?limit|timed? ?out|network|fetch failed|econn|overloaded|temporarily|503|429|502|504|timeout/i.test(
+  // A provider that never produced a single token inside the full silence
+  // budget is not a dropped connection — it is a provider that cannot serve
+  // this request in time. Retrying re-sends the identical prompt and spends the
+  // same window again: measured on NVIDIA NIM, two 90 s silent attempts in a
+  // row produced nothing but a 180 s dead wait before the same error. Report it
+  // once, with the actionable advice, and let the user switch models.
+  // (Mid-stream silence is different — see the "stopped streaming" wording —
+  // and transport/status failures below are still worth one retry.)
+  if (/did not respond within/i.test(message)) return false;
+  return /rate.?limit|timed? ?out|network|fetch failed|econn|overloaded|temporarily|503|429|502|504|timeout|stopped streaming/i.test(
     message,
   );
 }
@@ -1983,12 +2220,22 @@ interface TurnLiveness {
   lastEventAt: number;
   /** Number of deltas this turn has produced. */
   events: number;
+  /** Reasoning characters streamed this turn (the deliberation signal). */
+  reasoningChars: number;
+  /** When reasoning started; 0 while the turn has produced none. */
+  reasoningStartedAt: number;
   /** How the turn ended; the retry policy reads this. */
-  ended: "settled" | "silent" | "ceiling";
+  ended: "settled" | "silent" | "ceiling" | "deliberation";
 }
 
 export function newTurnLiveness(): TurnLiveness {
-  return { lastEventAt: performance.now(), events: 0, ended: "settled" };
+  return {
+    lastEventAt: performance.now(),
+    events: 0,
+    reasoningChars: 0,
+    reasoningStartedAt: 0,
+    ended: "settled",
+  };
 }
 
 /**
@@ -2005,12 +2252,24 @@ export function newTurnLiveness(): TurnLiveness {
  */
 export function turnCutShortMessageFor(
   plannerLabel: string,
-  reason: "silent" | "ceiling",
+  reason: "silent" | "ceiling" | "deliberation",
   liveness: TurnLiveness,
   waitedMs: number,
   firstOutputBudgetMs: number,
 ): string {
   const waited = Math.round(waitedMs / 1000);
+  if (reason === "deliberation") {
+    // Deliberately free of the retry keywords: this is not a transient
+    // hiccup, it is the model not converging. The caller steers instead of
+    // treating it as a network event.
+    return (
+      `The planner (${plannerLabel}) reasoned for ${waited}s and wrote ` +
+      `${liveness.reasoningChars.toLocaleString()} characters of analysis without taking a single action, ` +
+      `so the turn was stopped. It is being told to act with what it already has. ` +
+      `If it deliberates again, the honest read is that this prompt is too open for this model — ` +
+      `switch to a faster provider (Groq openai/gpt-oss-20b) or make the step smaller.`
+    );
+  }
   if (reason === "ceiling") {
     return (
       `The planner (${plannerLabel}) was still streaming after ${waited}s and was stopped. ` +
@@ -2050,13 +2309,17 @@ export function withTurnBudget<T>(
     idleMs: number;
     maxMs: number;
     onTimeout: () => void;
-    messageFor: (reason: "silent" | "ceiling", liveness: TurnLiveness, waitedMs: number) => string;
+    /** Cut a turn that reasons this much without acting (see the guard). */
+    maxReasoningChars?: number;
+    /** …or that reasons for this long, once it has said something substantial. */
+    maxReasoningMs?: number;
+    messageFor: (reason: "silent" | "ceiling" | "deliberation", liveness: TurnLiveness, waitedMs: number) => string;
   },
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const startedAt = performance.now();
     let done = false;
-    const finish = (reason: "silent" | "ceiling", waitedMs: number): void => {
+    const finish = (reason: "silent" | "ceiling" | "deliberation", waitedMs: number): void => {
       done = true;
       clearInterval(ticker);
       liveness.ended = reason;
@@ -2071,6 +2334,22 @@ export function withTurnBudget<T>(
       }
       if (performance.now() - liveness.lastEventAt > opts.idleMs) {
         finish("silent", waited);
+        return;
+      }
+      // A turn that keeps reasoning without acting is not converging. Checked
+      // before the ceiling so the user gets the steer in ~90 s instead of
+      // waiting out 210 s for the same outcome.
+      const maxReasoningChars = opts.maxReasoningChars ?? MAX_REASONING_CHARS;
+      const maxReasoningMs = opts.maxReasoningMs ?? MAX_REASONING_MS;
+      if (liveness.reasoningChars >= maxReasoningChars) {
+        finish("deliberation", waited);
+        return;
+      }
+      const reasoningMs = liveness.reasoningStartedAt > 0
+        ? performance.now() - liveness.reasoningStartedAt
+        : 0;
+      if (reasoningMs >= maxReasoningMs && liveness.reasoningChars >= MIN_REASONING_CHARS_FOR_TIME_CUT) {
+        finish("deliberation", waited);
         return;
       }
       if (waited > opts.maxMs) finish("ceiling", waited);
@@ -2150,6 +2429,8 @@ function describeIntent(name: string, input: Record<string, unknown>): string {
       return `Open ${input.url} in a new tab`;
     case "read_page":
       return "Read the page";
+    case "click_text":
+      return `Click "${String(input.text ?? "").slice(0, 60)}"`;
     case "scroll":
       return `Scroll ${input.direction}`;
     case "find_text":

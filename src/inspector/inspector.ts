@@ -63,6 +63,15 @@ interface InspectData {
     summary: string;
     ocrRan?: boolean;
     leakedText?: string;
+    /** The frame was rebuilt after the adversarial pass recovered something. */
+    escalated?: boolean;
+    /** What the adversarial pass probed on the shipped pixels. */
+    attack?: {
+      ran: boolean;
+      reconstructableRegions: number;
+      uncoveredFaces: number;
+      details: string[];
+    };
   };
   vault: VaultEntry[];
   snapshot?: {
@@ -156,45 +165,91 @@ async function drawShot(): Promise<void> {
   const kb = Math.round(source.length / 1024);
   const coverage = currentData.tiles > 1 ? `full-page (${currentData.tiles} tiles stitched)` : "viewport";
 
-  if (shotView === "redacted") {
+  const isRedacted = shotView === "redacted";
+
+  if (isRedacted) {
     // Only claim egress when the redacted frame really can leave: with vision
     // off (the default) nothing is sent, and "Shipped to planner" was a claim
     // about a transfer that never happened.
     const egressNote = currentData.visionEnabled
       ? "Sent to the vision model when it runs."
       : "Held locally - vision is off, so no image is sent.";
-    shotNote.textContent = `${image.naturalWidth}x${image.naturalHeight}px - ${kb} KB - ${coverage} - ${currentData.redactedCount} regions masked. ${egressNote}`;
+    shotNote.textContent = `${image.naturalWidth}x${image.naturalHeight}px - ${kb} KB - ${coverage} - ${currentData.redactedCount} regions masked. ${egressNote} Outlines mark where the pixels were destroyed.`;
   } else {
     shotNote.textContent = `${image.naturalWidth}x${image.naturalHeight}px - ${kb} KB - ${coverage} - Raw un-redacted capture (NEVER leaves device). Outlines mark detection boxes.`;
-
-    // Draw detection boxes on original. Boxes arrive normalized 0-1
-    // (the convention the offscreen pipeline emits, so overlays land
-    // correctly at any DPR or display size) — they MUST be scaled to the
-    // canvas, or every outline collapses into a single pixel at the origin.
-    const canvasW = shot.width;
-    const canvasH = shot.height;
-    currentData.detections.forEach((det, idx) => {
-      if (!det.box) return;
-      const x = det.box.x * canvasW;
-      const y = det.box.y * canvasH;
-      const width = det.box.width * canvasW;
-      const height = det.box.height * canvasH;
-      if (width < 1 || height < 1) return;
-      ctx.strokeStyle = idx === activeDetectionIndex ? "#00888c" : "#e23829";
-      ctx.lineWidth = idx === activeDetectionIndex ? 3 : 2;
-      ctx.strokeRect(x, y, width, height);
-
-      // Label badge
-      ctx.fillStyle = idx === activeDetectionIndex ? "#00888c" : "#e23829";
-      ctx.font = "bold 11px sans-serif";
-      const text = `${det.kind}: ${det.label}`;
-      const textWidth = ctx.measureText(text).width;
-      const badgeY = Math.min(Math.max(0, y - 16), canvasH - 16);
-      ctx.fillRect(x, badgeY, textWidth + 8, 16);
-      ctx.fillStyle = "#ffffff";
-      ctx.fillText(text, x + 4, badgeY + 12);
-    });
   }
+
+  // Detection outlines are drawn on BOTH views.
+  //
+  // They used to be drawn only on the original, behind an `else` branch on the
+  // view toggle — and the toggle DEFAULTS to the redacted view, so the default
+  // screen showed a fully-redacted frame with no markup at all and the redacted
+  // pane, the one that proves the redaction, was the one pane that drew
+  // nothing. Showing the same boxes on both is what makes the BEFORE/AFTER pair
+  // a comparison rather than two unrelated pictures.
+  //
+  // Boxes arrive normalized 0-1 from the offscreen pipeline, which now derives
+  // them from the rectangle it actually painted (padding, clamp and full-page
+  // scroll offset included), so an outline lands on its mask rather than near
+  // it. They must still be scaled to the canvas here.
+  const canvasW = shot.width;
+  const canvasH = shot.height;
+  currentData.detections.forEach((det, idx) => {
+    if (!det.box) return;
+    const x = det.box.x * canvasW;
+    const y = det.box.y * canvasH;
+    const width = det.box.width * canvasW;
+    const height = det.box.height * canvasH;
+    if (width < 1 || height < 1) return;
+
+    const active = idx === activeDetectionIndex;
+    // On the redacted view the outline sits on a black mask, so it is drawn in
+    // a high-contrast green with a dashed white inner outline; red-on-black was
+    // nearly invisible and read as "no boxes were drawn".
+    const stroke = active ? "#00888c" : isRedacted ? "#39ff88" : "#e23829";
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = active ? 3 : 2;
+    ctx.strokeRect(x, y, width, height);
+    if (isRedacted) {
+      ctx.save();
+      ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = "rgba(255,255,255,0.75)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x + 1.5, y + 1.5, Math.max(0, width - 3), Math.max(0, height - 3));
+      ctx.restore();
+    }
+
+    // Label badge: what this box is, and on the redacted pane what tier of
+    // redaction it received. The tier matters — an opaque mask and a reversible
+    // blur are not the same guarantee, and the audit used to show them
+    // identically.
+    const tier = isRedacted ? redactionTier(det) : "detected";
+    const text = `${det.kind}: ${det.label} [${tier}]`;
+    ctx.font = "bold 11px sans-serif";
+    const textWidth = ctx.measureText(text).width;
+    const badgeY = Math.min(Math.max(0, y - 16), Math.max(0, canvasH - 16));
+    ctx.fillStyle = stroke;
+    ctx.fillRect(x, badgeY, textWidth + 8, 16);
+    ctx.fillStyle = isRedacted && !active ? "#0b1a12" : "#ffffff";
+    ctx.fillText(text, x + 4, badgeY + 12);
+  });
+}
+
+/**
+ * How a detection kind is actually redacted, mirroring the painter in
+ * offscreen.ts. Surfaced in the overlay badge so the proof image says WHICH
+ * guarantee each box carries instead of implying they are all equivalent.
+ */
+function redactionTier(det: Detection): string {
+  // A detection that was reported and deliberately NOT painted (a face with
+  // face destruction switched off) must not be labelled as redacted — that is
+  // the one case where the box on the image is the leak, not the fix.
+  if (/NOT redacted/i.test(det.label)) return "none";
+  const kind = det.kind;
+  if (kind === "face") return "opaque";
+  if (kind.endsWith("_text") || kind === "image_text") return "opaque";
+  if (kind === "credential_label" || kind === "input_field" || kind === "credential") return "blur+escalate";
+  return "surrogate";
 }
 
 // --- Render Summary ---------------------------------------------------------
@@ -210,6 +265,10 @@ function renderSummary(): void {
     ["Processing time", `${d.processingTimeMs}ms`],
     ["Page tiles", d.tiles],
     ["Re-OCR verified", d.verification?.verified ? "YES" : "NO"],
+    // The adversarial pass attacks the SHIPPED pixels and reports what it got
+    // back. Shown even when it found nothing: "probed and clean" and "not
+    // probed" are different claims, and the old card allowed neither to be read.
+    ["Attack re-check", attackCell(d.verification)],
   ];
 
   summaryEl.innerHTML = cells
@@ -219,9 +278,16 @@ function renderSummary(): void {
 
   // Residual banner
   const hasResidual = d.verification && !d.verification.verified;
-  residualEl.className = `residual ${hasResidual ? "dirty" : "clean"}`;
+  // An escalated frame is neither a plain pass nor a leak: the auditor FOUND a
+  // recoverable region and destroyed it, so the image shown is the rebuilt one.
+  // Rendering it as a plain "integrity confirmed" would hide that the first
+  // paint was insufficient, which is the single most audit-relevant fact here.
+  const escalated = Boolean(d.verification?.escalated);
+  residualEl.className = `residual ${hasResidual ? "dirty" : escalated ? "escalated" : "clean"}`;
   residualEl.innerHTML = hasResidual
     ? `<strong>Residual PII Leak Detected!</strong><span class="sub">${d.verification?.summary || "Adversarial re-OCR identified un-redacted characters."}</span>`
+    : escalated
+    ? `<strong>Escalated and re-verified.</strong><span class="sub">${d.verification?.summary || "The adversarial pass recovered content from a soft redaction, so every region was destroyed and re-checked."}</span>`
     // Not "Zero-Leak": the check proves the REDACTED regions are clean in the
     // shipped bytes. It cannot see a region no detector flagged, so the banner
     // states the scoped claim rather than a completeness one (README §6.5).
@@ -230,6 +296,18 @@ function renderSummary(): void {
 }
 
 // --- Render Vault ----------------------------------------------------------
+
+/**
+ * The adversarial re-check cell: what the attack probed and what it found.
+ * Split so "the probe ran and found nothing" cannot be read as "no probe".
+ */
+function attackCell(verification: { attack?: { ran: boolean; reconstructableRegions: number; uncoveredFaces: number } } | undefined): string {
+  const attack = verification?.attack;
+  if (!attack) return "NOT RUN";
+  if (!attack.ran) return "NOT RUN";
+  if (attack.reconstructableRegions === 0 && attack.uncoveredFaces === 0) return "CLEAN";
+  return `${attack.reconstructableRegions}+${attack.uncoveredFaces}`;
+}
 
 function renderVault(): void {
   if (!currentData || currentData.vault.length === 0) {

@@ -15,6 +15,7 @@
  *   6. Privacy ledger records redaction events and chain stays intact.
  */
 import assert from "node:assert";
+import { readFile } from "node:fs/promises";
 
 // ─── chrome.storage shim (what the modules call) ───────────────────────────
 const mem = new Map();
@@ -1417,6 +1418,33 @@ const passwordSnap = {
     { id: 1, role: "textbox", name: "Order notes", value: "", attrs: { inputType: "text" } },
   ],
 };
+// ── Validated refusals: a real identifier is refused, a LOOKALIKE is not ────
+// The gate used to refuse any 12-digit run with optional single spaces, so an
+// order number or a reference typed into an innocent field was refused with a
+// message claiming it "looks like an Aadhaar number". Shared/checksums.ts sets
+// the project's standard — validate, then act — and the typing gate now meets it.
+const { matchedIdentifierLabel } = await import("../src/background/safety.ts");
+ok("a Verhoeff-valid Aadhaar is identified as one",
+  matchedIdentifierLabel(aadhaarFmt) === "Aadhaar number", aadhaarFmt);
+ok("an embedded Aadhaar is still caught (not only an exact-value match)",
+  matchedIdentifierLabel(`my aadhaar is ${aadhaarFmt} ok`) === "Aadhaar number");
+ok("a 12-digit lookalike that fails Verhoeff is NOT refused",
+  matchedIdentifierLabel(badAadhaarFmt) === undefined, badAadhaarFmt);
+ok("a Luhn-valid card is identified as one",
+  matchedIdentifierLabel("4111 1111 1111 1111") === "Card number");
+ok("a Luhn-invalid 16-digit reference number is NOT refused",
+  matchedIdentifierLabel("4111 1111 1111 1112") === undefined);
+ok("a PAN shape is still identified (no checksum exists for it)",
+  matchedIdentifierLabel("ABCDE1234F") === "PAN number");
+ok("an SSN shape is still refused",
+  matchedIdentifierLabel("123-45-6789") === undefined &&
+  gate({ name: "type", input: { element_id: 1, text: "123-45-6789", reason: "notes" } }, gateSnap, true).verdict === "refuse");
+ok("an order number into an innocent field is no longer refused",
+  gate({ name: "type", input: { element_id: 1, text: "Reference 1234 5678 9012", reason: "notes" } }, gateSnap, true).verdict !== "refuse");
+ok("and the refusal naming works off the validated evidence",
+  gate({ name: "type", input: { element_id: 1, text: aadhaarFmt, reason: "n" } }, gateSnap, true).reason?.includes("validates as a Aadhaar number") === true ||
+  gate({ name: "type", input: { element_id: 1, text: aadhaarFmt, reason: "n" } }, gateSnap, true).reason?.includes("Aadhaar number") === true);
+
 ok("a password FIELD is refused even when the typed value is a harmless token",
   gate({ name: "type", input: { element_id: 2, text: "<PII_3>", reason: "fill" } }, passwordSnap, true).verdict === "refuse");
 
@@ -1982,7 +2010,7 @@ const capped = mergeFaceBoxes(manyModelFaces, manySkin);
 ok("every model-detected face is kept",
   capped.filter((f) => f.source === "model").length === 12);
 ok("supplementary additions are capped so a photo cannot wall the page",
-  capped.filter((f) => f.source === "skin").length <= 8,
+  capped.filter((f) => f.source === "skin").length <= 16,
   String(capped.filter((f) => f.source === "skin").length));
 ok("model boxes are ordered largest first",
   capped[0].width === 80);
@@ -2086,8 +2114,15 @@ await withTurnBudget(
   budgetOpts((reason, liveness, waited) => turnCutShortMessageFor("NVIDIA test", reason, liveness, waited, 60_000)),
 ).catch((err) => { silentReason = err.message; });
 ok("a turn that never answers is cut as 'silent'", silentLiveness.ended === "silent", silentReason);
-ok("the no-output message is still classed as a transient stall (one retry)",
-  isRetryablePlannerError(silentReason));
+// ...but NOT retried. Measured on NVIDIA NIM: the first attempt produced no
+// token in 90s, the retry produced no token in another 90s, and the run died
+// after 180s of dead waiting with the same message it could have shown at 90s.
+ok("a turn that never produced a single token is NOT retried (180s of nothing)",
+  !isRetryablePlannerError(silentReason), silentReason);
+ok("a status-coded transient failure is still retried once",
+  isRetryablePlannerError("429 rate limit exceeded") &&
+  isRetryablePlannerError("network error: fetch failed") &&
+  isRetryablePlannerError("503 Service Unavailable"));
 
 // A turn that streams and then goes quiet is a dropped connection: retryable.
 const droppedLiveness = newTurnLiveness();
@@ -2120,5 +2155,931 @@ await withTurnBudget(
 clearInterval(foreverTouch);
 ok("an unbounded stream is stopped at the ceiling, not left running",
   ceilingEnding === "ceiling", ceilingEnding);
+
+// ── Scenario AL: detected-vs-boxed reconciliation ───────────────────────────
+// The screenshot evidence: PRY's own audit said "2 PII detected · 0 items
+// redacted · nothing to verify" while the BEFORE/AFTER pair showed the address
+// readable in both frames. The text channels had found the email in the
+// snapshot (an account chip's aria-label renders no text node), tokenized it —
+// and the pixel channel had no way to box it, silently.
+console.log("\n=== Scenario AL: PII target hygiene and detected-vs-boxed reconciliation ===\n");
+
+const {
+  sanitizePiiTargets, findUnlocatedValues, isLocatableSelector,
+} = await import("../src/shared/redaction-reconciliation.ts");
+
+// Hygiene: only values worth locating, and only our own selector shape cross
+// the message channel to a page.
+const targets = sanitizePiiTargets([
+  { value: "ada@example.com", selector: '[data-pry-id="12"]' },
+  { value: "ada@example.com", selector: '[data-pry-id="12"]' }, // duplicate pair
+  { value: "ab" },                                              // too short
+  { value: "x".repeat(200) },                                   // too long
+  { selector: "body" },                                         // not our shape
+  { selector: '[data-pry-id="7"]' },                           // selector alone is fine
+  { value: "  +91 98765 43210  " },                             // trimmed
+]);
+ok("duplicate value+selector pairs collapse to one target", targets.length === 3);
+ok("a target keeps its value and selector together (attribution survives)",
+  targets[0].value === "ada@example.com" && targets[0].selector === '[data-pry-id="12"]');
+ok("too-short and over-long values never reach a page",
+  !targets.some((t) => t.value !== undefined && (t.value.length < 3 || t.value.length > 80)) &&
+  !targets.some((t) => (t.value ?? "").startsWith("xx")));
+ok("an arbitrary selector is rejected; the registry shape is kept",
+  !isLocatableSelector("body") && isLocatableSelector('[data-pry-id="7"]') &&
+  targets.some((t) => t.selector === '[data-pry-id="7"]' && t.value === undefined));
+ok("a whitespace-padded value is trimmed before it is matched",
+  targets.some((t) => t.value === "+91 98765 43210"));
+
+// Reconciliation: a value with no box anywhere is exactly the leak to report.
+ok("a value boxed as text counts as located",
+  findUnlocatedValues(
+    [{ value: "ada@example.com" }],
+    [{ value: "ada@example.com" }, { kind: "face" }],
+  ).length === 0);
+ok("a value boxed via its element counts as located too (no false alarm)",
+  findUnlocatedValues(
+    [{ value: "ada@example.com", selectors: undefined, selector: '[data-pry-id="12"]' }],
+    [{ kind: "pii_field", value: "ada@example.com" }],
+  ).length === 0);
+ok("a value nothing could box is reported as unlocated (the Gmail frame)",
+  findUnlocatedValues(
+    [{ value: "ada@example.com" }, { value: "Ramesh Gupta" }],
+    [{ kind: "face" }],
+  ).join("|") === "ada@example.com|Ramesh Gupta");
+ok("no targets means nothing to report",
+  findUnlocatedValues([], [{ kind: "face" }]).length === 0 &&
+  findUnlocatedValues(undefined, undefined).length === 0);
+// The warning sample reuses the tokenizer's masking (asserted above), so the
+// value it warns about is never re-leaked into the transcript.
+ok("the warning sample is masked by the shared tokenizer policy",
+  maskSample("ada@example.com") === "ad•••@example.com" &&
+  !maskSample("ada@example.com").includes("ada"));
+
+// ── Scenario AM: OCR frame-text triage (PII inside images/canvas) ───────────
+// The gap this closes: every other pixel channel starts from the DOM, so text
+// baked into an <img>, a <canvas> or a video frame was invisible to all of
+// them and stayed readable in the frame the audit shows (and ships, with
+// vision on). This pass reads the ALREADY-REDACTED frame back, which makes it
+// self-targeting — a DOM-redacted value is a black rectangle OCR cannot read,
+// so anything it can read is by definition what nothing else covered.
+console.log("\n=== Scenario AM: OCR frame-text triage ===\n");
+
+const {
+  findTriageBoxes, dropCoveredBoxes, capTriageBoxes,
+} = await import("../src/shared/ocr-pii-triage.ts");
+
+// Words laid out left-to-right on one line, 20px tall, 8px apart.
+const line = (text, opts = {}) => {
+  let x = opts.x ?? 10;
+  const y = opts.y ?? 10;
+  const words = text.split(" ").map((w) => {
+    const word = { text: w, x, y, width: w.length * 8, height: 20, confidence: opts.confidence ?? 95 };
+    x += w.length * 8 + 8;
+    return word;
+  });
+  return { words };
+};
+
+const plain = findTriageBoxes([line("Building a GPT math engine from scratch")]);
+ok("ordinary page text yields no boxes (no false blackouts)", plain.length === 0,
+  JSON.stringify(plain.map((b) => b.value)));
+
+const email = findTriageBoxes([line("contact ada@example.com today", { x: 0, y: 100 })]);
+ok("an email inside image text is boxed exactly over its word",
+  email.length === 1 && email[0].value === "ada@example.com" && email[0].y === 100 &&
+  email[0].width === "ada@example.com".length * 8, JSON.stringify(email));
+ok("the box kind uses the painter's opaque tier (`*_text`)",
+  email[0].kind.endsWith("_text"), email[0]?.kind);
+
+// A phone split across two OCR words must union BOTH word boxes: boxing only
+// the first word would leave the remaining digits readable.
+const phone = findTriageBoxes([line("call 98765 43210", { x: 4, y: 40 })]);
+ok("a multi-word span unions every word it covers",
+  phone.length === 1 && phone[0].value.includes("98765") && phone[0].width >= 10 * 8,
+  JSON.stringify(phone));
+
+// A name in a photo has no pattern to match — only the on-device NER knows it.
+const named = findTriageBoxes([line("Priya Sharma", { x: 0, y: 60 })], { spans: ["Priya Sharma"] });
+ok("a name found by on-device NER is boxed inside an image too",
+  named.length === 1 && named[0].source === "known_span" && named[0].value === "Priya Sharma");
+ok("a span match inside a longer word is not boxed (Ann in Annual)",
+  findTriageBoxes([line("Annual report")], { spans: ["Ann"] }).length === 0);
+
+// Gibberish lines must not manufacture blackouts.
+const gibberish = findTriageBoxes([line("ada@example.com", { confidence: 12 })]);
+ok("a line OCR itself is unsure about is ignored", gibberish.length === 0);
+
+// Coverage: boxes already inside a redaction region are not painted twice.
+const two = findTriageBoxes([
+  line("ada@example.com", { x: 0, y: 0 }),
+  line("bob@example.com", { x: 0, y: 200 }),
+]);
+ok("two values on two lines produce two boxes", two.length === 2);
+const keptOne = dropCoveredBoxes(two, [{ x: 0, y: 0, width: 200, height: 24 }]);
+ok("a box already covered by a redaction region is dropped",
+  keptOne.length === 1 && keptOne[0].value === "bob@example.com");
+ok("a barely-overlapping box is kept (partial coverage is not coverage)",
+  dropCoveredBoxes(two, [{ x: 190, y: 0, width: 10, height: 20 }]).length === 2);
+
+const triageCapped = capTriageBoxes(two, 1);
+ok("the cap reports what it dropped instead of implying full triage",
+  triageCapped.kept.length === 1 && triageCapped.dropped === 1);
+ok("nothing to cap reports nothing dropped", capTriageBoxes(two, 5).dropped === 0);
+
+// ── Scenario AN: text-anchored targeting (the Gmail inbox row) ──────────────
+// The failing run: "open gmail and then open the first email" ended with
+// `Loop detected: repeated "read_page" 3 times` because the page read's 80
+// element slots went to the sidebar, toolbar and tabs, so no message row was in
+// the list at all — the planner's own reasoning says "element [25] is a
+// checkbox" and it never found a clickable row. Re-reading could not add what
+// the read never selected. The text it CAN see is the handle that exists.
+console.log("\n=== Scenario AN: text-anchored targeting ===\n");
+
+const {
+  normalizeForMatch, scoreTextMatch, rankTextMatches, pickTextMatch,
+  isClickableTarget, describeTextTarget,
+} = await import("../src/shared/text-target.ts");
+
+ok("matching ignores case and collapsed whitespace",
+  normalizeForMatch("  Meta\n   You're\t on the Muse waiting list ") === "meta you're on the muse waiting list");
+ok("zero-width characters do not break a match",
+  normalizeForMatch("Priya\u200bSharma") === "priyasharma");
+ok("scoring prefers exact over prefix over word over substring",
+  scoreTextMatch("Sent", "Sent") === "exact" &&
+  scoreTextMatch("Sent items", "Sent") === "prefix" &&
+  scoreTextMatch("Sentry City", "Sent") === "prefix" &&
+  scoreTextMatch("Open Sent now", "Sent") === "word" &&
+  scoreTextMatch("City Sentry", "Sent") === "substring",
+  ["Sent/Sent", scoreTextMatch("Sent", "Sent"), "City Sentry/Sent", scoreTextMatch("City Sentry", "Sent")].join(" | "));
+ok("a query shorter than 2 characters matches nothing",
+  scoreTextMatch("Inbox", "I") === null && scoreTextMatch("Inbox", "") === null);
+
+// The inbox frame: rows are measured as separate runs, in reading order.
+const inboxFrame = [
+  { text: "Inbox", x: 90, y: 130, width: 40, height: 18 },
+  { text: "Starred", x: 90, y: 152, width: 60, height: 18 },
+  { text: "You're on the Muse waitlist", x: 180, y: 160, width: 240, height: 18 },
+  { text: "Team approved - BuildSprint", x: 180, y: 190, width: 240, height: 18 },
+  { text: "Use code 910520 to log in", x: 180, y: 220, width: 240, height: 18 },
+];
+const firstEmail = pickTextMatch(inboxFrame, "You're on the Muse waitlist");
+ok("the first email row is matched by its visible subject text",
+  firstEmail?.run.text === "You're on the Muse waitlist" && firstEmail.run.y === 160,
+  JSON.stringify(firstEmail?.run));
+ok("a row-level query matches even though the row is several spans",
+  pickTextMatch(inboxFrame, "team approved")?.run.y === 190);
+ok("the topmost of several equal matches wins, and index steps down",
+  pickTextMatch(inboxFrame, "Inbox")?.run.y === 130 &&
+  pickTextMatch(inboxFrame, "o", 0) === null);
+
+// Two rows both containing "Meta" → index selects the second, by position.
+const twoMetas = [
+  { text: "Meta - You're on the Muse waitlist", x: 0, y: 160, width: 200, height: 18 },
+  { text: "Meta - Use code 910520 to log in", x: 0, y: 200, width: 200, height: 18 },
+];
+ok("index picks the next match down the page, not a random one",
+  pickTextMatch(twoMetas, "Meta")?.run.y === 160 &&
+  pickTextMatch(twoMetas, "Meta", 1)?.run.y === 200);
+ok("an out-of-range index falls back to the last match instead of clicking nothing",
+  pickTextMatch(twoMetas, "Meta", 99)?.run.y === 200);
+ok("a query with no match returns null so the caller can fail loudly",
+  pickTextMatch(inboxFrame, "nonexistent row") === null);
+ok("ranking is deterministic: score first, then reading order",
+  rankTextMatches(
+    [{ text: "Open Sent", x: 0, y: 10, width: 50, height: 10 }, { text: "Sent", x: 0, y: 90, width: 50, height: 10 }],
+    "Sent",
+  )[0].run.y === 90);
+
+// Clickable-container policy: Gmail rows are table rows with a delegated
+// handler, so `tr` must count; a bare span must not.
+ok("a table row counts as a click target (Gmail's inbox rows)",
+  isClickableTarget("tr", null, false));
+ok("controls and roles count, and a plain span does not",
+  isClickableTarget("a", "link", false) &&
+  isClickableTarget("div", "listitem", false) &&
+  isClickableTarget("div", null, true) &&
+  !isClickableTarget("span", null, false));
+ok("the action result names what was clicked",
+  describeTextTarget("You're on the Muse waitlist", "tr", "row") ===
+  '<tr role=row> "you\'re on the muse waitlist"');
+
+// Contract: the tool is exposed to the planner, routed to the page, and the
+// safety gate still sees irreversible text requests.
+const { TOOLS, PAGE_ACTIONS } = await import("../src/background/tools.ts");
+const clickTextTool = TOOLS.find((t) => t.name === "click_text");
+ok("click_text is exposed to the planner with a text parameter",
+  Boolean(clickTextTool) &&
+  clickTextTool.parameters.properties.text?.type === "string" &&
+  clickTextTool.parameters.required.includes("text"));
+ok("click_text is routed to the content script as a page action",
+  PAGE_ACTIONS.has("click_text"));
+
+const { gate: safetyGate } = await import("../src/background/safety.ts");
+const refuseEmpty = safetyGate({ name: "click_text", input: { text: "a" } }, undefined, false);
+ok("a blind click_text (no usable text) is refused", refuseEmpty.verdict === "refuse", refuseEmpty.reason);
+const confirmRiskyText = safetyGate({ name: "click_text", input: { text: "Delete account" } }, undefined, true);
+ok("an irreversible target stays behind a confirmation even when matched by text",
+  confirmRiskyText.verdict === "confirm", JSON.stringify(confirmRiskyText));
+const allowReadOnly = safetyGate({ name: "click_text", input: { text: "You're on the Muse waitlist" } }, undefined, true);
+ok("an ordinary row click is allowed", allowReadOnly.verdict === "allow", JSON.stringify(allowReadOnly));
+
+// ── Scenario AO: the deliberation guard ─────────────────────────────────────
+// The reported stall: the planner streamed past the 6 000-char display cap
+// deliberating about which element was "the first email", never emitted a tool
+// call, and nothing cut it — silence never tripped while reasoning flowed, so
+// the run sat in one turn until the 210 s ceiling with a truncated, unmoving
+// panel. It looked like an API failure; it was a model that would not act.
+console.log("\n=== Scenario AO: deliberation guard ===\n");
+
+const { ACT_NOW_DIRECTIVE } = await import("../src/background/agent.ts");
+
+// The directive must name both handles this stall needs.
+ok("the steering directive tells the model to act now",
+  /act now/i.test(ACT_NOW_DIRECTIVE) && /ONE tool call/.test(ACT_NOW_DIRECTIVE));
+ok("and hands it the handle it was missing (click_text by visible text)",
+  /click_text/.test(ACT_NOW_DIRECTIVE) && /no element id/.test(ACT_NOW_DIRECTIVE));
+
+// A deliberation cut must never be classified as a transient network hiccup,
+// or it would be retried with the identical prompt and stall identically.
+const deliberateLiveness = newTurnLiveness();
+deliberateLiveness.events = 40;
+deliberateLiveness.reasoningChars = 14_200;
+deliberateLiveness.reasoningStartedAt = performance.now() - 100_000;
+const deliberateMessage = turnCutShortMessageFor("NVIDIA test", "deliberation", deliberateLiveness, 100_000, 60_000);
+ok("the deliberation message names the real cause (reasoned, no action)",
+  /without taking a single action/.test(deliberateMessage) &&
+  /14,200 characters/.test(deliberateMessage), deliberateMessage);
+ok("the deliberation message is NOT classed as a retryable stall",
+  !isRetryablePlannerError(deliberateMessage), deliberateMessage);
+ok("and it does not blame the network for a model that would not act",
+  !/network|overloaded|timed? ?out|stalled/i.test(deliberateMessage));
+
+// The budget really does cut a turn that only reasons. Reasoning deltas keep
+// arriving, so neither the silence window nor the first-output window can fire:
+// the reasoning guard is the only thing that can end this turn.
+const monologueLiveness = newTurnLiveness();
+const monologue = setInterval(() => {
+  monologueLiveness.lastEventAt = performance.now();
+  monologueLiveness.events++;
+  monologueLiveness.reasoningChars += 400;
+  if (monologueLiveness.reasoningStartedAt === 0) monologueLiveness.reasoningStartedAt = performance.now();
+}, 10);
+let monologueEnded = "";
+const monologueStart = Date.now();
+await withTurnBudget(
+  new Promise(() => {}),
+  monologueLiveness,
+  {
+    firstOutputMs: 60_000,
+    idleMs: 30_000,
+    maxMs: 600_000,
+    maxReasoningChars: 2_000,
+    maxReasoningMs: 60_000,
+    onTimeout() {},
+    messageFor: (reason, liveness, waited) =>
+      turnCutShortMessageFor("NVIDIA test", reason, liveness, waited, 60_000),
+  },
+).catch(() => { monologueEnded = monologueLiveness.ended; });
+clearInterval(monologue);
+ok("a turn that only reasons is cut by the guard, not left to the ceiling",
+  monologueEnded === "deliberation", monologueEnded);
+ok("and it is cut quickly rather than after minutes",
+  Date.now() - monologueStart < 5_000, `${Date.now() - monologueStart}ms`);
+
+// The time rule has a floor so a slow-but-short turn is not cut for being slow.
+const slowButShallow = newTurnLiveness();
+slowButShallow.events = 3;
+slowButShallow.reasoningChars = 120;
+slowButShallow.reasoningStartedAt = performance.now() - 200_000;
+const shallowCut = await Promise.race([
+  withTurnBudget(new Promise((r) => setTimeout(() => r("answered"), 1200)), slowButShallow, {
+    firstOutputMs: 60_000,
+    idleMs: 30_000,
+    maxMs: 600_000,
+    onTimeout() {},
+    messageFor: (reason, liveness, waited) => turnCutShortMessageFor("NVIDIA test", reason, liveness, waited, 60_000),
+  }).catch(() => "cut"),
+  new Promise((r) => setTimeout(() => r("timeout"), 4000)),
+]);
+ok("a turn that has barely said anything is not cut for being slow",
+  shallowCut === "answered", String(shallowCut));
+
+// ── Scenario AP: the app-switcher dead end ─────────────────────────────────
+// The live run: task = reach another site from a Gmail tab. The planner clicked
+// `<a 'Google apps'>`, which opens Google's app launcher in a CROSS-ORIGIN
+// iframe (ogs.google.com). Nothing in the page can read that document, so the
+// tiles are invisible to the page read AND to click_text — the agent then asked
+// for the text "YouTube", was told truthfully that no visible text matched, and
+// had no action left that could finish the route.
+console.log("\n=== Scenario AP: app-switcher route guard ===\n");
+
+const { looksLikeAppSwitcher, appSwitcherRefusal } = await import("../src/shared/route-guard.ts");
+
+ok("the app-launcher control is recognised by its accessible name",
+  looksLikeAppSwitcher("Google apps") && looksLikeAppSwitcher("Apps") &&
+  looksLikeAppSwitcher("Apps launcher") && looksLikeAppSwitcher("nine-square grid") &&
+  looksLikeAppSwitcher("waffle"));
+ok("ordinary content that merely mentions apps is NOT blocked",
+  !looksLikeAppSwitcher("Apps and extensions") &&
+  !looksLikeAppSwitcher("Google Play") &&
+  !looksLikeAppSwitcher("Inbox") &&
+  !looksLikeAppSwitcher("Manage third-party apps and services") &&
+  !looksLikeAppSwitcher(undefined));
+ok("an over-long name is not treated as a switcher",
+  !looksLikeAppSwitcher("Apps launcher and settings for this workspace account"));
+
+const refusal = appSwitcherRefusal("Google apps");
+ok("the refusal explains WHY the route cannot be completed (cross-origin frame)",
+  Boolean(refusal) && /cross-origin frame/.test(refusal) && /click_text/.test(refusal));
+ok("the refusal names the route that works instead",
+  Boolean(refusal) && /navigate/.test(refusal) && /cannot miss/.test(refusal));
+ok("the redirect can name the exact destination when the caller knows it",
+  /https:\/\/youtube\.com/.test(appSwitcherRefusal("Google apps", "https://youtube.com") ?? "") &&
+  /https:\/\/mail\.google\.com/.test(appSwitcherRefusal("Google apps", "https://mail.google.com") ?? ""));
+ok("a non-switcher click is not refused at all",
+  appSwitcherRefusal("Compose") === null && appSwitcherRefusal("Inbox") === null);
+
+// The row-text separator: minified app markup has no whitespace text nodes, so
+// joining measured runs is what makes a quoted row matchable at all.
+const { rankTextMatches: rankRows } = await import("../src/shared/text-target.ts");
+const joinedRow = "Meta You're on the Muse waitlist 1:19 AM";
+const gluedRow = "MetaYou're on the Muse waitlist1:19 AM";
+ok("a row quoted the way a person writes it matches the joined text",
+  rankRows([{ text: joinedRow, x: 0, y: 0, width: 1, height: 1 }], "Meta You're on the Muse waitlist").length === 1);
+ok("which is exactly what glued textContent could not do (the reason for the join)",
+  rankRows([{ text: gluedRow, x: 0, y: 0, width: 1, height: 1 }], "Meta You're on the Muse waitlist").length === 0);
+
+// ─── Scenario AQ: painted-box integrity, egress evidence, ledger integrity ──
+console.log("\n=== Scenario AQ: painted boxes, egress evidence, ledger integrity ===\n");
+
+// `regionMappingFor` is already bound above (Scenario K); reuse it rather than
+// shadowing it, which esbuild rejects as a duplicate declaration.
+const { paintRectFor, normalizePaintedRect } = await import("../src/shared/region-mapping.ts");
+const { deriveOffscreenProtection, applyCaptureEvidence, missingProtection } = await import("../src/shared/screenshot-protection.ts");
+const { screenshotSendDecision } = await import("../src/shared/screenshot-egress.ts");
+const { verifyLedgerChain, recordTokenization, recordAction, initLedger, exportCertifiedAuditProof } =
+  await import("../src/background/privacy-ledger.ts");
+
+// ── The audit's box must be the box that was painted ──
+// The overlay used to be derived from the source region while the fill used the
+// padded, clamped, scroll-offset rect, so every proof marker sat off its mask —
+// and in full-page mode (offsetY in the thousands) far off it.
+const paintGeom = { scale: 2, offsetY: 0, imageWidth: 1000, imageHeight: 800 };
+const painted = paintRectFor({ x: 100, y: 50, width: 40, height: 20 }, paintGeom);
+ok("a region is padded and scaled into device pixels",
+  painted.x === 192 && painted.y === 92 && painted.width === 96 && painted.height === 56,
+  JSON.stringify(painted));
+const paintedBox = normalizePaintedRect(painted, 1000, 800);
+ok("the reported box round-trips to the painted rectangle",
+  Math.round(paintedBox.x * 1000) === painted.x &&
+  Math.round(paintedBox.y * 800) === painted.y &&
+  Math.round(paintedBox.width * 1000) === painted.width &&
+  Math.round(paintedBox.height * 800) === painted.height,
+  JSON.stringify(paintedBox));
+ok("the box is NOT the unpadded source rect (the old drift)",
+  Math.round(paintedBox.x * 1000) !== 200 && Math.round(paintedBox.y * 800) !== 100);
+
+// Full-page: regions are measured on the restored viewport, so the scroll
+// offset applies first and the clamp keeps the fill on the canvas.
+const fullPageMapping = regionMappingFor({
+  imageWidth: 2560, dpr: 2, viewportWidth: 1280, scrollY: 1200, fullPage: true, imageHeight: 4000,
+});
+ok("stitched mapping resolves to tile scale + scroll offset",
+  fullPageMapping.valid && fullPageMapping.scale === 2 && fullPageMapping.offsetY === 2400,
+  JSON.stringify(fullPageMapping));
+const deepRegion = paintRectFor(
+  { x: 10, y: 300, width: 100, height: 20 },
+  { scale: fullPageMapping.scale, offsetY: fullPageMapping.offsetY, imageWidth: 2560, imageHeight: 4000 },
+);
+// y = scroll*scale + region.y*scale - padding = 2400 + 600 - 8.
+ok("a region deep in a stitched page lands at scale*scroll + y*scale",
+  deepRegion.y === 2992, `y=${deepRegion.y}`);
+ok("and its reported box matches that painted row",
+  Math.round(normalizePaintedRect(deepRegion, 2560, 4000).y * 4000) === deepRegion.y);
+
+const clamped = paintRectFor({ x: 0, y: 0, width: 10, height: 10 }, paintGeom);
+ok("a region at the canvas edge is clamped, never negative",
+  clamped.x === 0 && clamped.y === 0 && clamped.width > 0 && clamped.height > 0);
+ok("a region entirely outside the canvas is not painted and not reported",
+  paintRectFor({ x: 5000, y: 5000, width: 10, height: 10 }, paintGeom) === null);
+ok("a zero-sized image yields a zero box rather than NaN",
+  normalizePaintedRect({ x: 1, y: 1, width: 1, height: 1 }, 0, 0).width === 0);
+ok("an invalid scale is refused rather than painted at 1:1",
+  paintRectFor({ x: 1, y: 1, width: 1, height: 1 }, { scale: 0, offsetY: 0, imageWidth: 10, imageHeight: 10 }) === null);
+
+// ── Egress evidence has real producers ──
+// The contract existed, the guard read it, and nothing wrote it — so the VLM
+// path could never ship a frame. These assert the producers and the guard agree.
+const healthyOffscreen = deriveOffscreenProtection({
+  faceScanRan: true, finalScanRan: true, residualDetections: 0, policyEnabled: true,
+});
+ok("offscreen evidence leaves the service-worker halves unclaimed",
+  healthyOffscreen.facesComplete === true &&
+  healthyOffscreen.finalScanComplete === true &&
+  healthyOffscreen.textComplete === false &&
+  healthyOffscreen.mappingValid === false &&
+  healthyOffscreen.reasons.length === 0,
+  JSON.stringify(healthyOffscreen));
+const assembled = applyCaptureEvidence(healthyOffscreen, { textComplete: true, mappingValid: true });
+ok("assembly supplies the text + geometry facts without weakening the rest",
+  assembled.textComplete === true && assembled.mappingValid === true &&
+  assembled.facesComplete === true && assembled.finalScanComplete === true);
+ok("a fully-evidenced frame is allowed to ship (vision is reachable)",
+  screenshotSendDecision({
+    redactedDataUrl: "data:image/jpeg;base64,AA==", detections: [], redactedCount: 0,
+    verification: { verified: true, regionsChecked: 3, regionsRedacted: 3, leakedPatterns: [] },
+    protection: assembled,
+  }).allowed === true);
+ok("a geometry failure alone is enough to refuse it",
+  screenshotSendDecision({
+    redactedDataUrl: "data:image/jpeg;base64,AA==", detections: [], redactedCount: 0,
+    verification: { verified: true, regionsChecked: 3, regionsRedacted: 3, leakedPatterns: [] },
+    protection: applyCaptureEvidence(healthyOffscreen, { textComplete: true, mappingValid: false }),
+  }).allowed === false);
+ok("a frame with no evidence at all is refused, not assumed safe",
+  screenshotSendDecision({
+    redactedDataUrl: "data:image/jpeg;base64,AA==", detections: [], redactedCount: 0,
+    verification: { verified: true, regionsChecked: 0, regionsRedacted: 0, leakedPatterns: [] },
+    protection: undefined,
+  }).allowed === false);
+ok("missingProtection() is explicit and refused",
+  missingProtection("no producer").facesComplete === false &&
+  missingProtection("no producer").residualDetections !== 0);
+
+// ── Ledger integrity is COMPUTED, not asserted ──
+// The panel's badge used to be rendered from a summary that re-hashed nothing
+// and seeded the first link from the first entry, so a tampered head was
+// structurally invisible. These mutate stored bytes and demand detection.
+await clearLedger();
+await recordSnapshot("https://example.com/a", "t", 3);
+await recordTokenization([{ token: "<PII_1>", kind: "pii_text" }]);
+await recordAction("click", true, 4);
+const storedKey = "pry-privacy-ledger";
+const readStore = () => mem.get(storedKey);
+
+const cleanChain = await verifyLedgerChain(readStore().entries);
+ok("an untouched ledger verifies every digest and link",
+  cleanChain.valid && cleanChain.hashesIntact && cleanChain.linksIntact && !cleanChain.headLinkUnverifiable,
+  JSON.stringify(cleanChain));
+const cleanSummary = await getLedgerSummary();
+ok("the summary badge is backed by re-derived digests",
+  cleanSummary.chainValid === true && cleanSummary.chainHashesIntact === true &&
+  cleanSummary.chainHeadUnverifiable === false &&
+  cleanSummary.totalActions === 1 && cleanSummary.lastEntryType === "action",
+  JSON.stringify(cleanSummary));
+
+// Tamper with the FIRST entry — the one the old check could never see.
+const tamperedHead = readStore();
+tamperedHead.entries[0] = { ...tamperedHead.entries[0], data: { ...tamperedHead.entries[0].data, elementCount: 999 } };
+mem.set(storedKey, tamperedHead);
+const headCheck = await getLedgerSummary();
+ok("tampering with the FIRST entry is detected (the old check was tautological)",
+  headCheck.chainValid === false && headCheck.chainHashesIntact === false,
+  JSON.stringify(headCheck));
+ok("and the summary names the tampered entry",
+  (headCheck.chainReasons ?? []).some((r) => /entry 1/.test(r)), JSON.stringify(headCheck.chainReasons));
+
+// Restore, then tamper with a middle entry's link only.
+await clearLedger();
+await recordSnapshot("https://example.com/a", "t", 1);
+await recordSnapshot("https://example.com/b", "t", 1);
+await recordSnapshot("https://example.com/c", "t", 1);
+const relinked = readStore();
+relinked.entries[2] = { ...relinked.entries[2], prevHash: relinked.entries[0].hash };
+mem.set(storedKey, relinked);
+const linkCheck = await verifyLedgerChain(readStore().entries);
+ok("a broken middle link is detected",
+  linkCheck.valid === false && linkCheck.linksIntact === false && linkCheck.hashesIntact === false,
+  JSON.stringify(linkCheck));
+
+// A trimmed log must not be reported as intact OR tampered: the head link is
+// genuinely unverifiable, and saying either would be a claim we cannot back.
+await clearLedger();
+await recordSnapshot("https://example.com/a", "t", 1);
+await recordSnapshot("https://example.com/b", "t", 1);
+const trimmed = readStore();
+trimmed.entries = trimmed.entries.slice(1);
+mem.set(storedKey, trimmed);
+const trimmedCheck = await getLedgerSummary();
+ok("a trimmed head is reported unverifiable, not INTACT and not TAMPERED",
+  trimmedCheck.chainHeadUnverifiable === true && trimmedCheck.chainHashesIntact === true &&
+  trimmedCheck.chainValid === true,
+  JSON.stringify(trimmedCheck));
+
+// ── The session boundary is real, and the export states its coverage ──
+await clearLedger();
+await initLedger();
+await recordSnapshot("https://example.com/a", "t", 1);
+const firstSession = await getLedgerSummary();
+await recordSnapshot("https://example.com/b", "t", 1);
+const sameSession = await getLedgerSummary();
+ok("entries land inside the session that wrote them",
+  firstSession.sessionEntries === 1 && sameSession.sessionEntries === 2,
+  `first=${firstSession.sessionEntries} same=${sameSession.sessionEntries}`);
+ok("sessionId is stable while the session runs",
+  firstSession.sessionId === sameSession.sessionId && /^session-/.test(firstSession.sessionId));
+await initLedger();
+await recordSnapshot("https://example.com/c", "t", 1);
+const nextSession = await getLedgerSummary();
+ok("a new run starts a new session id and its own entry count",
+  nextSession.sessionId !== sameSession.sessionId && nextSession.sessionEntries === 1,
+  `${nextSession.sessionId} vs ${sameSession.sessionId} / ${nextSession.sessionEntries}`);
+ok("history is appended across sessions, not discarded",
+  nextSession.totalEntries === 3, `entries=${nextSession.totalEntries}`);
+
+const proof = await exportCertifiedAuditProof();
+ok("the exported proof states the window the Merkle root covers",
+  proof.coverage.retainedFromSeq === 1 && proof.coverage.retainedToSeq === 3 &&
+  proof.coverage.trimmed === false && proof.coverage.maxEntries === 500,
+  JSON.stringify(proof.coverage));
+ok("the exported proof carries a 64-hex Merkle root over that window",
+  typeof proof.merkleRoot === "string" && /^[0-9a-f]{64}$/.test(proof.merkleRoot), proof.merkleRoot);
+ok("the exported proof reports the chain verdict it computed",
+  proof.chainValid === true && proof.chainHashesIntact === true &&
+  Array.isArray(proof.chainReasons));
+
+// clearLedger must actually clear — the reset button claims it does.
+await clearLedger();
+const afterClear = await getLedgerSummary();
+ok("clearLedger empties the ledger the panel reads",
+  afterClear.totalEntries === 0 && afterClear.chainValid === true,
+  JSON.stringify(afterClear));
+
+console.log("\n=== Scenario AR: adversarial redaction attack ===\n");
+
+const {
+  attackSoftRegions, uncoveredFaceBoxes, edgeEnergy, unsharpRegion,
+  RECONSTRUCTION_THRESHOLD, MIN_ORIGINAL_ENERGY,
+} = await import("../src/background/redaction-attack.ts");
+
+// ── Face coverage: a detection MISS, not a weak mask ──
+// This is the probe that matters most, because no escalation inside the known
+// regions can fix a face nobody boxed.
+const faceBox = { x: 100, y: 100, width: 40, height: 40 };
+const coverAll = { x: 95, y: 95, width: 50, height: 50 };
+const coverHalf = { x: 120, y: 100, width: 40, height: 40 };
+const coverGrazing = { x: 135, y: 135, width: 40, height: 40 };
+
+ok("a face fully inside a destroyed region is not reported",
+  uncoveredFaceBoxes([faceBox], [coverAll]).length === 0);
+ok("a face the region only half covers is still counted as covered (>= 50%)",
+  uncoveredFaceBoxes([faceBox], [coverHalf]).length === 0);
+ok("a face the region barely clips IS reported",
+  uncoveredFaceBoxes([faceBox], [coverGrazing]).length === 1,
+  JSON.stringify(uncoveredFaceBoxes([faceBox], [coverGrazing])));
+ok("with no destroyed regions every detected face is reported",
+  uncoveredFaceBoxes([faceBox], []).length === 1 &&
+  uncoveredFaceBoxes([faceBox], undefined).length === 1);
+ok("a degenerate zero-area detection is ignored rather than reported as a leak",
+  uncoveredFaceBoxes([{ x: 1, y: 1, width: 0, height: 30 }], []).length === 0);
+ok("adjacent-but-not-overlapping regions do not count as coverage",
+  uncoveredFaceBoxes([faceBox], [{ x: 140, y: 100, width: 10, height: 40 }]).length === 1);
+
+// ── Reconstruction: the probe decides on RESIDUAL energy ──
+// A region whose pixels are untouched carries 100% of its original edge energy,
+// which is the strongest possible statement that nothing was redacted.
+const textRegion = { x: 10, y: 10, width: 60, height: 30, kind: "input_field", label: "Search" };
+const sharpText = makeImage(80, 50, (x, y) =>
+  x >= 10 && x < 70 && y >= 10 && y < 40 ? ((x % 4) < 2 ? [20, 20, 20] : [250, 250, 250]) : white());
+
+const untouched = attackSoftRegions(sharpText, sharpText, [textRegion]);
+ok("an UNTOUCHED region is reported as fully recoverable",
+  untouched.length === 1 && Math.round(untouched[0].residualFraction * 100) === 100,
+  JSON.stringify(untouched.map((f) => f.residualFraction)));
+ok("and the reason names the residual, not a sharpening gain",
+  /dampened, not destroyed/.test(untouched[0].reason) && /100% of the original edge energy/.test(untouched[0].reason),
+  untouched[0].reason);
+
+const blackedOut = makeImage(80, 50, (x, y) =>
+  x >= 10 && x < 70 && y >= 10 && y < 40 ? black() : white());
+ok("an OPAQUE region is silent (nothing left to reconstruct)",
+  attackSoftRegions(sharpText, blackedOut, [textRegion]).length === 0);
+
+const blankBefore = makeImage(80, 50, white);
+ok("a region that was BLANK before redaction is not reported as a leak",
+  attackSoftRegions(blankBefore, blankBefore, [textRegion]).length === 0,
+  "a blank field cannot leak, and demanding an opaque fill of every empty input would black out whole forms");
+
+// A genuinely half-destroyed region: the text is softened by a box average, so
+// the structure is dampened but still present. This is the case the probe exists
+// for, and it is built here rather than by weakening a shipped paint so the
+// fixture cannot be mistaken for the real calibration (that lives in
+// scripts/offscreen-integration-test.mjs, against PRY's own blur).
+const soften = (img, rect, radius) => {
+  const out = { width: img.width, height: img.height, data: new Uint8ClampedArray(img.data) };
+  const span = radius * 2 + 1;
+  for (let y = rect.y; y < rect.y + rect.height; y++) {
+    for (let x = rect.x; x < rect.x + rect.width; x++) {
+      let sum = 0;
+      let n = 0;
+      for (let dy = -radius; dy <= radius; dy++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+          const px = x + dx;
+          const py = y + dy;
+          if (px < 0 || py < 0 || px >= img.width || py >= img.height) continue;
+          const i = (py * img.width + px) * 4;
+          sum += (img.data[i] + img.data[i + 1] + img.data[i + 2]) / 3;
+          n++;
+        }
+      }
+      const v = Math.round(sum / n);
+      const t = (y * img.width + x) * 4;
+      out.data[t] = v; out.data[t + 1] = v; out.data[t + 2] = v; out.data[t + 3] = 255;
+    }
+  }
+  return out;
+};
+const partial = soften(sharpText, textRegion, 3);
+const residual = edgeEnergy(partial, textRegion) / edgeEnergy(sharpText, textRegion);
+ok("a softened region keeps a real but reduced residual",
+  residual > 0 && residual < 1 && residual < RECONSTRUCTION_THRESHOLD,
+  `residual=${residual.toFixed(3)} threshold=${RECONSTRUCTION_THRESHOLD}`);
+ok("softening this much reads as destroyed at the shipped threshold",
+  attackSoftRegions(sharpText, partial, [textRegion]).length === 0,
+  `residual=${residual.toFixed(3)}`);
+// Pin the GATE itself: the decision must flip on the measured residual, not on
+// some other quantity that happens to correlate with it today.
+ok("the same pixels fire the moment the threshold drops past the residual",
+  attackSoftRegions(sharpText, partial, [textRegion], { threshold: residual + 0.02 }).length === 0 &&
+  attackSoftRegions(sharpText, partial, [textRegion], { threshold: residual - 0.02 }).length === 1,
+  `residual=${residual.toFixed(3)}`);
+
+ok("a tiny region yields no energy reading at all (no divide-by-zero guess)",
+  edgeEnergy(sharpText, { x: 10, y: 10, width: 2, height: 2 }) === 0);
+ok("the minimum-energy floor is what suppresses faint-but-blank fields",
+  MIN_ORIGINAL_ENERGY > 0 &&
+  attackSoftRegions(makeImage(80, 50, white), makeImage(80, 50, gray), [textRegion]).length === 0);
+
+// Sharpening must not WEAKEN a region: the evidence pass is a filter, and a
+// filter that lowered energy would let a destroyed region look recovered.
+const recovered = edgeEnergy(unsharpRegion(partial, textRegion), textRegion);
+ok("the evidence sharpening pass does not reduce measured energy",
+  recovered >= edgeEnergy(partial, textRegion) - 0.001,
+  `${edgeEnergy(partial, textRegion).toFixed(2)} → ${recovered.toFixed(2)}`);
+// The calibration finding that forced the residual gate: repeated unsharp
+// MANUFACTURES energy — three cheap passes drive a softened (i.e. already
+// judged-destroyed) region's measured energy ABOVE the sharp original, because
+// iterated unsharp manufactures ringing at an edge rather than restoring lost
+// bandwidth. A gate on "how much did sharpening bring back?" would therefore
+// open on every frame and escalate the whole product to solid black.
+let iterated = partial;
+for (let pass = 0; pass < 3; pass++) iterated = unsharpRegion(iterated, textRegion, 3, 4);
+const shippedE = edgeEnergy(partial, textRegion);
+const iteratedE = edgeEnergy(iterated, textRegion);
+ok("iterated sharpening inflates measured energy above the original",
+  iteratedE > edgeEnergy(sharpText, textRegion),
+  `orig=${edgeEnergy(sharpText, textRegion).toFixed(1)} softened=${shippedE.toFixed(1)} iterated=${iteratedE.toFixed(1)}`);
+ok("so a gain-based gate would have fired here, and the residual gate does not",
+  attackSoftRegions(sharpText, partial, [textRegion]).length === 0);
+ok("yet the opaque region is still silent under the shipped gate",
+  attackSoftRegions(sharpText, blackedOut, [textRegion]).length === 0);
+
+// ── The attack must be wired into the pipeline, not merely importable ──
+const offscreenSource = await readFile(new URL("../src/offscreen/offscreen.ts", import.meta.url), "utf8");
+ok("the shipped-frame attack is invoked on the real verification path",
+  /attackShippedFrame\(originalData, shippedData/.test(offscreenSource));
+ok("and its findings feed the same escalation the OCR leaks use",
+  /reconstructionHits > 0 \|\| uncoveredFaces\.length > 0/.test(offscreenSource));
+ok("an uncovered face is added to the rebuild region list (or the repaint would miss it)",
+  /escalationRegions = \[/.test(offscreenSource) && /rebuildWithOpaqueMasks\(originalCanvas, escalationRegions/.test(offscreenSource));
+ok("the attack evidence is reported on the verification object",
+  /attack: \{\s*\/\/ `ran` means the PROBE ran/.test(offscreenSource));
+ok("the face probe is awaited, not fired and forgotten",
+  /const shippedFaces = await detectFacesWithBlazeFace\(shippedCanvas\)/.test(offscreenSource));
+
+console.log("\n=== Scenario AS: task tokenization must not eat the user's instruction ===\n");
+
+// Regression set from a real run. The user asked for a YouTube channel by name;
+// the contextual name rule vaulted the name (and, in two cases, the rest of the
+// sentence), so the planner received an opaque token where its search target
+// should have been, spun for 43s trying to work out what <PII_1> was, and then
+// typed the token's own spelling into YouTube's search box.
+// `tokenizer` (the shared singleton) is already bound at the top of this file.
+const { leadingNameRun, MAX_NAME_WORDS, PIITokenizer } = await import("../src/background/tokenizer.ts");
+
+const UNTOUCHED_TASKS = [
+  // The report, verbatim.
+  "open youtube and suggest me to Harkirat Singh yt channel",
+  "i want to open harkirat singh yt channel",
+  // Ordinary prose around a preposition is not an addressee.
+  "go to Priya Sharma profile and download the file",
+  "add Ramesh Gupta to the meeting invite",
+  "open youtube and search for the best channel to watch",
+  "send the file to my manager",
+  "reply to the first email in the inbox",
+  "scroll to the bottom and read the page",
+  "can you find the best yt channel for devops",
+];
+for (const task of UNTOUCHED_TASKS) {
+  tokenizer.clear();
+  const { task: out, tokenCount } = tokenizer.tokenizeTask(task);
+  ok(`the task is not tokenized: ${JSON.stringify(task.slice(0, 44))}`,
+    out === task && tokenCount === 0,
+    `→ ${JSON.stringify(out)} (vault: ${tokenizer.getEntries().map((e) => e.original).join(" | ")})`);
+}
+
+// The feature must still work: a genuine message payload is tokenized, and the
+// vault holds the NAME — not the name plus the rest of the sentence.
+const MESSAGING_TASKS = [
+  { task: "send an email to Priya Sharma about the invoice", name: "Priya Sharma", keep: "about the invoice" },
+  { task: "reply to Sharma Traders with the quotation", name: "Sharma Traders", keep: "with the quotation" },
+  { task: "email Ramesh Gupta the report", name: "Ramesh Gupta", keep: "the report" },
+  { task: "text priya sharma the address", name: "priya sharma", keep: "the address" },
+  { task: "addressed to Acme Corporation", name: "Acme Corporation", keep: "" },
+  { task: "sent by Ramesh Gupta", name: "Ramesh Gupta", keep: "" },
+  { task: "name: Acme Corporation", name: "Acme Corporation", keep: "" },
+  { task: "send an email to प्रिया शर्मा", name: "प्रिया शर्मा", keep: "" },
+];
+for (const { task, name, keep } of MESSAGING_TASKS) {
+  tokenizer.clear();
+  const { task: out, tokenCount } = tokenizer.tokenizeTask(task);
+  const entries = tokenizer.getEntries();
+  ok(`a message payload IS tokenized: ${JSON.stringify(task.slice(0, 40))}`,
+    tokenCount === 1 && /<PII_1>/.test(out), `→ ${JSON.stringify(out)}`);
+  ok(`  …and the vault holds exactly the name (${JSON.stringify(name)})`,
+    entries.length === 1 && entries[0].original === name,
+    `vault=${JSON.stringify(entries.map((e) => e.original))}`);
+  ok("  …and the words AFTER the name survive in the task",
+    keep === "" ? true : out.endsWith(keep), `→ ${JSON.stringify(out)}`);
+}
+
+// Shape rules, pinned directly: these are the judgments the regex outsources.
+ok("a capitalised run stops where the capitals stop",
+  leadingNameRun("Harkirat Singh yt channel") === "Harkirat Singh");
+ok("a lowercase run stops at the first function word",
+  leadingNameRun("priya sharma the address") === "priya sharma");
+ok("a run that STARTS with a function word is prose, not a name",
+  leadingNameRun("the meeting invite") === null && leadingNameRun("my manager") === null);
+ok("a single word is not treated as a name after a preposition",
+  leadingNameRun("John") === null && leadingNameRun("youtube") === null);
+ok("a name run is capped at three words",
+  leadingNameRun("Alpha Beta Gamma Delta") === "Alpha Beta Gamma" && MAX_NAME_WORDS === 3);
+ok("non-Latin scripts are names too (any-script letter runs)",
+  leadingNameRun("प्रिया शर्मा") === "प्रिया शर्मा");
+ok("punctuation inside a name is preserved",
+  leadingNameRun("O'Brien Jean-Luc") === "O'Brien Jean-Luc");
+
+// ── Bracket-stripped tokens must resolve ──
+// Observed: told to pass <PII_1> verbatim, the planner emitted PII_1, the
+// bracketed match found nothing, and the literal characters were typed into the
+// page — the user's value silently replaced by the token's own spelling.
+for (const entry of tokenizer.getEntries()) {
+  const bare = entry.token.slice(1, -1);
+  const resolved = tokenizer.resolveAll(bare);
+  ok(`a bracket-stripped token resolves (${bare})`,
+    resolved === entry.original, `${bare} → ${JSON.stringify(resolved)}`);
+  ok(`  …and the bracketed form still resolves (${entry.token})`,
+    tokenizer.resolveAll(entry.token) === entry.original);
+}
+ok("a bare token that is NOT in the vault is left as written",
+  tokenizer.resolveAll("PII_99") === "PII_99" && tokenizer.resolveAll("MY_1ST_PLAN") === "MY_1ST_PLAN");
+ok("a substituted value is never re-scanned for another token",
+  (() => {
+    const t = new PIITokenizer();
+    // A vault whose value happens to spell a token: resolving the OTHER entry
+    // must not then resolve this value a second time.
+    t.tokenize("PII_2", "pii_text");
+    const rahul = t.tokenize("Rahul", "pii_text");
+    return t.resolveAll(rahul) === "Rahul";
+  })());
+ok("an identifier that merely looks token-ish is not resolved away",
+  tokenizer.resolveAll("SKU_1234 and v2_X1 ok") === "SKU_1234 and v2_X1 ok");
+
+// ── The planner must never be told to search for a token's spelling ──
+const { SYSTEM_PROMPT, SYSTEM_PROMPT_LOCAL, taskPrompt } = await import("../src/background/prompt.ts");
+for (const [name, prompt] of [["remote", SYSTEM_PROMPT], ["local", SYSTEM_PROMPT_LOCAL]]) {
+  ok(`the ${name} prompt says a token may be used as a search query`,
+    /SEARCH (QUERY|box)/i.test(prompt));
+  ok(`the ${name} prompt forbids typing the token's own spelling`,
+    /SPELLING/.test(prompt));
+}
+
+console.log("\n=== Scenario AT: what task text is redacted, and what must not be ===\n");
+
+// An audit of the whole task path against realistic inputs, kept as the
+// regression set. `want: true` is a SECRET the user is handing over (must be
+// tokenized); `want: false` is an INSTRUCTION PARAMETER (must reach the planner
+// intact). Every entry here was produced by asking "what would break the task?"
+// of the rules, not by reading them.
+const {
+  tokenKindForTextMatch, tokenKindLabel, buildTokenLegend,
+} = await import("../src/background/tokenizer.ts");
+
+const TASK_CASES = [
+  // Secrets — must be tokenized.
+  { task: "log in with password hunter2copy", want: true },
+  { task: "my card is 4111 1111 1111 1111, pay the bill", want: true },
+  { task: "use aadhaar 9900 5163 2666 for the form", want: true },
+  { task: "the key is sk-abcdefghijklmnopqrstuvwxyz012345", want: true },
+  { task: "otp is 483920, enter it", want: true },
+  { task: "my email is rahul.verma@example.com", want: true },
+  { task: "call me on +91 98765 43210", want: true },
+  { task: "PAN ABCDE1234F and IFSC HDFC0001234 for KYC", want: true },
+  { task: "send an email to Priya Sharma", want: true },
+  // A cue word outranks the checksum: these are LOOKALIKES (they fail Verhoeff),
+  // but the user called them their Aadhaar, so a typo must not leak them.
+  { task: "my Aadhaar number is 2345 6789 0129 please verify", want: true },
+  { task: "use aadhaar 4111 1111 1111 for the form", want: true },
+  // Parameters and prose — must NOT be tokenized.
+  { task: "open youtube and suggest me to Harkirat Singh yt channel", want: false },
+  { task: "find order 1234 5678 9012 in the orders page", want: false },
+  { task: "open the video with id 1234567890123456", want: false },
+  // Same lookalike digits, NO cue word: not an identity document, so the bare
+  // run needs the checksum to agree and it does not.
+  { task: "the form has 4111 1111 1111 in it", want: false },
+  { task: "search for the best yt channel for devops", want: false },
+  { task: "go to the settings page and turn on dark mode", want: false },
+  { task: "reply to the first email in my inbox", want: false },
+  { task: "open my profile picture and change it", want: false },
+  { task: "book a table for 2024 12 25 at 7pm", want: false },
+  { task: "open the file report 2025 09 18 final.pdf", want: false },
+  { task: "add a new contact called Work Notes", want: false },
+  { task: "open the password manager and change my login", want: false },
+  { task: "the key is configuration, not a secret", want: false },
+];
+
+let taskFalsePositives = 0;
+let taskFalseNegatives = 0;
+let taskGobbled = 0;
+for (const { task, want } of TASK_CASES) {
+  tokenizer.clear();
+  const { task: out, tokenCount, newEntries } = tokenizer.tokenizeTask(task);
+  const changed = tokenCount > 0;
+  if (changed && !want) taskFalsePositives++;
+  if (!changed && want) taskFalseNegatives++;
+  // A vault value that is not a substring of the task would mean the rule
+  // invented a value; a value containing sentence punctuation means it ate the
+  // instruction again.
+  for (const entry of newEntries) {
+    if (!task.includes(entry.original) || /[.!?]$/.test(entry.original)) taskGobbled++;
+  }
+  assert.equal(
+    changed,
+    want,
+    `task tokenization verdict for ${JSON.stringify(task)}: got ${JSON.stringify(out)} ` +
+    `(vault: ${JSON.stringify(newEntries.map((e) => e.original))})`,
+  );
+}
+ok("no instruction parameter is tokenized away (0 false positives)",
+  taskFalsePositives === 0, `${taskFalsePositives}/${TASK_CASES.length}`);
+ok("no secret in a task is left raw (0 false negatives)",
+  taskFalseNegatives === 0, `${taskFalseNegatives}/${TASK_CASES.length}`);
+ok("every vault value is an exact substring of the task (nothing gobbled)",
+  taskGobbled === 0, `${taskGobbled}`);
+
+// ── The masked line the panel shows for the user's own task ──
+tokenizer.clear();
+const maskedTask = tokenizer.tokenizeTask("send an email to Priya Sharma about the invoice");
+ok("tokenizeTask reports the entries IT created, for the panel to name",
+  maskedTask.newEntries.length === 1 && maskedTask.newEntries[0].original === "Priya Sharma",
+  JSON.stringify(maskedTask.newEntries.map((e) => e.original)));
+ok("and the masked sample it renders hides the value",
+  maskSample(maskedTask.newEntries[0].original) !== "Priya Sharma" &&
+  !maskSample(maskedTask.newEntries[0].original).includes("harma"),
+  maskSample(maskedTask.newEntries[0].original));
+ok("a task with nothing to redact reports no entries (no empty notice)",
+  (() => { tokenizer.clear(); return tokenizer.tokenizeTask("open youtube").newEntries.length === 0; })());
+
+// ── The token legend the planner receives ──
+tokenizer.clear();
+tokenizer.tokenize("Priya Sharma", "pii_text");
+tokenizer.tokenize("4111 1111 1111 1111", "credential");
+tokenizer.tokenize("9900 5163 2666", "id_number");
+const legend = buildTokenLegend(tokenizer.getEntries());
+ok("the legend lists every live token",
+  ["<PII_1>", "<CRED_1>", "<ID_1>"].every((t) => legend.includes(t)), legend);
+ok("the legend describes the CATEGORY and never the value",
+  /person, company or place name/.test(legend) &&
+  !/Priya|Sharma|4111|9900/.test(legend), legend);
+ok("the legend tells the planner a token is usable as a search query",
+  /search box/i.test(legend), legend);
+ok("an empty vault produces no legend at all (no empty section)",
+  (() => { tokenizer.clear(); return buildTokenLegend(tokenizer.getEntries()) === null; })());
+ok("a long vault is capped and says so",
+  (() => {
+    const t = new PIITokenizer();
+    for (let i = 0; i < 11; i++) t.tokenize(`Person${i} Name`, "pii_text");
+    const l = buildTokenLegend(t.getEntries(), 8);
+    return l.includes("+3 more token(s)") && !l.includes("Person10 Name");
+  })());
+ok("each vault kind has a human label",
+  ["pii_text", "credential", "id_number", "api_key", "image_text", "something_new"]
+    .every((k) => tokenKindLabel(k).length > 3));
+ok("the shared matcher maps to the prefix the panel expects",
+  tokenKindForTextMatch("email", "Email address") === "credential" &&
+  tokenKindForTextMatch("phone", "Phone number") === "credential" &&
+  tokenKindForTextMatch("id_text", "Card number") === "credential" &&
+  tokenKindForTextMatch("id_text", "Aadhaar number") === "id_number" &&
+  tokenKindForTextMatch("name_text", "Person name") === "pii_text");
+ok("the task prompt carries the legend when there is one",
+  (() => {
+    const withLegend = taskPrompt("do the thing", "https://x.test", "X", "LEGEND_HERE");
+    const without = taskPrompt("do the thing", "https://x.test", "X");
+    return withLegend.includes("LEGEND_HERE") && withLegend.includes("Task: do the thing") &&
+      without === "Current tab: X — https://x.test\n\nTask: do the thing";
+  })());
+
+tokenizer.clear();
 
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

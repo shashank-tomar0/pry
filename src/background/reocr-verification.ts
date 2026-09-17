@@ -23,6 +23,7 @@
  */
 
 import type { VerificationResult } from "../shared/types";
+import { tierForKind, tierSetsFor } from "../shared/region-paint";
 
 export type { VerificationResult };
 
@@ -254,19 +255,83 @@ export function regionChangedFraction(
   return count > 0 ? changed / count : 0;
 }
 
-/** Kinds whose redaction is a blur rather than a solid mask. */
-const BLUR_KINDS = new Set(["input_field", "credential_label", "credential"]);
+// ─── Tier vocabulary, derived from the painter's own table ──────────────────
+//
+// These sets used to be maintained HERE, independently of the painter, and the
+// two disagreed: `credential` was painted as a surrogate while this file
+// classified it as a blur, so the check measured the wrong guarantee for that
+// kind. Both sides now read `tierForKind` from shared/region-paint.ts, and the
+// verifier asks it with the SAME policy the frame was painted under — otherwise
+// a frame the user asked to paint softly (masking off) would be measured as if
+// it had promised opaque fills, and fail for obeying its own settings.
 
 /**
  * Kinds whose redaction must be IRREVERSIBLE, not merely altered.
  *
- * Faces live here. A blurred face is still the face: super-resolution
- * deanonymization inverts a Gaussian blur given the kernel, which is the very
- * attack PRY's threat model names. Accepting "pixels changed" for these kinds
- * would let a reverting edit to the offscreen pipeline silently weaken the
- * guarantee again, so the verifier demands near-total opaque coverage.
+ * Faces and the exact-PII span kinds live here. A blurred face is still the
+ * face: super-resolution deanonymization inverts a Gaussian blur given the
+ * kernel, which is the very attack PRY's threat model names. Accepting "pixels
+ * changed" for these kinds would let a reverting edit to the offscreen pipeline
+ * silently weaken the guarantee again, so the verifier demands near-total opaque
+ * coverage — and since the painter fills exactly these kinds with pure black,
+ * the demand is one the shipped code can actually meet.
  */
-const DESTROYED_KINDS = new Set(["face"]);
+function destroyedKindsFor(policy: VerificationTierPolicy): Set<string> {
+  return tierSetsFor(policy).destroyed;
+}
+
+/**
+ * The tier policy a frame was painted with. Structurally `PaintPolicy`, named
+ * separately here so this module does not have to care whether the painter's
+ * policy ever grows a third toggle.
+ */
+export interface VerificationTierPolicy {
+  destroyFaces: boolean;
+  maskCredentials: boolean;
+}
+
+/**
+ * The toggles as they ship. Used only when the caller has no policy in hand —
+ * every real capture passes its own, because the tiers it painted with are the
+ * tiers that must be proven.
+ */
+export const DEFAULT_TIER_POLICY: VerificationTierPolicy = {
+  destroyFaces: true,
+  maskCredentials: true,
+};
+
+/** Kinds on the soft tier: they must be proven altered, not proven opaque. */
+function softKindsFor(policy: VerificationTierPolicy): Set<string> {
+  return tierSetsFor(policy).soft;
+}
+
+/**
+ * The regions worth reading back with OCR.
+ *
+ * An OCR re-read exists to catch a SOFT region that still holds the user's
+ * original text — the case where a blur was too weak to matter. A SURROGATE
+ * region is excluded because by construction it holds NONE of the user's
+ * pixels: the real value was discarded and a synthetic, format-preserving
+ * stand-in was painted instead. Reading it back therefore finds PRY's own
+ * painting, and those stand-ins are designed to satisfy the very patterns this
+ * scan looks for — the synthetic card "4111 8703 3161 1545" matches "Card
+ * number" and (16 digits in 4-4-4 groups) "Aadhaar number", and the synthetic
+ * email and phone match their patterns too. Every frame containing a masked
+ * credential field used to report ~4 residual leaks, fail its own mask
+ * verification, and be withheld from vision — a privacy check rejecting the
+ * output it had just produced correctly.
+ *
+ * Coverage is not reduced. The failure this inclusion COULD catch — a surrogate
+ * region that was never painted — is caught directly by the pixel check, which
+ * sees an unpainted region keep its original variance and show no change at all
+ * (see `verifyRegions`).
+ */
+export function ocrCheckableRegions<T extends { kind: string }>(
+  regions: readonly T[],
+  policy: VerificationTierPolicy = DEFAULT_TIER_POLICY,
+): T[] {
+  return regions.filter((region) => tierForKind(region.kind, policy) !== "surrogate");
+}
 /** Fraction of the region that must be near-black for a destroyed region. */
 const DESTROYED_BLACK_RATIO = 0.9;
 
@@ -324,7 +389,17 @@ export function verifyRegions(
   redacted: PixelImage,
   regions: RedactionRegion[],
   timestamp: number = Date.now(),
+  /**
+   * The policy the frame was PAINTED with. Defaults to the shipped toggles, so
+   * an arithmetic-only caller (the harness) gets the ordinary run's tiers. An
+   * offscreen caller must pass its real policy: with masking off the span kinds
+   * are painted softly, and measuring them as if they had been filled opaque
+   * would fail a frame for honouring the user's settings.
+   */
+  policy: VerificationTierPolicy = DEFAULT_TIER_POLICY,
 ): VerificationResult {
+  const destroyedKinds = destroyedKindsFor(policy);
+  const softKinds = softKindsFor(policy);
   let regionsChecked = 0;
   let regionsRedacted = 0;
   const leakedPatterns: string[] = [];
@@ -360,7 +435,7 @@ export function verifyRegions(
       // Destroyed kinds require PROOF of irreversibility, checked before the
       // loose "pixels changed" rule below — otherwise a regression back to
       // blur (which changes plenty of pixels) would still verify.
-      if (DESTROYED_KINDS.has(region.kind)) {
+      if (destroyedKinds.has(region.kind)) {
         // Interior measurement: prove the fill itself, not the JPEG ringing at
         // its edge. A blur/touch-up regression leaves the interior non-black.
         if (interiorBlackRatio >= DESTROYED_BLACK_RATIO) {
@@ -368,7 +443,7 @@ export function verifyRegions(
           continue;
         }
         leakedPatterns.push(
-          `"${region.label}" (${region.kind}) at ${region.x},${region.y} is not opaque ` +
+          `PIXEL: "${region.label}" (${region.kind}) at ${region.x},${region.y} is not opaque ` +
           `(only ${Math.round(interiorBlackRatio * 100)}% of the interior covered) — a ` +
           `reversible redaction, recoverable by super-resolution deanonymization.`,
         );
@@ -383,7 +458,7 @@ export function verifyRegions(
       // energy and moves a large fraction of pixels, even when the source
       // text is faint gray (placeholder text) and the mean diff stays low.
       // An untouched region keeps its sharpness and pixel identity.
-      if (BLUR_KINDS.has(region.kind)) {
+      if (softKinds.has(region.kind)) {
         const e0 = regionGradientEnergy(original, region.x, region.y, region.width, region.height);
         const e1 = regionGradientEnergy(redacted, region.x, region.y, region.width, region.height);
         const changed = regionChangedFraction(original, redacted, region.x, region.y, region.width, region.height);
@@ -393,7 +468,7 @@ export function verifyRegions(
         }
       }
       leakedPatterns.push(
-        `"${region.label}" (${region.kind}) at ${region.x},${region.y} was not visibly redacted — original content may still be visible.`,
+        `PIXEL: "${region.label}" (${region.kind}) at ${region.x},${region.y} was not visibly redacted — original content may still be visible.`,
       );
     } else {
       // No original for comparison: a mask or a low-variance (blurred/uniform)
@@ -402,7 +477,7 @@ export function verifyRegions(
         regionsRedacted++;
       } else {
         leakedPatterns.push(
-          `"${region.label}" (${region.kind}) at ${region.x},${region.y} could not be confirmed redacted.`,
+          `PIXEL: "${region.label}" (${region.kind}) at ${region.x},${region.y} could not be confirmed redacted.`,
         );
       }
     }

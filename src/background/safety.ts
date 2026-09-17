@@ -14,6 +14,8 @@
  */
 
 import type { AgentAction, PageElement, PageSnapshot } from "../shared/types";
+import { isAadhaarNumber, isCardNumber } from "../shared/checksums";
+import { normalizeForMatch } from "../shared/text-target";
 
 // ─── Credential Patterns ────────────────────────────────────────────────────
 
@@ -49,8 +51,11 @@ const CREDENTIAL_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
 ];
 
 /**
- * Value-level patterns. If the text being typed matches any of these,
- * it is refused even if the field itself looks innocent.
+ * Value-level patterns for secrets that have NO checksum to validate against.
+ *
+ * Their shapes are self-identifying (a `sk-ant-` prefix is not a coincidence),
+ * so an anchored shape test is the strongest evidence available: there is no
+ * arithmetic that could confirm or refute one.
  */
 const VALUE_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
   // API keys
@@ -63,15 +68,43 @@ const VALUE_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
   { pattern: /^AKIA[0-9A-Z]{16}/, label: "AWS access key" },
   { pattern: /^eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\./, label: "JWT token" },
   { pattern: /^-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----/, label: "Private key" },
-  // Card numbers (13-19 digits, with optional spaces/dashes)
-  { pattern: /^\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{1,7}$/, label: "Card number" },
-  // Aadhaar: 12 digits
-  { pattern: /^\d{4}\s?\d{4}\s?\d{4}$/, label: "Aadhaar number" },
-  // PAN: 5 letters + 4 digits + 1 letter
-  { pattern: /^[A-Z]{5}\d{4}[A-Z]$/, label: "PAN number" },
-  // SSN: XXX-XX-XXXX
+  // SSN: XXX-XX-XXXX. No checksum exists, so the shape is the whole test.
   { pattern: /^\d{3}-\d{2}-\d{4}$/, label: "SSN" },
 ];
+
+/**
+ * Identifier shapes that CAN be validated, and are therefore only refused when
+ * the arithmetic agrees.
+ *
+ * This used to be three bare regexes, and the cost was real: `/\b\d{4}\s?\d{4}\s?\d{4}\b/`
+ * refuses any twelve-digit run with optional single spaces — an order number, a
+ * reference, a phone-plus-extension — with a message claiming it "looks like an
+ * Aadhaar number". The rest of this codebase is built on the opposite principle,
+ * stated in `shared/checksums.ts`: regex hits become validated detections and
+ * lookalikes become MEASURED false positives instead of over-redaction. The same
+ * standard belongs on the typing gate, so a value is refused when a real Aadhaar
+ * (Verhoeff, never 0/1-led) or a real card (Luhn) is found in it.
+ *
+ * Scanning without anchors rather than matching the whole string is deliberate:
+ * "my aadhaar is 2345 6789 0123" typed into a field still contains the identity
+ * number, and refusing only when the value IS the number would let that through.
+ *
+ * PAN keeps a shape-only test because PAN has no checkable digit — but its
+ * pattern is 10 characters in a strictly alternating letter/digit form, so it is
+ * not the false-positive source that a bare digit run is.
+ */
+export function matchedIdentifierLabel(text: string): string | undefined {
+  // Cards: 13-19 digits with optional separators, validated by Luhn.
+  for (const m of text.matchAll(/(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)/g)) {
+    if (isCardNumber(m[0])) return "Card number";
+  }
+  // Aadhaar: exactly 12 digits, 4-4-4 or contiguous, validated by Verhoeff.
+  for (const m of text.matchAll(/(?<!\d)\d{4}[ -]?\d{4}[ -]?\d{4}(?!\d)/g)) {
+    if (isAadhaarNumber(m[0])) return "Aadhaar number";
+  }
+  if (/\b[A-Z]{5}\d{4}[A-Z]\b/.test(text)) return "PAN number";
+  return undefined;
+}
 
 // ─── Irreversible Action Patterns ───────────────────────────────────────────
 
@@ -156,23 +189,30 @@ export function gate(
       };
     }
 
-    // Check if the value contains an Indian ID number.
-    if (/\b\d{4}\s?\d{4}\s?\d{4}\b/.test(text)) {
+    // Check whether the value CONTAINS a checksum-valid identifier. Validating
+    // rather than shape-matching is the difference between refusing a real
+    // Aadhaar/card and refusing every twelve-digit run with spaces in it.
+    const identifier = matchedIdentifierLabel(text);
+    if (identifier) {
       return {
         verdict: "refuse",
         reason:
-          "Refusing to type that value — it looks like an Aadhaar number. " +
-          "Sensitive identity documents should be entered by the user directly.",
+          `Refusing to type that value — it validates as a ${identifier}. ` +
+          `Identity and payment documents are the user's to enter, not the agent's; ` +
+          `ask them to fill the field, then continue once they confirm.`,
       };
     }
-    if (/\b[A-Z]{5}\d{4}[A-Z]\b/.test(text)) {
-      return {
-        verdict: "refuse",
-        reason:
-          "Refusing to type that value — it looks like a PAN number. " +
-          "Tax identification documents should be entered by the user directly.",
-      };
-    }
+  }
+
+  // A text-anchored click with no usable text is not a click, it is a blind
+  // click — refused whether or not confirmations are enabled, because there is
+  // no target to confirm and the click would land on whatever happens to be
+  // under the pointer.
+  if (action.name === "click_text" && normalizeForMatch(String(action.input.text ?? "")).length < 2) {
+    return {
+      verdict: "refuse",
+      reason: "click_text needs the visible text of the target (at least 2 characters).",
+    };
   }
 
   // ── If confirmations are disabled, allow everything that passed the checks above ──
@@ -185,6 +225,20 @@ export function gate(
       return {
         verdict: "confirm",
         summary: `Click ${JSON.stringify(el.name)} on ${snapshot?.title ?? "this page"}?`,
+      };
+    }
+  }
+
+  // A text-anchored click has no element to inspect, so the REQUESTED TEXT is
+  // what gets checked. Without this, click_text would be a hole in the same
+  // confirmation the id-based path enforces: "Delete account" is just as
+  // irreversible typed as it is resolved.
+  if (action.name === "click_text") {
+    const text = String(action.input.text ?? "");
+    if (IRREVERSIBLE_PATTERNS.some((p) => p.test(text))) {
+      return {
+        verdict: "confirm",
+        summary: `Click ${JSON.stringify(text)} on ${snapshot?.title ?? "this page"}?`,
       };
     }
   }

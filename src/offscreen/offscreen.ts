@@ -28,15 +28,44 @@
  * Results are sent back via chrome.runtime.sendMessage (NOT sendResponse).
  */
 
-import type { DetectedPII } from "../background/pii-detector";
-import { verifyRegions, emptyVerification, detectPIIInText, layoutRegionCrops } from "../background/reocr-verification";
-import { getSyntheticSurrogate } from "../background/surrogates";
-import { ocrDataUrl } from "./ocr";
-import type { VerificationResult } from "../shared/types";
+import {
+  verifyRegions,
+  emptyVerification,
+  detectPIIInText,
+  layoutRegionCrops,
+  ocrCheckableRegions,
+} from "../background/reocr-verification";
+import {
+  attackSoftRegions,
+  uncoveredFaceBoxes,
+  type PixelRect,
+  type ReconstructionFinding,
+} from "../background/redaction-attack";
+import { tierForKind } from "../shared/region-paint";
+import { ocrDataUrl, ocrWordLines } from "./ocr";
+import {
+  findTriageBoxes,
+  dropCoveredBoxes,
+  capTriageBoxes,
+  type OcrLine,
+  type TriageBox,
+} from "../shared/ocr-pii-triage";
+import type { ScreenshotProtection, VerificationResult } from "../shared/types";
 import { detectSpans, warmUpNer } from "../ml/ner";
 import { classifyInjection, warmUpGuard } from "../ml/guard";
 import { FilesetResolver, FaceDetector as MpFaceDetector } from "@mediapipe/tasks-vision";
+import { tileLooksReadable } from "../shared/frame-text";
 import { mergeFaceBoxes, type FaceBox } from "../shared/face-regions";
+import { normalizePaintedRect } from "../shared/region-mapping";
+import {
+  BLUR_RADIUS_CSS_PX,
+  OPAQUE_FILL,
+  planRegionPaints,
+  SURROGATE_BORDER,
+  SURROGATE_FILL,
+  SURROGATE_TEXT_FILL,
+} from "../shared/region-paint";
+import { deriveOffscreenProtection } from "../shared/screenshot-protection";
 
 // ─── BlazeFace (real face detection, Tier 0) ────────────────────────────────
 // Replaces the skin-color heuristic as the PRIMARY face channel. The model
@@ -63,7 +92,7 @@ async function getBlazeFace(): Promise<MpFaceDetector | null> {
           return await MpFaceDetector.createFromOptions(files, {
             baseOptions: { modelAssetPath, delegate: "GPU" },
             runningMode: "IMAGE",
-            minDetectionConfidence: 0.4,
+            minDetectionConfidence: 0.28,
           });
         }
       } catch {
@@ -73,7 +102,7 @@ async function getBlazeFace(): Promise<MpFaceDetector | null> {
       return await MpFaceDetector.createFromOptions(files, {
         baseOptions: { modelAssetPath, delegate: "CPU" },
         runningMode: "IMAGE",
-        minDetectionConfidence: 0.4,
+        minDetectionConfidence: 0.28,
       });
     })().catch(() => {
       blazeFaceFailed = true;
@@ -107,7 +136,7 @@ async function detectFacesWithBlazeFace(
           confidence: d.categories?.[0]?.score ?? 0.8,
         };
       })
-      .filter((f) => f.width > 20 && f.height > 20);
+      .filter((f) => f.width > 16 && f.height > 16);
   } finally {
     bitmap.close();
   }
@@ -138,6 +167,23 @@ async function getChromeFaceDetector(): Promise<FaceDetector | null> {
 }
 
 // ─── Types ──────────────────────────────────────────────────────────────────
+
+/**
+ * One entry in the frame's audit detection list.
+ *
+ * NOTE the `kind` vocabulary is the AUDIT vocabulary, not the model-facing
+ * `DetectedPII["kind"]` union: a password box reports as `password`, a card box
+ * as `credit_card`, and the side panel's colour map has a deliberate entry for
+ * each (red for secrets, violet for identifiers). The previous code typed this
+ * list as `DetectedPII[]` and cast every write with `as any`, which is how field
+ * kinds came to sit outside the type they were declared to be.
+ */
+interface AuditDetection {
+  kind: string;
+  box?: { x: number; y: number; width: number; height: number };
+  confidence: number;
+  label: string;
+}
 
 interface SensitiveRegion {
   x: number;
@@ -179,7 +225,12 @@ function isSkinColor(r: number, g: number, b: number): boolean {
     nb > 0.08 && nb < 0.32 &&
     nr > nb;
 
-  return rgbRule || normalizedRule;
+  // Rule 3: YCbCr chrominance color space (standard invariant against lighting and shadows).
+  const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+  const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+  const ycbcrRule = cb >= 77 && cb <= 135 && cr >= 130 && cr <= 177;
+
+  return rgbRule || normalizedRule || ycbcrRule;
 }
 
 /**
@@ -312,7 +363,13 @@ function regionsOverlap(
 // pixel blur always alters the region, so redaction + verification agree
 // everywhere. Cost is trivial for field/face-sized regions.
 
-function blurChannel(
+/**
+ * Exported for the verification harness only: it needs PRY's REAL blur so the
+ * adversarial probe can be calibrated against the thing it will actually be
+ * pointed at ("is the radius this pipeline ships recoverable?") instead of
+ * against a blur the test wrote to make itself pass.
+ */
+export function blurChannel(
   img: { width: number; height: number; data: Uint8ClampedArray },
   channel: number,
   radius: number,
@@ -353,8 +410,11 @@ function blurChannel(
   }
 }
 
-/** Box-blur an (x, y, w, h) device-pixel region in place on the context. */
-function boxBlurRegion(
+/**
+ * Box-blur an (x, y, w, h) device-pixel region in place on the context.
+ * Exported for the harness — see `blurChannel`.
+ */
+export function boxBlurRegion(
   ctx: OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D,
   x: number,
   y: number,
@@ -397,6 +457,7 @@ async function processScreenshot(
     destroyFaces: boolean;
     maskCredentials: boolean;
     showRedactionLabels: boolean;
+    scanFrameText?: boolean;
   },
   /**
    * Region→image mapping (see the service worker's captureAndProcessScreenshot):
@@ -405,6 +466,8 @@ async function processScreenshot(
    */
   regionScale: number = dpr,
   regionOffsetY: number = 0,
+  /** Spans the on-device NER already found on this page — see triageFrameText. */
+  knownSpans: string[] = [],
 ): Promise<{
   redactedDataUrl: string;
   detections: Array<{
@@ -416,6 +479,8 @@ async function processScreenshot(
   redactedCount: number;
   processingTimeMs: number;
   verification: VerificationResult;
+  /** Egress evidence this document can witness. See screenshot-protection.ts. */
+  protection: ScreenshotProtection;
 }> {
   const startTime = performance.now();
   console.log(`[PRY Offscreen] Processing ${width}x${height} screenshot, DPR=${dpr}, ${sensitiveRegions.length} DOM regions + face detection`);
@@ -451,7 +516,7 @@ async function processScreenshot(
     label: string;
   }> = [];
 
-  const allDetections: DetectedPII[] = [];
+  const allDetections: AuditDetection[] = [];
 
   // Scale factor: DOM coordinates are CSS pixels, screenshot is device pixels.
   // Full-page captures fold the tile scale and scroll offset into regionScale
@@ -463,102 +528,77 @@ async function processScreenshot(
   const showLabels = privacy?.showRedactionLabels === true;
 
   // 1. DOM-guided redaction — redact known sensitive regions.
-  for (const region of sensitiveRegions) {
-    // Scale CSS coordinates to device pixels + expand by 4px padding. The
-    // scroll offset applies before clamping so a region above the fold of the
-    // restored viewport still lands on the right stitched row.
-    const padding = 4 * scale;
-    const rx = Math.max(0, Math.round(region.x * scale - padding));
-    const ry = Math.max(0, Math.round(region.y * scale + regionOffsetY - padding));
-    const rw = Math.min(width - rx, Math.round(region.width * scale + padding * 2));
-    const rh = Math.min(height - ry, Math.round(region.height * scale + padding * 2));
+  //
+  // The tier decision and the painted rectangle both come from
+  // shared/region-paint.ts as a plan, so this loop only executes ops. That
+  // matters for more than tidiness: the audit box is read off `op.box`, which
+  // was derived from `op.rect` — the rectangle this loop paints. Previously the
+  // box was derived from the SOURCE region while the fill used a padded,
+  // clamped, scroll-offset rect, so every proof marker sat off its mask (and far
+  // off it in full-page mode). One op, one rectangle.
+  const paintOps = planRegionPaints(
+    sensitiveRegions,
+    { scale, offsetY: regionOffsetY, imageWidth: width, imageHeight: height },
+    { destroyFaces, maskCredentials },
+  );
 
-    if (rw <= 0 || rh <= 0) continue;
+  for (const op of paintOps) {
+    const rect = op.rect;
+    if (!rect || !op.box) continue;
+    const { x: rx, y: ry, width: rw, height: rh } = rect;
 
-    // Placement per region kind:
-    //   face                 → opaque black fill (same guarantee as the pixel
-    //                          channel; a blurred face is still the face)
-    //   *_text               → solid black box over exactly the PII span
-    //   credential_label /
-    //   input_field          → soft box-blur, escalated if OCR reads it back
-    //   everything else      → surrogate inpaint (real pixels discarded)
-    //
-    // DOM-detected faces (perceive.ts marks avatar/profile images as
-    // `kind: "face"`) used to fall through to the SURROGATE branch: a white
-    // box with a lock glyph. That broke the pipeline's own contract in both
-    // directions — a white box is a reversible redaction for a biometric
-    // identifier, and verifyRegions (DESTROYED_KINDS) then failed the frame,
-    // reporting a leak on a region the pipeline itself had painted white.
-    const isFace = region.kind === "face";
-
-    if (isFace && !destroyFaces) {
-      // Face redaction is switched off by the user: still report the
-      // detection, change nothing. (The pixel channel behaves identically.)
+    if (op.tier === "skip") {
+      // Face redaction is switched off, or masking is off for this kind: still
+      // report the detection, change nothing. Reported with the rect we WOULD
+      // have painted, so the panel can show what was left untouched, and
+      // deliberately NOT added to redactionRegions — an unpainted region is not
+      // a redaction, and counting it as one made the audit's "regions masked"
+      // claim larger than the pixels support.
       allDetections.push({
-        kind: "face",
-        box: {
-          x: (region.x * scale) / width,
-          y: (region.y * scale + regionOffsetY) / height,
-          width: (region.width * scale) / width,
-          height: (region.height * scale) / height,
-        },
+        kind: op.detectionKind,
+        box: op.box,
         confidence: 0.95,
-        label: region.label,
+        label: `${op.label} — NOT redacted (destruction is off for this kind)`,
       });
       continue;
     }
 
-    const solidText = region.kind.endsWith("_text");
-    const useBlur =
-      region.kind === "credential_label" ||
-      region.kind === "input_field";
-
-    // full-mask credential regions (password/card/Aadhaar/API-key fields) are
-    // gated by the user's maskCredentials toggle. Soft input-field blur always
-    // runs (a generic field the user types into is still sensitive), but when
-    // masking is off we degrade to blur so the pixels are still protected.
-    if (isFace || (solidText && maskCredentials)) {
-      // Solid black, zero information left: the span is exactly the PII.
-      ctx.fillStyle = "#000000";
+    if (op.tier === "opaque") {
+      // Solid black, zero information left.
+      ctx.fillStyle = OPAQUE_FILL;
       ctx.fillRect(rx, ry, rw, rh);
-    } else if (useBlur || !maskCredentials) {
+    } else if (op.tier === "blur") {
       // Deterministic blur (see boxBlurRegion): alters pixels on every Chrome
       // build, so re-OCR verification can always confirm the redaction.
-      boxBlurRegion(ctx, rx, ry, rw, rh, 6 * scale);
+      boxBlurRegion(ctx, rx, ry, rw, rh, op.blurRadius ?? BLUR_RADIUS_CSS_PX * scale);
     } else {
-      // Synthetic Semantic Surrogate Inpainting:
-      // Overwrite the real PII pixels completely with a clean field + synthetic surrogate data.
-      // This wipes real PII from the pixel buffer while giving downstream VLMs realistic visual structure.
-      ctx.fillStyle = "#ffffff";
+      // Synthetic Semantic Surrogate Inpainting: overwrite the real PII pixels
+      // with a clean field, then draw a format-preserving synthetic value so
+      // downstream visual structure survives.
+      ctx.fillStyle = SURROGATE_FILL;
       ctx.fillRect(rx, ry, rw, rh);
-      ctx.strokeStyle = "#6366f1";
-      ctx.lineWidth = Math.max(1, Math.round(scale));
+      ctx.strokeStyle = SURROGATE_BORDER;
+      ctx.lineWidth = 1;
       ctx.strokeRect(rx, ry, rw, rh);
 
-      const surrogateText = getSyntheticSurrogate(region.kind || region.label, region.value);
-      ctx.fillStyle = "#0f172a";
-      ctx.font = `600 ${Math.max(9, Math.round(Math.min(rh * 0.45, 12 * scale)))}px system-ui, -apple-system, sans-serif`;
+      const fontSize = op.fontSizePx ?? Math.max(9, Math.round(Math.min(rh * 0.5, 12 * scale)));
+      const pad = op.padPx ?? 4 * scale;
+      ctx.fillStyle = SURROGATE_TEXT_FILL;
+      ctx.font = `500 ${fontSize}px system-ui, -apple-system, sans-serif`;
       ctx.textBaseline = "middle";
       ctx.textAlign = "left";
-      const pad = 4 * scale;
-      ctx.fillText(`🔒 ${surrogateText}`, rx + pad, ry + rh / 2, Math.max(10, rw - pad * 2));
+      ctx.fillText(op.surrogateText ?? "", rx + pad, ry + rh / 2, Math.max(10, rw - pad * 2));
     }
 
     allDetections.push({
-      kind: isFace ? "face" : (region.kind === "credential_label" || region.kind === "input_field") ? "credential" : region.kind as any,
-      // Normalized 0-1 coordinates (same convention as face boxes) so the
-      // audit panel can overlay proof markers on the thumbnail regardless of
-      // DPR or display size: x_norm = cssPx * dpr / deviceWidth.
-      box: {
-        x: (region.x * scale) / width,
-        y: (region.y * scale + regionOffsetY) / height,
-        width: (region.width * scale) / width,
-        height: (region.height * scale) / height,
-      },
+      kind: op.detectionKind,
+      box: op.box,
       confidence: 0.95,
-      label: region.label,
+      label: op.label,
     });
-    redactionRegions.push({ x: rx, y: ry, width: rw, height: rh, kind: region.kind, label: region.label });
+    // Only painted ops reach the verifier, so "regions checked" is exactly the
+    // set of regions whose pixels this pipeline claims to have changed.
+    redactionRegions.push({ x: rx, y: ry, width: rw, height: rh, kind: op.kind, label: op.label });
 
     // Optional demo labels: a small chip above the redacted region so viewers
     // can see exactly where PII was hidden. Off by default; only used for demos.
@@ -586,13 +626,28 @@ async function processScreenshot(
   // out" report. Model channels still run only as a pair (Chrome's detector is
   // the same class of accuracy as BlazeFace and costs a full-image encode).
   let modelFaces: FaceBox[] = [];
+  // Evidence for the egress contract: a channel counts as "ran" only when it
+  // completed without throwing. A model that is missing and a model that threw
+  // are the same thing to the guard — no proof — but the reason string they
+  // leave behind is not, so the failure is captured rather than swallowed.
+  let faceChannelRan = false;
+  let faceChannelFailure = "";
 
   try {
-    modelFaces = (await detectFacesWithBlazeFace(canvas)).map((f) => ({ ...f, source: "model" as const }));
+    // ORIGINAL pixels, not `canvas`. The DOM region loop above has already
+    // painted black fills onto `canvas`, and the skin-colour pass below
+    // deliberately reads `originalCtx` for exactly that reason — but this call
+    // passed the redacted canvas, contradicting its own documented contract
+    // ("BlazeFace pass over the ORIGINAL pixels"). Feeding masks to the
+    // detector is how a face near a redacted field goes undetected and stays
+    // readable in a frame the pipeline believes it cleaned.
+    modelFaces = (await detectFacesWithBlazeFace(originalCanvas)).map((f) => ({ ...f, source: "model" as const }));
+    faceChannelRan = true;
     if (modelFaces.length > 0) {
       console.log(`[PRY Offscreen] BlazeFace found ${modelFaces.length} faces`);
     }
-  } catch {
+  } catch (err) {
+    faceChannelFailure = err instanceof Error ? err.message : String(err);
     // Fall through to the next channel.
   }
 
@@ -602,7 +657,8 @@ async function processScreenshot(
       try {
         const bitmap = await createImageBitmap(await (async () => {
           const c = new OffscreenCanvas(width, height);
-          c.getContext("2d")!.drawImage(canvas, 0, 0);
+          // Original pixels here too — same reason as BlazeFace above.
+          c.getContext("2d")!.drawImage(originalCanvas, 0, 0);
           return c.convertToBlob();
         })());
         const faces = await chromeDetector.detect(bitmap);
@@ -615,10 +671,12 @@ async function processScreenshot(
           confidence: 0.95,
           source: "model" as const,
         }));
+        faceChannelRan = true;
         if (modelFaces.length > 0) {
           console.log(`[PRY Offscreen] Chrome FaceDetector found ${modelFaces.length} faces`);
         }
-      } catch {
+      } catch (err) {
+        faceChannelFailure = faceChannelFailure || (err instanceof Error ? err.message : String(err));
         // Fall through to skin-color.
       }
     }
@@ -631,10 +689,12 @@ async function processScreenshot(
   try {
     const imageData = originalCtx.getImageData(0, 0, width, height);
     skinFaces = detectFacesBySkinColor(imageData, width, height).map((f) => ({ ...f, source: "skin" as const }));
+    faceChannelRan = true;
     if (skinFaces.length > 0) {
       console.log(`[PRY Offscreen] Skin-colour heuristic found ${skinFaces.length} candidate faces`);
     }
-  } catch {
+  } catch (err) {
+    faceChannelFailure = faceChannelFailure || (err instanceof Error ? err.message : String(err));
     // No supplementary channel — the model's boxes still stand.
   }
 
@@ -684,15 +744,61 @@ async function processScreenshot(
 
       allDetections.push({
         kind: "face",
-        box: {
-          x: face.x / width,
-          y: face.y / height,
-          width: face.width / width,
-          height: face.height / height,
-        },
+        // The EXPANDED, clamped rectangle — the pixels this loop actually
+        // painted — not the raw detector box. Reporting the unexpanded box put
+        // the audit marker inside the mask instead of on it.
+        box: normalizePaintedRect({ x: rx, y: ry, width: rw, height: rh }, width, height),
         confidence: face.confidence,
         label: destroyFaces ? "Face destroyed (opaque)" : "Face detected",
       });
+    }
+  }
+
+  // 2.5 Frame-text triage — the only channel that can see PII the DOM never had.
+  //       Every other pixel path starts from the DOM (text nodes, fields,
+  //       avatars, detector elements). Text baked into an <img>, a <canvas> or a
+  //       video frame is invisible to all of them, so it stayed readable in the
+  //       audit's BEFORE/AFTER pair and — with vision on — in the frame that
+  //       shipped. This reads the ALREADY-REDACTED canvas back with on-device
+  //       OCR and boxes whatever PII is still legible there, which makes it
+  //       self-targeting: a DOM-redacted value is a black rectangle and OCR
+  //       cannot read it, so what remains is by definition what nothing else
+  //       covered. Best-effort and bounded: no OCR, no triage, never a block.
+  let triageBoxes = 0;
+  let triageDropped = 0;
+  let triageRan = false;
+  if (privacy?.scanFrameText !== false) {
+    try {
+      const triage = await triageFrameText(canvas, width, height, redactionRegions, knownSpans);
+      triageRan = triage.ran;
+      triageDropped = triage.dropped;
+      for (const box of triage.boxes) {
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(box.x, box.y, box.width, box.height);
+        redactionRegions.push({
+          x: box.x,
+          y: box.y,
+          width: box.width,
+          height: box.height,
+          kind: box.kind,
+          label: box.label,
+        });
+        allDetections.push({
+          kind: "image_text",
+          // Painted rect, normalised — same rule as every other channel.
+          box: normalizePaintedRect(
+            { x: box.x, y: box.y, width: box.width, height: box.height },
+            width, height,
+          ),
+          confidence: 0.8,
+          label: box.label,
+        });
+        triageBoxes++;
+      }
+      console.log(`[PRY Offscreen] Frame-text triage: ${triageBoxes} box(es) painted, ` +
+        `${triageDropped} capped, ${triage.tiles} tile(s) examined, ${triage.timedOut ? "PARTIAL (tile budget or timeout)" : "complete"}`);
+    } catch {
+      // Triage is additive: a failed OCR must never lose the DOM redactions.
     }
   }
 
@@ -706,10 +812,16 @@ async function processScreenshot(
   // (the post-JPEG image) and re-scan every redacted region, at the pixel level
   // and with a real OCR re-read, to prove the redaction worked.
   let verification: VerificationResult = emptyVerification();
+  // Evidence for the egress contract (see shared/screenshot-protection.ts).
+  // With no redacted regions there is nothing to re-read, and the pass is
+  // complete by definition — treating that as "the scan did not run" would have
+  // withheld every frame of a clean page for no reason.
+  let finalScanRan = redactionRegions.length === 0;
+  let finalScanFailure = "";
   if (redactionRegions.length > 0) {
     try {
       const originalData = originalCtx.getImageData(0, 0, width, height);
-      const first = await verifyShippedImage(redactedBlob, originalData, redactionRegions, width, height);
+      const first = await verifyShippedImage(redactedBlob, originalData, redactionRegions, width, height, { destroyFaces, maskCredentials });
       verification = first.result;
 
       // 5. ESCALATION — the auditor must REMEDIATE, not just complain.
@@ -720,28 +832,83 @@ async function processScreenshot(
       //    never reaches the model — and the claim that incomplete redactions
       //    are elevated to zero-entropy fills is a description of this code
       //    rather than an aspiration.
-      if (first.ocrLeaks.length > 0) {
-        const escalated = await rebuildWithOpaqueMasks(originalCanvas, redactionRegions, width, height);
+      //    The adversarial pass feeds the SAME escalation. A region a
+      //    reconstruction probe can still read is no different from a region OCR
+      //    can still read: both mean the blur did not destroy the content, and
+      //    both must be lifted to an opaque fill before the frame ships.
+      const reconstructionHits = first.attack.reconstruction.length;
+      const uncoveredFaces = first.attack.uncoveredFaces;
+      if (first.ocrLeaks.length > 0 || reconstructionHits > 0 || uncoveredFaces.length > 0) {
+        // A face the detector found only in the SHIPPED frame is not in
+        // `redactionRegions` — nothing painted it — so the rebuild has to be
+        // told about it, or the escalation would repaint the frame and still
+        // ship the face. These boxes become real redactions from here on: they
+        // are painted, they are reported as detections, and they are re-verified
+        // like every other region.
+        const escalationRegions = [
+          ...redactionRegions,
+          ...uncoveredFaces.map((box) => ({
+            x: box.x,
+            y: box.y,
+            width: box.width,
+            height: box.height,
+            kind: "face",
+            label: "Face found by the adversarial re-probe",
+          })),
+        ];
+        const escalated = await rebuildWithOpaqueMasks(originalCanvas, escalationRegions, width, height);
         redactedBlob = escalated.blob;
         redactedDataUrl = escalated.dataUrl;
-        const second = await verifyShippedImage(redactedBlob, originalData, redactionRegions, width, height);
+        for (const box of uncoveredFaces) {
+          redactionRegions.push({ ...box, kind: "face", label: "Face found by the adversarial re-probe" });
+          allDetections.push({
+            kind: "face",
+            box: normalizePaintedRect(box, width, height),
+            confidence: 0.7,
+            label: "Face found by the adversarial re-probe",
+          });
+        }
+        const second = await verifyShippedImage(redactedBlob, originalData, escalationRegions, width, height, { destroyFaces, maskCredentials });
+        // WHY the rebuild happened. The escalated frame's own leak list is
+        // (correctly) empty — the leaks were destroyed — but a record with no
+        // trace of what the first paint got wrong is not an audit, it is a
+        // clean bill of health for a failure nobody wrote down.
+        const escalationReasons = [
+          ...first.ocrLeaks.map((l) => `OCR: ${l} was still readable in a soft region`),
+          ...first.attack.details,
+        ];
         verification = {
           ...second.result,
           escalated: true,
+          escalationReasons: [...new Set(escalationReasons)],
+          // The FIRST pass's attack evidence is kept: the second run attacks a
+          // rebuild it just proved clean, so it reports nothing by construction.
+          attack: {
+            ...(second.result.attack ?? { ran: true, reconstructableRegions: 0, uncoveredFaces: 0, details: [] }),
+            reconstructableRegions: reconstructionHits,
+            uncoveredFaces: uncoveredFaces.length,
+            details: [
+              ...first.attack.details,
+              ...(second.result.attack?.details ?? []),
+            ],
+          },
           leakedText: verification.leakedText ?? second.result.leakedText,
           summary: second.result.verified
-            ? `ESCALATED: OCR found ${first.ocrLeaks.join(", ")} readable in a blurred region, so every region was destroyed and the image re-verified. ${second.result.summary}`
+            ? `ESCALATED: ${escalationReason(reconstructionHits, uncoveredFaces.length, first.ocrLeaks)}, ` +
+              `so every region was destroyed and the image re-verified. ${second.result.summary}`
             : `ESCALATED and still failing: ${second.result.summary}`,
         };
       }
+      finalScanRan = true;
       console.log(`[PRY Offscreen] Re-OCR verification: ${verification.summary}`);
     } catch (error) {
+      finalScanFailure = error instanceof Error ? error.message : String(error);
       verification = {
         verified: false,
         regionsChecked: 0,
         regionsRedacted: 0,
         leakedPatterns: [
-          `Re-OCR verification could not run: ${error instanceof Error ? error.message : String(error)}`,
+          `Re-OCR verification could not run: ${finalScanFailure}`,
         ],
         confidence: 0,
         summary: "WARNING: re-OCR verification could not run.",
@@ -750,7 +917,23 @@ async function processScreenshot(
     }
   }
 
-  console.log(`[PRY Offscreen] Redacted ${allDetections.length} items (${faceBoxes.length} faces, ${sensitiveRegions.length} DOM regions) in ${(performance.now() - startTime).toFixed(0)}ms`);
+  // The egress contract's evidence, produced where the scans actually ran:
+  // this document witnessed its own face pass and its own final scan, so it
+  // reports those; the service worker owns the text-channel and geometry halves
+  // (see shared/screenshot-protection.ts) because it is the process holding
+  // those numbers. Before this, nothing produced the object at all and the
+  // guard refused every frame, so the vision path could never ship one.
+  const protection = deriveOffscreenProtection({
+    faceScanRan: faceChannelRan,
+    faceScanFailure: faceChannelFailure || undefined,
+    finalScanRan,
+    finalScanFailure: finalScanFailure || undefined,
+    // Proven leaks only: the pixel re-read and the OCR re-read both write here.
+    residualDetections: verification.leakedPatterns?.length ?? 0,
+    policyEnabled: destroyFaces && maskCredentials,
+  });
+
+  console.log(`[PRY Offscreen] Redacted ${redactionRegions.length} region(s) of ${allDetections.length} detection(s) (${faceBoxes.length} faces, ${sensitiveRegions.length} DOM regions, ${triageBoxes} from frame-text OCR${triageRan ? "" : " (triage unavailable)"}) in ${(performance.now() - startTime).toFixed(0)}ms`);
 
   return {
     redactedDataUrl,
@@ -760,10 +943,100 @@ async function processScreenshot(
       confidence: d.confidence,
       label: d.label,
     })),
-    redactedCount: allDetections.length,
+    // Regions actually masked on the canvas, not the number of things noticed.
+    // A face that was detected while face destruction is off is a finding, not
+    // a redaction, and counting it inflated the audit's "regions masked" claim
+    // above what the pixels support.
+    redactedCount: redactionRegions.length,
     processingTimeMs: performance.now() - startTime,
     verification,
+    protection,
   };
+}
+
+/** Tile height for frame-text triage. One viewport-ish slice at a time. */
+const TRIAGE_TILE_HEIGHT = 900;
+/** Never OCR more than this many slices — bounds the worst-case frame cost. */
+const TRIAGE_MAX_TILES = 6;
+/** Per-tile OCR bound; a tile that times out is reported, not retried. */
+const TRIAGE_TILE_TIMEOUT_MS = 8000;
+
+/**
+ * Read the already-redacted canvas back with on-device OCR and return the boxes
+ * that still hold legible PII.
+ *
+ * Tiled on purpose. A stitched full-page capture can be 1280×10000, and handing
+ * that to Tesseract in one call costs tens of seconds and a lot of memory; the
+ * run would stall waiting for its own privacy check. Slicing keeps each OCR job
+ * viewport-sized, and the tile budget bounds the total: a very tall page is
+ * triaged from the top down and the shortfall is REPORTED (`timedOut`), never
+ * implied to be complete.
+ *
+ * Returns `ran: false` when OCR was unavailable for every tile — the caller
+ * then knows the frame was not triaged at all, which is a different statement
+ * from "triaged and clean".
+ */
+async function triageFrameText(
+  canvas: OffscreenCanvas,
+  width: number,
+  height: number,
+  covered: Array<{ x: number; y: number; width: number; height: number }>,
+  knownSpans: string[],
+): Promise<{ boxes: TriageBox[]; dropped: number; tiles: number; timedOut: boolean; ran: boolean }> {
+  const tileHeight = Math.min(TRIAGE_TILE_HEIGHT, height);
+  const tileCount = Math.min(TRIAGE_MAX_TILES, Math.max(1, Math.ceil(height / tileHeight)));
+  const collected: OcrLine[] = [];
+  let tilesRun = 0;
+  let tilesBlank = 0;
+  let timedOut = false;
+
+  for (let index = 0; index < tileCount; index++) {
+    const top = index * tileHeight;
+    const sliceHeight = Math.min(tileHeight, height - top);
+    if (sliceHeight <= 0) break;
+    try {
+      const tile = new OffscreenCanvas(width, sliceHeight);
+      const tileCtx = tile.getContext("2d")!;
+      // Copy from the REDACTED canvas: whatever is still readable here is what
+      // no other channel covered.
+      tileCtx.drawImage(canvas, 0, top, width, sliceHeight, 0, 0, width, sliceHeight);
+      // Skip blank slices. Most of a page is whitespace or an already-painted
+      // black mask, and OCR'ing either one is pure cost in the user's critical
+      // path. A slice with almost no mid-tone pixels carries no legible text.
+      if (!tileLooksReadable(tileCtx.getImageData(0, 0, width, sliceHeight))) {
+        tilesBlank++;
+        continue;
+      }
+      // PNG, not JPEG: compression artifacts around small UI text cost real
+      // recognition accuracy, and this image never leaves the machine.
+      const tileUrl = await blobToDataUrl(await tile.convertToBlob({ type: "image/png" }));
+      const lines = await ocrWordLines(tileUrl, TRIAGE_TILE_TIMEOUT_MS);
+      if (!lines) {
+        // A null result is either "nothing legible in this tile" or a failure;
+        // only a total absence across all tiles means OCR itself was down.
+        continue;
+      }
+      tilesRun++;
+      for (const line of lines) {
+        collected.push({
+          words: line.words.map((w) => ({ ...w, y: w.y + top })),
+        });
+      }
+    } catch {
+      timedOut = timedOut || index < tileCount - 1;
+    }
+  }
+
+  // Any tile left unprocessed (budget reached) means partial coverage.
+  if (tileCount < Math.ceil(height / tileHeight)) timedOut = true;
+
+  const found = findTriageBoxes(collected, { spans: knownSpans });
+  const uncovered = dropCoveredBoxes(found, covered);
+  const { kept, dropped } = capTriageBoxes(uncovered);
+  // `ran` means the frame was EXAMINED, not that it produced boxes: a page that
+  // is mostly whitespace was triaged and is clean. Reporting that as "triage
+  // unavailable" would be the wrong story for the common case.
+  return { boxes: kept, dropped, tiles: tilesRun + tilesBlank, timedOut, ran: tilesRun + tilesBlank > 0 };
 }
 
 /**
@@ -786,18 +1059,49 @@ async function verifyShippedImage(
   regions: Array<{ x: number; y: number; width: number; height: number; kind: string; label: string }>,
   width: number,
   height: number,
-): Promise<{ result: VerificationResult; ocrLeaks: string[] }> {
+  /** The tiers this frame was painted with — see verifyRegions. */
+  policy: { destroyFaces: boolean; maskCredentials: boolean },
+): Promise<{ result: VerificationResult; ocrLeaks: string[]; attack: AttackOutcome }> {
   const bitmap = await createImageBitmap(blob);
   const verifyCanvas = new OffscreenCanvas(width, height);
   const verifyCtx = verifyCanvas.getContext("2d", { willReadFrequently: true })!;
   verifyCtx.drawImage(bitmap, 0, 0);
   bitmap.close();
 
-  let result = verifyRegions(originalData, verifyCtx.getImageData(0, 0, width, height), regions);
+  const shippedData = verifyCtx.getImageData(0, 0, width, height);
+  let result = verifyRegions(originalData, shippedData, regions, Date.now(), policy);
   let ocrLeaks: string[] = [];
 
+  // ── Adversarial attack, on the SHIPPED pixels ────────────────────────────
+  //
+  // Everything above asks "did the redaction happen?". This asks the question
+  // the project's own threat model actually cares about: "can I UNDO it?". Two
+  // probes, both against the decoded bytes that are about to ship:
+  //
+  //   1. Reconstruction — the soft (blur) tier is a low-pass filter, and a
+  //      low-pass filter is invertible given its kernel. Sharpening each soft
+  //      region measures how much of the original's edge energy is still in
+  //      there. An opaque fill returns ~0; a blur returns a real fraction, and
+  //      that fraction is the honest measure of what is recoverable.
+  //   2. Face coverage — re-run the model detector over the SHIPPED frame and
+  //      look for any face outside every region the pipeline believes it
+  //      destroyed. That is not a weak mask, it is a MISSING one, and no amount
+  //      of escalation inside the known regions can fix it.
+  //
+  // The artifact is built here, next to the pixels, because this is the only
+  // place that holds both the original and the exact shipped buffer.
+  const attack = await attackShippedFrame(originalData, shippedData, regions, policy, verifyCanvas);
+  if (attack.details.length > 0) {
+    result = {
+      ...result,
+      leakedPatterns: [...result.leakedPatterns, ...attack.details],
+    };
+  }
+
   try {
-    const layout = layoutRegionCrops(regions);
+    // Only regions that could still hold the USER's pixels are read back — see
+    // ocrCheckableRegions for why the surrogate tier is out.
+    const layout = layoutRegionCrops(ocrCheckableRegions(regions, policy));
     if (layout.slots.length > 0) {
       const ocrCanvas = new OffscreenCanvas(layout.width, layout.height);
       const ocrCtx = ocrCanvas.getContext("2d")!;
@@ -841,7 +1145,127 @@ async function verifyShippedImage(
     // OCR is corroboration only — the pixel result above stands.
   }
 
-  return { result, ocrLeaks };
+  // The attack evidence travels with the verification (so the audit panel can
+  // show what was probed, not just what failed) and with the leak list (so the
+  // escalation pass below treats a recoverable blur exactly like a readable
+  // string: something that must not reach the model).
+  result = {
+    ...result,
+    attack: {
+      // `ran` means the PROBE ran, not that it found anything — the same
+      // distinction the egress contract draws for scan completeness. A probe
+      // that could not run (detector missing, pixel read failed) reports false
+      // so the audit never implies a frame was attacked when it was not.
+      ran: attack.ran,
+      reconstructableRegions: attack.reconstruction.length,
+      uncoveredFaces: attack.uncoveredFaces.length,
+      details: attack.details,
+    },
+  };
+
+  return { result, ocrLeaks, attack };
+}
+
+/**
+ * Why the frame was escalated, as a phrase. Built rather than interpolated
+ * inline because the three triggers fire independently and the zero cases read
+ * as nonsense ("proved 0 recoverable blur(s) and 1 uncovered face(s)") if the
+ * counts are simply concatenated.
+ */
+function escalationReason(reconstructionHits: number, uncoveredFaces: number, ocrLeaks: string[]): string {
+  const reasons: string[] = [];
+  if (reconstructionHits > 0) {
+    reasons.push(`${reconstructionHits} blur${reconstructionHits === 1 ? "" : "s"} the adversarial pass proved recoverable`);
+  }
+  if (uncoveredFaces > 0) {
+    reasons.push(`${uncoveredFaces} face${uncoveredFaces === 1 ? "" : "s"} the pipeline had not covered`);
+  }
+  if (ocrLeaks.length > 0) {
+    reasons.push(`OCR still reading ${ocrLeaks.join(", ")}`);
+  }
+  const last = reasons.pop() ?? "a redaction the auditor could not accept";
+  return reasons.length > 0 ? `${reasons.join(", ")} and ${last}` : last;
+}
+
+/** What the adversarial pass found on one candidate shipped frame. */
+interface AttackOutcome {
+  /** True when the reconstruction probe completed (found nothing or not). */
+  ran: boolean;
+  /** Soft regions a reconstruction probe could still read. */
+  reconstruction: ReconstructionFinding[];
+  /** Faces the detector still finds outside every destroyed region. */
+  uncoveredFaces: PixelRect[];
+  /** Human-readable lines, ready for the audit's reason list. */
+  details: string[];
+}
+
+/**
+ * Attack one candidate frame: reconstruction on the soft tier, plus a face
+ * coverage re-probe when faces were supposed to be destroyed.
+ *
+ * Runs on the shipped pixels only. A region painted opaque has no structure to
+ * recover, so the probe is silent there — which is what makes escalation
+ * convergent: re-running this after a rebuild finds nothing, and the loop
+ * cannot oscillate.
+ */
+async function attackShippedFrame(
+  originalData: ImageData,
+  shippedData: ImageData,
+  regions: Array<{ x: number; y: number; width: number; height: number; kind: string; label: string }>,
+  policy: { destroyFaces: boolean; maskCredentials: boolean },
+  shippedCanvas: OffscreenCanvas,
+): Promise<AttackOutcome> {
+  const details: string[] = [];
+  let ran = false;
+  let reconstruction: ReconstructionFinding[] = [];
+  let uncoveredFaces: PixelRect[] = [];
+
+  try {
+    // Only the SOFT tier is attackable: `skip` regions were deliberately left
+    // alone, and opaque/surrogate regions have had their real pixels discarded.
+    const soft = regions
+      .filter((r) => tierForKind(r.kind, policy) === "blur")
+      .map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height, kind: r.kind, label: r.label }));
+    if (soft.length > 0) {
+      reconstruction = attackSoftRegions(originalData, shippedData, soft);
+      for (const finding of reconstruction) details.push(`RECONSTRUCTION: ${finding.reason}`);
+    }
+    // Nothing on the soft tier means there was nothing to reconstruct: the probe
+    // is complete, and an opaque/surrogate-only frame is genuinely not soft-
+    // attackable rather than unexamined.
+    ran = true;
+  } catch {
+    // A probe failure must never block a frame the pixel checks already passed.
+  }
+
+  if (policy.destroyFaces) {
+    try {
+      // The model detector only. The skin-colour pass is deliberately excluded:
+      // it is a high-recall heuristic with a real false-positive rate, and a
+      // false positive here would escalate the frame (blacking out an innocent
+      // region) on the strength of a colour histogram.
+      //
+      // AWAITED, not fire-and-forget: an unawaited probe would hand back an
+      // empty finding list before the detector resolved, so the attack would
+      // silently report "no uncovered faces" on every frame — a check that
+      // always passes, which is worse than no check.
+      const shippedFaces = await detectFacesWithBlazeFace(shippedCanvas);
+      const covered = regions.filter((r) => r.kind === "face");
+      uncoveredFaces = uncoveredFaceBoxes(shippedFaces, covered);
+      for (const box of uncoveredFaces) {
+        details.push(
+          `FACE COVERAGE: a face is still detectable in the shipped image at ` +
+          `${Math.round(box.x)},${Math.round(box.y)} (${Math.round(box.width)}×${Math.round(box.height)}), ` +
+          `outside every region PRY destroyed — a detection miss, not a weak mask.`,
+        );
+      }
+    } catch {
+      // Detector unavailable: the face half reports nothing rather than claiming
+      // a clean frame it never probed.
+    }
+  }
+
+  return { ran, reconstruction, uncoveredFaces, details };
 }
 
 /**
@@ -895,7 +1319,10 @@ chrome.runtime.onMessage.addListener(
         destroyFaces: boolean;
         maskCredentials: boolean;
         showRedactionLabels: boolean;
+        scanFrameText?: boolean;
       };
+      /** NER spans already found on the page, for in-image name triage. */
+      knownSpans?: string[];
       text?: string;
     },
     _sender: chrome.runtime.MessageSender,
@@ -917,6 +1344,7 @@ chrome.runtime.onMessage.addListener(
         message.privacy,
         message.regionScale ?? message.dpr ?? 1,
         message.regionOffsetY ?? 0,
+        message.knownSpans ?? [],
       )
         .then((result) => {
           // Send result back via sendMessage, NOT sendResponse.

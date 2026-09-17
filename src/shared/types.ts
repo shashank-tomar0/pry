@@ -35,6 +35,8 @@ export interface PageSnapshot {
 
 export type ActionName =
   | "click"
+  /** Click by visible text — the handle that exists when no element id does. */
+  | "click_text"
   | "type"
   | "select"
   | "scroll"
@@ -91,10 +93,52 @@ export interface VerificationResult {
    * then re-verified. The shipped bytes are the escalated ones.
    */
   escalated?: boolean;
+  /**
+   * Why the frame was rebuilt — the findings that triggered escalation.
+   *
+   * Kept SEPARATE from `leakedPatterns` because the two answer different
+   * questions, and conflating them broke the egress guard: `leakedPatterns`
+   * means "still present in the bytes that ship", so a remediated finding must
+   * leave it or `residualDetections` stays above zero and the frame is withheld
+   * forever. Without this field the reason for the rebuild was then lost
+   * entirely — an escalated frame reported a clean pass with no trace of what
+   * the first paint got wrong.
+   */
+  escalationReasons?: string[];
+  /**
+   * What the ADVERSARIAL pass probed on the shipped pixels — the audit's answer
+   * to "can this redaction be undone?" rather than "did it happen?".
+   *
+   * `leakedPatterns` already carries the human-readable findings; this exists so
+   * the panel can separate "the pixel check passed" from "an attack on those
+   * pixels failed", which is the distinction the whole feature rests on.
+   */
+  attack?: {
+    /** True when the reconstruction probe completed (whether or not it hit). */
+    ran: boolean;
+    /** Soft regions a sharpening probe could still read energy out of. */
+    reconstructableRegions: number;
+    /** Faces the detector still finds in the shipped frame, unredacted. */
+    uncoveredFaces: number;
+    /** Full reason lines, one per finding. */
+    details: string[];
+  };
+}
+
+/** Completed scanning evidence; never a guarantee of detector recall. */
+export interface ScreenshotProtection {
+  facesComplete: boolean;
+  textComplete: boolean;
+  mappingValid: boolean;
+  finalScanComplete: boolean;
+  residualDetections: number;
+  policyEnabled: boolean;
+  reasons: string[];
 }
 
 /** Screenshot processing result from the privacy pipeline. */
 export interface ProcessedScreenshotResult {
+  protection?: ScreenshotProtection;
   redactedDataUrl: string;
   detections: Array<{
     kind: string;
@@ -117,6 +161,10 @@ export type ContentRequest =
   | { kind: "capture-and-act"; action: AgentAction }
   | { kind: "get-sensitive-regions" }
   | { kind: "locate-spans"; spans: string[] }
+  /** Detector→pixel bridge: box PII found inside an element (aria-label,
+   *  title, value) where no text node exists to measure. Each target carries
+   *  the value it holds so the box can be attributed back to it. */
+  | { kind: "locate-elements"; targets: Array<{ selector: string; value?: string }> }
   | { kind: "fullpage-begin" }
   | { kind: "fullpage-scroll"; y: number; hideSticky: boolean }
   | { kind: "fullpage-restore" };
@@ -362,6 +410,16 @@ export interface PrivacySettings {
   tokenizePII: boolean;
   /** Show redaction labels on screenshots (demo mode). */
   showRedactionLabels: boolean;
+  /**
+   * Read the finished frame back with on-device OCR and black-box any PII the
+   * DOM channels could not see — text baked into an image, a canvas, a video
+   * frame or a PDF viewer's output. Every other pixel channel starts from the
+   * DOM, so without this those pixels are unredactable by construction.
+   *
+   * Costs one OCR pass per capture; unrelated to the re-OCR verification of
+   * redacted regions, which always runs.
+   */
+  scanFrameText: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -387,6 +445,7 @@ export const DEFAULT_SETTINGS: Settings = {
     maskCredentials: true,
     tokenizePII: true,
     showRedactionLabels: false,
+    scanFrameText: false,
   },
   elevenlabs: {
     apiKey: "",
@@ -512,6 +571,15 @@ export interface InspectData {
     confidence: number;
     summary: string;
     checkedAt: number;
+    /**
+     * True when the adversarial auditor remediated a soft region it could
+     * recover (or a face it re-found) and rebuilt the frame. The bytes on
+     * screen are the escalated ones, so the inspector must not present them as
+     * the ordinary paint output.
+     */
+    escalated?: boolean;
+    /** What the adversarial pass probed, carried through to the inspector. */
+    attack?: VerificationResult["attack"];
   };
   vault: Array<{
     token: string;

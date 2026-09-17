@@ -15,8 +15,9 @@
  */
 
 import { createWorker } from "tesseract.js";
-import type { Worker } from "tesseract.js";
+import type { Page, Worker } from "tesseract.js";
 import { correctOcrText } from "./ocr-correct";
+import type { OcrLine, OcrWord } from "../shared/ocr-pii-triage";
 
 let workerPromise: Promise<Worker> | null = null;
 
@@ -46,14 +47,12 @@ async function getWorker(): Promise<Worker> {
 }
 
 /**
- * OCR a data URL (redacted screenshot) and return its recognized text.
- * Returns null on any failure or timeout — the caller falls back to the
- * pixel-region verification result.
+ * Run one recognition and hand back the raw page, or null on failure/timeout.
+ *
+ * Single choke point for the worker so the text and word-box callers share
+ * exactly one warm-up, one timeout policy and one recovery path.
  */
-export async function ocrDataUrl(
-  dataUrl: string,
-  timeoutMs: number = 8000,
-): Promise<string | null> {
+async function recognize(dataUrl: string, timeoutMs: number): Promise<Page | null> {
   let worker: Worker;
   try {
     worker = await getWorker();
@@ -63,14 +62,14 @@ export async function ocrDataUrl(
 
   try {
     const result = await Promise.race([
-      worker.recognize(dataUrl),
+      // `blocks: true` is what carries per-word bounding boxes; `text` keeps the
+      // existing text callers unchanged.
+      worker.recognize(dataUrl, {}, { text: true, blocks: true }),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("OCR timeout")), timeoutMs),
       ),
     ]);
-    const text = result?.data?.text ?? "";
-    const { correctedText } = correctOcrText(text);
-    return correctedText.trim().length > 0 ? correctedText : null;
+    return (result?.data as Page) ?? null;
   } catch {
     // A timed-out recognize leaves the single worker busy forever — every
     // later screenshot would queue behind the wedged job and time out in
@@ -83,4 +82,67 @@ export async function ocrDataUrl(
     workerPromise = null;
     return null;
   }
+}
+
+/**
+ * OCR a data URL (redacted screenshot) and return its recognized text.
+ * Returns null on any failure or timeout — the caller falls back to the
+ * pixel-region verification result.
+ */
+export async function ocrDataUrl(
+  dataUrl: string,
+  timeoutMs: number = 8000,
+): Promise<string | null> {
+  const page = await recognize(dataUrl, timeoutMs);
+  if (!page) return null;
+  const text = page.text ?? "";
+  const { correctedText } = correctOcrText(text);
+  return correctedText.trim().length > 0 ? correctedText : null;
+}
+
+/**
+ * OCR a frame and return its text as LINES OF BOXED WORDS.
+ *
+ * This is what makes PII triage possible: text alone can say "there is an email
+ * in this frame", but only boxes say WHERE, and the boxes are what gets painted
+ * over. Grouping follows the engine's own line structure rather than a
+ * y-proximity guess, so a wrapped paragraph is not merged into one line whose
+ * union box would cover the whole paragraph.
+ *
+ * Best-effort by design: null on any failure or timeout, never throws.
+ */
+export async function ocrWordLines(
+  dataUrl: string,
+  timeoutMs: number = 12_000,
+): Promise<OcrLine[] | null> {
+  const page = await recognize(dataUrl, timeoutMs);
+  if (!page) return null;
+  const lines: OcrLine[] = [];
+  for (const block of page.blocks ?? []) {
+    for (const paragraph of block?.paragraphs ?? []) {
+      for (const line of paragraph?.lines ?? []) {
+        const words: OcrWord[] = [];
+        for (const word of line?.words ?? []) {
+          const value = (word?.text ?? "").trim();
+          const bbox = word?.bbox;
+          if (!value || !bbox) continue;
+          const width = bbox.x1 - bbox.x0;
+          const height = bbox.y1 - bbox.y0;
+          if (width <= 0 || height <= 0) continue;
+          words.push({
+            text: value,
+            x: bbox.x0,
+            y: bbox.y0,
+            width,
+            height,
+            confidence: word.confidence,
+          });
+        }
+        if (words.length > 0) lines.push({ words });
+      }
+    }
+  }
+  // Empty successful recognition is distinct from unavailable OCR. Text with
+  // no locatable words cannot be used as evidence of a completed boxed scan.
+  return lines.length > 0 ? lines : (page.text?.trim() ? null : []);
 }

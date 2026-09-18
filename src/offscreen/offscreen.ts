@@ -172,10 +172,11 @@ async function detectFacesWithBlazeFaceTiles(
   canvas: OffscreenCanvas,
   width: number,
   height: number,
+  fullPage = false,
 ): Promise<Array<{ x: number; y: number; width: number; height: number; confidence: number }>> {
   const detector = await getBlazeFace();
   if (!detector) return [];
-  const tiles = planFaceTiles(width, height);
+  const tiles = planFaceTiles(width, height, { fullPage });
   if (tiles.length === 0) return [];
   const found: Array<{ x: number; y: number; width: number; height: number; confidence: number }> = [];
   for (const tile of tiles) {
@@ -308,6 +309,25 @@ function isSkinColor(r: number, g: number, b: number): boolean {
 /**
  * Detect face-like regions using skin-color clustering.
  * Returns bounding boxes of likely face regions.
+ *
+ * THE FLOOR THIS CHANNEL ACTUALLY HAS, because the code and its own comment
+ * disagreed. The old comment claimed "min size 28px keeps real faces in
+ * thumbnails", and it did not: the cluster test counted grid CELLS, and a 12 px
+ * grid needs 40 of them — about 5 760 px² of skin, a ~76 px square. So the
+ * channel documented at 28 px only reached ~76 px, and the band between the
+ * short-range model (which tiling gets to ~30 px) and 76 px was covered by
+ * nothing. That is the hole the reported YouTube grid fell into.
+ *
+ * Two changes close it, and neither is a threshold loosening:
+ *   - the SAMPLING grid is finer (4 px), so a 14 px blob is 12+ samples instead
+ *     of 1, and can be counted at all;
+ *   - the limits are stated in PIXEL AREA rather than in cells, so the floor
+ *     does not silently scale with the sampling step again.
+ *
+ * A small false positive here costs an over-redacted ~14 px box (the box is
+ * painted opaque — see tierForKind), while a small false negative ships a face.
+ * The per-frame cap on how many of these guesses are ADDED still lives in
+ * mergeFaceBoxes, so a photo wall cannot blot the page.
  */
 function detectFacesBySkinColor(
   imageData: ImageData,
@@ -315,8 +335,20 @@ function detectFacesBySkinColor(
   canvasHeight: number,
 ): Array<{ x: number; y: number; width: number; height: number; confidence: number }> {
   const { data } = imageData;
-  const blockSize = 12; // Sample every 12 pixels for speed.
-  const minClusterSize = 40; // Minimum skin pixels to count as a face region.
+  /** Sample step, in pixels. The mask below is FULL resolution; this only sets
+   *  how finely a blob is stepped through, i.e. the smallest blob that exists. */
+  const blockSize = 4;
+  /** Minimum skin AREA for a face region: ~200 px² ≈ a 14 px square. This is
+   *  the floor no channel reaches below (see FACE_MIN_SIDE_PX in the model
+   *  pass), so the three channels finally agree on where they stop. */
+  const minClusterAreaPx = 200;
+  const minClusterSize = Math.max(1, Math.ceil(minClusterAreaPx / (blockSize * blockSize)));
+  /** BFS budget per region, as AREA — the old cap was 2000 cells of 144 px²,
+   *  kept identical so a large skin area (a photo) is truncated exactly where it
+   *  used to be rather than becoming an unbounded walk on the finer grid. */
+  const maxRegionCells = Math.max(2000, Math.round(288_000 / (blockSize * blockSize)));
+  /** Smallest side of a reported region. Below this there is no face to find. */
+  const minSidePx = 12;
 
   // Build a skin-color mask.
   const mask = new Uint8Array(canvasWidth * canvasHeight);
@@ -339,7 +371,7 @@ function detectFacesBySkinColor(
       let count = 0;
       const queue = [idx];
 
-      while (queue.length > 0 && count < 2000) {
+      while (queue.length > 0 && count < maxRegionCells) {
         const ci = queue.pop()!;
         if (visited[ci]) continue;
         visited[ci] = 1;
@@ -367,18 +399,21 @@ function detectFacesBySkinColor(
         const regionH = maxY - minY;
         const aspectRatio = regionW / regionH;
 
-        // Faces are roughly 1:1 to 1:1.5 aspect ratio. Min size 28px keeps
-        // real faces in thumbnails while dropping tiny avatar icons. The
-        // per-frame cap on how many of these guesses are ADDED lives in
-        // mergeFaceBoxes (shared policy), never here: this scanner's job is
+        // Faces are roughly 1:1 to 1:1.5 aspect ratio. The side floor is the
+        // stated one (minSidePx), not a number that drifted with the sampling
+        // step. The per-frame cap on how many of these guesses are ADDED lives
+        // in mergeFaceBoxes (shared policy), never here: this scanner's job is
         // to report what it sees, not to decide what the pipeline keeps.
-        if (aspectRatio > 0.5 && aspectRatio < 2.0 && regionW > 28 && regionH > 28) {
+        if (aspectRatio > 0.5 && aspectRatio < 2.0 && regionW > minSidePx && regionH > minSidePx) {
           regions.push({
             x: minX,
             y: minY,
             width: regionW,
             height: regionH,
-            confidence: Math.min(0.9, count / 200),
+            // Confidence tracks the skin AREA the region actually covers, so it
+            // means the same thing at any sampling step: 0.9 at ~28 800 px²
+            // (the old 200 cells of 144 px²), and ~0.01 for a 14 px face.
+            confidence: Math.min(0.9, (count * blockSize * blockSize) / 28_800),
           });
         }
       }
@@ -546,6 +581,12 @@ async function processScreenshot(
    * guess — see triageFrameText's `unlocatedText`.
    */
   unlocatedValues: string[] = [],
+  /**
+   * True only for an actual stitched full-page capture (`fullPage: true` never
+   * means "requested" — see region-mapping.ts). The face-tile pass skips tiling
+   * for it: the page's own length, not the viewport, would set every crop size.
+   */
+  fullPage: boolean = false,
 ): Promise<{
   unlocatedText?: ProcessedScreenshotResult["unlocatedText"];
   redactedDataUrl: string;
@@ -738,7 +779,7 @@ async function processScreenshot(
     // large face found by both is one face.
     let tiledFaces: FaceBox[] = [];
     try {
-      tiledFaces = (await detectFacesWithBlazeFaceTiles(originalCanvas, width, height)).map(
+      tiledFaces = (await detectFacesWithBlazeFaceTiles(originalCanvas, width, height, fullPage)).map(
         (f) => ({ ...f, source: "model" as const }),
       );
     } catch (err) {
@@ -750,7 +791,7 @@ async function processScreenshot(
     if (dedupedFaces.length > fullFrameFaces.length) {
       console.log(
         `[PRY Offscreen] Face tiles found ${dedupedFaces.length - fullFrameFaces.length} face(s) ` +
-        `the full-frame pass missed (${planFaceTiles(width, height).length} tiles)`,
+        `the full-frame pass missed (${planFaceTiles(width, height, { fullPage }).length} tiles)`,
       );
     }
     modelFaces = dedupedFaces;
@@ -1236,8 +1277,14 @@ async function triageFrameText(
   // designated catch-all for text the DOM never had (image, canvas, video), so
   // it is also the only thing that can say whether a value the DOM could not
   // place is legible in the frame or simply not there at all.
-  const spans = [...knownSpans, ...unlocatedValues];
-  const found = findTriageBoxes(collected, { spans });
+  // The two lists are passed SEPARATELY: the NER spans are matched exactly (a
+  // name is either painted there or it is not), while the values the DOM could
+  // not place get the tolerant pass as well, because their clearance decides
+  // whether the frame ships — see TriageLimits.requested.
+  const found = findTriageBoxes(collected, {
+    spans: knownSpans,
+    requested: unlocatedValues,
+  });
   const uncovered = dropCoveredBoxes(found, covered);
   // Boxes dropCoveredBoxes removed were already covered by a painted region, so
   // they are clean too; only what the CAP discards is left legible.
@@ -1247,8 +1294,16 @@ async function triageFrameText(
 
   // Which of the asked-about values are still legible in the shipped frame?
   const wanted = [...new Set(unlocatedValues.map((value) => (value ?? "").trim()).filter(Boolean))];
+  // A value counts as read when a box covers it — either because the box's own
+  // text IS the value, or because the box was found by LOOKING for the value
+  // (`matchedSpan`) and the frame spelled it imperfectly. Without the second
+  // test, a value found through an OCR misread would be painted and still
+  // reported as never found, and the frame would be withheld over a glyph the
+  // pipeline had already destroyed.
   const named = (list: TriageBox[], value: string): boolean =>
-    list.some((box) => box.value.toLowerCase() === value.toLowerCase());
+    list.some((box) =>
+      box.value.toLowerCase() === value.toLowerCase() ||
+      box.matchedSpan?.toLowerCase() === value.toLowerCase());
   const readInFrame = wanted.filter((value) => named(found, value));
   const stillLegible = readInFrame.filter(
     (value) => !named(kept, value) && !named(coveredAlready, value),
@@ -1583,6 +1638,8 @@ chrome.runtime.onMessage.addListener(
       sensitiveRegions?: SensitiveRegion[];
       /** Values the DOM channel detected but could not place — see triageFrameText. */
       unlocatedValues?: string[];
+      /** True only for a stitched full-page capture — see processScreenshot. */
+      fullPage?: boolean;
       dpr?: number;
       regionScale?: number;
       regionOffsetY?: number;
@@ -1617,6 +1674,7 @@ chrome.runtime.onMessage.addListener(
         message.regionOffsetY ?? 0,
         message.knownSpans ?? [],
         message.unlocatedValues ?? [],
+        message.fullPage === true,
       )
         .then((result) => {
           // Send result back via sendMessage, NOT sendResponse.

@@ -21,6 +21,9 @@ publish/*.zip
 # Test artifacts
 scripts/.verify-out.mjs
 scripts/.tripwire-iife.js
+# Bundled for bench:latency (the bench needs the shipped tile planner, and Node
+# cannot import the TypeScript source directly).
+scripts/.face-regions.mjs
 eng.traineddata
 .ocr-cache/
 

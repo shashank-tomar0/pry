@@ -1006,6 +1006,33 @@ ok("the found value is painted as an opaque redaction",
   foundRun.result.detections.some((d) => /in image/i.test(d.label) && d.tier === "opaque"),
   JSON.stringify(foundRun.result.detections.map((d) => `${d.label}:${d.tier}`)));
 
+// The same frame, but the engine MISREAD the value ("Priya" → "Pn'ya"). Exact
+// matching found nothing, so the frame was withheld forever and the planner
+// worked blind on a page whose pixels the pipeline had already destroyed. The
+// clearance RULE is unchanged — the value must still be found and painted — but
+// the finder is tolerant now, for exactly these clearance-bearing values.
+const UNPLACED_MISREAD = "Pniya Sharma";
+globalThis.__pryOcrLines = [
+  {
+    words: [
+      { text: "Priya", x: 20, y: 20, width: 44, height: 14, confidence: 88 },
+      { text: "Sharma", x: 68, y: 20, width: 56, height: 14, confidence: 88 },
+    ],
+  },
+];
+const misreadRun = await runPipeline({
+  privacy: { scanFrameText: true },
+  unlocatedValues: [UNPLACED_MISREAD],
+  glyphs: [{ x: 20, y: 20, width: 124, height: 14 }],
+});
+const misreadBox = misreadRun.result.detections.find((d) => /in image/i.test(d.label));
+ok("a value the engine spelled imperfectly is still found and destroyed",
+  Boolean(misreadBox) && misreadBox.tier === "opaque",
+  JSON.stringify(misreadRun.result.detections.map((d) => `${d.label}:${d.tier}`)));
+ok("and the frame is cleared on that proof instead of being withheld",
+  misreadRun.result.unlocatedText?.legible === 1 && misreadRun.result.unlocatedText.stillLegible === 0,
+  JSON.stringify(misreadRun.result.unlocatedText));
+
 // The frame-text channel read this frame and did NOT find the value. That is an
 // OCR miss as easily as an absence, so it must NOT be reported as clearance —
 // the channel's own documentation is explicit that an unread value is a value it

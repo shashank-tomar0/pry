@@ -2348,18 +2348,46 @@ ok("the large portrait is still kept alongside it",
 // here as geometry.
 const {
   planFaceTiles, dedupeFaceBoxes, offsetFaceBoxes,
-  FACE_TILE_TARGET_PX, FACE_TILE_MAX, FACE_TILE_MAX_FRAME_PX, FACE_TILE_DUPLICATE_COVERAGE,
+  FACE_TILE_TARGET_PX, FACE_TILE_MAX, FACE_TILE_OVERLAP, FACE_TILE_MIN_GAIN,
+  FACE_TILE_DUPLICATE_COVERAGE,
 } = await import("../src/shared/face-regions.ts");
 const { FACE_DUPLICATE_COVERAGE: FACE_CHANNEL_DUPLICATE_COVERAGE } = await import("../src/shared/face-regions.ts");
 
 ok("a frame that already fits one tile is not tiled (the full-frame pass IS that tile)",
   planFaceTiles(320, 240).length === 0 && planFaceTiles(200, 120).length === 0);
-// Above the bound the grid could not cover the frame inside the tile budget, so
-// the caller keeps its single full-frame pass. Stated, not silent.
-ok("a stitched full-page capture is not tiled",
-  planFaceTiles(1280, 10000).length === 0 && FACE_TILE_MAX_FRAME_PX === 1280);
+// A stitched page capture is the one frame that is not tiled, and it is the
+// CALLER that says so — the offscreen document cannot tell a stitched image from
+// a very tall viewport by looking at it.
+ok("a stitched full-page capture is not tiled when the caller says it is one",
+  planFaceTiles(1280, 10000, { fullPage: true }).length === 0);
 ok("a zero-sized frame has no tiles",
   planFaceTiles(0, 0).length === 0);
+
+// THE REGRESSION THIS REPLACED. Tiling used to be refused above an absolute
+// 1280 px bound — a rule written for stitched captures that silently excluded
+// every ordinary laptop viewport and every retina capture (the frame is captured
+// at devicePixelRatio, so a 2× display is 2560 device px). Both were untested,
+// and both are the frames where the model's fixed 128 px input hurts most.
+ok("an ordinary 1440×900 viewport IS tiled",
+  planFaceTiles(1440, 900).length > 1, String(planFaceTiles(1440, 900).length));
+ok("a retina capture (device pixels) IS tiled",
+  planFaceTiles(2560, 1440).length > 1, String(planFaceTiles(2560, 1440).length));
+ok("a grid that cannot beat the full-frame pass is not tiled",
+  planFaceTiles(4000, 3000, { maxTiles: 1 }).length === 0 && FACE_TILE_MIN_GAIN === 2);
+ok("and the same frame IS tiled once the budget can buy magnification",
+  planFaceTiles(4000, 3000).length > 1, String(planFaceTiles(4000, 3000).length));
+// A small frame reaches the target with a handful of crops, so the rest of the
+// budget is NOT spent: more crops past the target buy no magnification a face
+// needs. This is the case the old planner got right by accident and the
+// "always finest" version of it would have got wrong.
+ok("a small frame reaches the target with few crops instead of spending the budget",
+  planFaceTiles(400, 240).length === 2 &&
+    Math.max(...planFaceTiles(400, 240).map((t) => Math.max(t.width, t.height))) <= FACE_TILE_TARGET_PX,
+  JSON.stringify(planFaceTiles(400, 240).map((t) => `${t.width}x${t.height}`)));
+ok("a large frame spends the budget, because the target is unreachable inside it",
+  planFaceTiles(2560, 1440).length === FACE_TILE_MAX - 1 &&
+    Math.max(...planFaceTiles(2560, 1440).map((t) => Math.max(t.width, t.height))) > FACE_TILE_TARGET_PX,
+  JSON.stringify(planFaceTiles(2560, 1440).map((t) => `${t.width}x${t.height}`)));
 
 const viewportTiles = planFaceTiles(1280, 800);
 ok("a 1280×800 viewport is tiled",
@@ -2392,6 +2420,20 @@ ok("a 44px face is ~4px in the whole-frame pass — gone before the first convol
   Math.round(facePx * fullFrameScale) <= 5, String(facePx * fullFrameScale));
 ok("and ~15px inside a tile — detectable, without moving any threshold",
   Math.round(facePx * tileScale) >= 12, String(facePx * tileScale));
+// The overlap factor exists to keep a face on a seam whole. It used to be applied
+// by inflating every crop by 25 %, which made a "320 px" tile 400 px and gave
+// away the very magnification the tiling is for; the grid is chosen to maximise
+// magnification now, so the crops must be NO COARSER than the naive grid.
+const naiveCrop = Math.max(Math.ceil((1280 / Math.ceil(1280 / FACE_TILE_TARGET_PX)) * (1 + FACE_TILE_OVERLAP)),
+  Math.ceil((800 / Math.ceil(800 / FACE_TILE_TARGET_PX)) * (1 + FACE_TILE_OVERLAP)));
+ok("the crop is finer than a target-sized grid inflated by the overlap would give",
+  Math.max(...viewportTiles.map((t) => Math.max(t.width, t.height))) <= naiveCrop,
+  `${Math.max(...viewportTiles.map((t) => Math.max(t.width, t.height)))} vs ${naiveCrop}`);
+ok("and the tile budget is spent to get there, not left half unused",
+  viewportTiles.length >= 12, String(viewportTiles.length));
+ok("identical crops are one detector call, not several",
+  new Set(planFaceTiles(1440, 900).map((t) => `${t.x},${t.y},${t.width},${t.height}`)).size ===
+    planFaceTiles(1440, 900).length);
 ok("the tile budget is what keeps the pass inside the frame wait",
   FACE_TILE_MAX <= 16 && viewportTiles.length <= FACE_TILE_MAX);
 
@@ -2588,7 +2630,7 @@ ok("an unbounded stream is stopped at the ceiling, not left running",
 console.log("\n=== Scenario AL: PII target hygiene and detected-vs-boxed reconciliation ===\n");
 
 const {
-  sanitizePiiTargets, findUnlocatedValues, isLocatableSelector,
+  sanitizePiiTargets, findUnlocatedValues, isLocatableSelector, unverifiedElementTargets,
 } = await import("../src/shared/redaction-reconciliation.ts");
 
 // Hygiene: only values worth locating, and only our own selector shape cross
@@ -2638,6 +2680,43 @@ ok("no targets means nothing to report",
 ok("the warning sample is masked by the shared tokenizer policy",
   maskSample("ada@example.com") === "ad•••@example.com" &&
   !maskSample("ada@example.com").includes("ada"));
+
+// ── Element-target coverage: per target, not a blanket flag ────────────────
+// `dom-selector-coverage-unverified` used to be pushed whenever ANY target had a
+// selector, because the wire format could not say which target a box belonged
+// to. A coverage failure withholds the frame, so on any page with a form field
+// the planner lost its vision channel — part of why the reported Gmail run read
+// the page five times and never saw it. The boxes name their target now.
+const elTarget = { selector: '[data-pry-id="12"]', value: "ada@example.com" };
+ok("a target whose box names it is covered",
+  unverifiedElementTargets([elTarget], [{ targetSelector: '[data-pry-id="12"]', value: "ada@example.com" }])
+    .unattributable.length === 0);
+ok("a target covered only by its value still counts as covered",
+  unverifiedElementTargets([elTarget], [{ value: "ada@example.com" }]).unattributable.length === 0);
+ok("an uncovered target that HAS a value is unplaced, not unverifiable",
+  (() => {
+    const r = unverifiedElementTargets([elTarget], [{ kind: "face" }]);
+    return r.unaccounted.join("|") === "ada@example.com" && r.unattributable.length === 0;
+  })());
+ok("an uncovered target with no value to report stays unverifiable (frame withheld)",
+  unverifiedElementTargets([{ selector: '[data-pry-id="9"]' }], []).unattributable.join("|") === '[data-pry-id="9"]');
+ok("a value boxed for a DIFFERENT target does not vouch for this one",
+  unverifiedElementTargets(
+    [{ selector: '[data-pry-id="9"]' }],
+    [{ targetSelector: '[data-pry-id="12"]', value: "other@example.com" }],
+  ).unattributable.length === 1);
+ok("no targets means nothing to verify",
+  unverifiedElementTargets([], []).unattributable.length === 0 &&
+    unverifiedElementTargets(undefined, undefined).unattributable.length === 0);
+const reconcileWorkerSource = await readFile("src/background/service-worker.ts", "utf8");
+ok("the worker asks the per-target question instead of the blanket one",
+  /unverifiedElementTargets\(elementTargets, validRegions\)/.test(reconcileWorkerSource) &&
+    !/failures\.push\("dom-selector-coverage-unverified"\)[\s\S]{0,120}?elementTargets\.length > 0/.test(reconcileWorkerSource) &&
+    !/if \(elementTargets\.length > 0\) \{\s*\n\s*failures\.push\("dom-selector-coverage-unverified"\)/.test(reconcileWorkerSource));
+const perceiveSource = await readFile("src/content/perceive.ts", "utf8");
+ok("and the content side echoes the target each box was drawn for",
+  /targetSelector: target\.selector/.test(perceiveSource) &&
+    /targetSelector\?: string;/.test(perceiveSource));
 
 // ── Scenario AM: OCR frame-text triage (PII inside images/canvas) ───────────
 // The gap this closes: every other pixel channel starts from the DOM, so text
@@ -2692,6 +2771,61 @@ ok("a span match inside a longer word is not boxed (Ann in Annual)",
 // Gibberish lines must not manufacture blackouts.
 const gibberish = findTriageBoxes([line("ada@example.com", { confidence: 12 })]);
 ok("a line OCR itself is unsure about is ignored", gibberish.length === 0);
+
+// ── A value the DOM could not place, spelled imperfectly in the frame ──────
+// This is the case that used to withhold the frame forever. The clearance rule
+// requires the frame-text channel to have FOUND every unplaced value (`legible
+// === requested`); the channel matched exactly, so one misread glyph meant
+// "never found", the frame never shipped, and the planner worked blind on a
+// page whose pixels the pipeline had already destroyed. The matcher is tolerant
+// now — for THESE values only, because they are the ones whose clearance decides
+// whether the frame ships. The rule itself is unchanged: found-and-painted, or
+// no clearance.
+const { foldForOcrMatch, withinEditBudget, editBudgetFor, MIN_FUZZY_SPAN_CHARS } =
+  await import("../src/shared/ocr-pii-triage.ts");
+
+ok("folding removes the separators and confusions OCR invents",
+  foldForOcrMatch("Hark1rat Singh") === foldForOcrMatch("Harkirat Singh") &&
+    foldForOcrMatch("ACME C0RP") === foldForOcrMatch("ACME CORP") &&
+    foldForOcrMatch("Ada  Lovelace") === foldForOcrMatch("ada lovelace"),
+  `${foldForOcrMatch("Hark1rat Singh")} vs ${foldForOcrMatch("Harkirat Singh")}`);
+ok("the edit budget scales with the value, so short values are not matched loosely",
+  editBudgetFor("abc") === 1 && editBudgetFor("harkiratsingh") === 2 && MIN_FUZZY_SPAN_CHARS >= 4);
+ok("two edits inside the budget are a match, three are not",
+  withinEditBudget("harkiratsingh", "hark1ratsingh", 2) &&
+    !withinEditBudget("harkiratsingh", "harquatsinxx", 2));
+
+const misread = findTriageBoxes([line("Hark1rat Singh", { x: 0, y: 80 })], {
+  requested: ["Harkirat Singh"],
+});
+ok("an unplaced value the frame misread is still found and boxed",
+  misread.length === 1, JSON.stringify(misread.map((b) => b.value)));
+ok("and the box carries the value it proves covered, not only what OCR read",
+  misread[0]?.matchedSpan === "Harkirat Singh" && misread[0]?.value === "Hark1rat Singh",
+  JSON.stringify(misread[0]));
+ok("the box covers BOTH misread words, not just the one that differed",
+  misread[0]?.width >= ("Hark1rat".length + "Singh".length) * 8, JSON.stringify(misread[0]));
+
+// The tolerance must not become a general fuzzy search: a value that is not in
+// the frame is still not found, however close another name looks.
+ok("a value that is not in the frame is not invented out of a near neighbour",
+  findTriageBoxes([line("Priya Kumari", { x: 0, y: 0 })], { requested: ["Priya Sharma"] }).length === 0);
+ok("a value with no shape left to recognise is refused outright",
+  findTriageBoxes([line("go to it", { x: 0, y: 0 })], { requested: ["go"] }).length === 0 &&
+    findTriageBoxes([line("od", { x: 0, y: 0 })], { requested: ["od"] }).length === 0);
+// …and the NER spans, which are NOT clearance-bearing, keep exact matching.
+ok("NER spans are matched exactly, so no box is widened for them",
+  findTriageBoxes([line("Hark1rat Singh", { x: 0, y: 80 })], { spans: ["Harkirat Singh"] }).length === 0);
+
+// A line the engine is unsure about is exactly where a misread of the requested
+// value lives, so THOSE values are still looked for there; pattern and NER
+// matching keep the confidence floor.
+const unsure = [line("Harkirat Singh", { x: 0, y: 40, confidence: 12 })];
+ok("a requested value is looked for on a low-confidence line",
+  findTriageBoxes(unsure, { requested: ["Harkirat Singh"] }).length === 1);
+ok("but a NER span is not, and neither is a pattern",
+  findTriageBoxes(unsure, { spans: ["Harkirat Singh"] }).length === 0 &&
+    findTriageBoxes([line("ada@example.com", { confidence: 12 })], { requested: [] }).length === 0);
 
 // Coverage: boxes already inside a redaction region are not painted twice.
 const two = findTriageBoxes([
@@ -4793,7 +4927,14 @@ ok("the old boolean guard is gone (no second copy of the policy in the loop)",
 console.log("\n=== Scenario BB: the tiled face pass is wired into the pipeline ===\n");
 
 ok("the offscreen pipeline runs a tiled pass over the original pixels",
-  /detectFacesWithBlazeFaceTiles\(originalCanvas, width, height\)/.test(offscreenSource));
+  /detectFacesWithBlazeFaceTiles\(originalCanvas, width, height, fullPage\)/.test(offscreenSource));
+// …and it is TOLD what kind of frame it is. The fullPage signal cannot be
+// inferred from the image, and the tile planner's one exclusion depends on it.
+ok("and the stitched-capture signal reaches the tile planner",
+  /const tiles = planFaceTiles\(width, height, \{ fullPage \}\)/.test(offscreenSource) &&
+    /fullPage: boolean = false,/.test(offscreenSource) &&
+    /message\.fullPage === true/.test(offscreenSource) &&
+    /capturedFullPage,/.test(workerSource));
 ok("and dedupes it against the full-frame pass before painting",
   /dedupeFaceBoxes\(\[\.\.\.fullFrameFaces, \.\.\.tiledFaces\]\)/.test(offscreenSource));
 ok("a tile failure cannot take the full-frame result down with it",
@@ -4801,7 +4942,7 @@ ok("a tile failure cannot take the full-frame result down with it",
 ok("the tile pass draws crops 1:1, so boxes are frame pixels after the offset",
   /drawImage\(canvas, tile\.x, tile\.y, tile\.width, tile\.height, 0, 0, tile\.width, tile\.height\)/.test(offscreenSource));
 ok("the pure geometry comes from the shared module rather than being re-derived",
-  /planFaceTiles\(width, height\)/.test(offscreenSource));
+  /planFaceTiles\(width, height, \{ fullPage \}\)/.test(offscreenSource));
 ok("the secondary model detector is gated on evidence, not on a count",
   /shouldRunSecondaryFaceDetector\(modelFaces, skinFaces\)/.test(offscreenSource) &&
     !/if \(modelFaces\.length === 0\) \{\s*const chromeDetector/.test(offscreenSource));
@@ -4846,7 +4987,12 @@ ok("the values the DOM could not place are handed to the pixel pipeline",
   /unlocatedValues/.test(workerSource) && /unlocatedValues,/.test(workerSource) &&
     /knownSpans: getActiveNerSpans\(\),\s*\n\s*unlocatedValues,/.test(workerSource));
 ok("the offscreen pipeline asks the frame-text channel about exactly those values",
-  /const spans = \[\.\.\.knownSpans, \.\.\.unlocatedValues\]/.test(offscreenSource));
+  /spans: knownSpans,\s*\n\s*requested: unlocatedValues,/.test(offscreenSource));
+// Tolerance is for the values whose CLEARANCE decides whether the frame ships,
+// never for the NER spans, which are matched exactly.
+ok("and only those values are matched tolerantly",
+  /requested\?: string\[\]/.test(await readFile("src/shared/ocr-pii-triage.ts", "utf8")) &&
+    /for \(const span of requested\) \{/.test(await readFile("src/shared/ocr-pii-triage.ts", "utf8")));
 ok("clearance requires the pixels to have been READ",
   /unlocatedText\?\.searched === true/.test(workerSource));
 ok("clearance requires the value to have been FOUND, not merely not found",

@@ -430,6 +430,18 @@ export interface SensitiveRegion {
   label: string;
   /** Raw text/input value for deterministic Format-Preserving Encryption surrogacy. */
   value?: string;
+  /**
+   * The detector target this box was drawn for, echoed back so the service
+   * worker can ATTRIBUTE a box to the target that asked for it.
+   *
+   * Without it the wire format could not say which target a box belonged to, so
+   * "every element target is covered" was unprovable and the service worker
+   * flagged `dom-selector-coverage-unverified` whenever ANY target carried a
+   * selector — which withholds the frame, on most pages with a form field. Now
+   * the check is per-target: a target is covered when a box names it (or covers
+   * its value), and only the genuinely unattributable ones are reported.
+   */
+  targetSelector?: string;
 }
 
 /**
@@ -787,6 +799,9 @@ export function locateElements(targets: PiiElementTarget[]): SensitiveRegion[] {
       // Carried through so the service worker can attribute this box to the
       // value it covers, instead of reporting the value as unlocatable.
       value: target.value,
+      // …and to the TARGET it was drawn for, which is what makes the coverage
+      // check exact rather than blanket (see SensitiveRegion.targetSelector).
+      targetSelector: target.selector,
     });
   }
 

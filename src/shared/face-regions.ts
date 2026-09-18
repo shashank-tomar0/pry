@@ -9,8 +9,12 @@
  *      sensitivity one — see planFaceTiles.
  *   2. Chrome's shape-detection FaceDetector — same class of limitation, asked
  *      only when the cheap channels leave a face unexplained.
- *   3. Skin-colour clustering — noisy, but the only channel that reliably
- *      reaches the 28–120 px faces channels 1 and 2 drop.
+ *   3. Skin-colour clustering — noisy, but the only channel that reaches the
+ *      14 px band the two model channels drop, and the only one that costs no
+ *      model call at all. (It was DOCUMENTED as reaching 28 px while actually
+ *      reaching ~76 px: its cluster test counted 12 px grid cells, and 40 of
+ *      them is about a 76 px square. The grid is 4 px now and the limits are
+ *      stated in pixel area, so the floor is the documented one.)
  *
  * These used to be an EXCLUSIVE chain (`if (faceBoxes.length === 0)`) inside
  * the offscreen pipeline: one confident BlazeFace hit skipped the skin-colour
@@ -96,7 +100,11 @@ function byAreaThenConfidence(a: FaceBox, b: FaceBox): number {
 // the same 44 px face arrives as ~15 px — detectable, and detectable because the
 // crop made it bigger in model space, not because a threshold was loosened.
 
-/** Largest side a tile should have, in frame pixels. 128/320 ≈ 0.4 scale. */
+/** Largest side a crop should have, in frame pixels — what the planner AIMS
+ *  for. It uses the fewest crops that reach it; only when the target cannot be
+ *  reached inside FACE_TILE_MAX does it spend the whole budget on the finest
+ *  crops it can cover the frame with (see the grid search in planFaceTiles). So
+ *  a crop may exceed this by design, on a large or retina frame. */
 export const FACE_TILE_TARGET_PX = 320;
 
 /** Overlap between neighbouring tiles, as a fraction of the tile size. A face
@@ -108,15 +116,23 @@ export const FACE_TILE_OVERLAP = 0.25;
 export const FACE_TILE_MAX = 16;
 
 /**
- * Frames taller/wider than this are NOT tiled.
+ * How much magnification tiling must buy to be worth its detector calls: the
+ * finest crop the budget can cover the frame with must be at most HALF the
+ * frame's longer side.
  *
- * A stitched full-page capture is the case: tiling 1280×10000 into 320 px crops
- * needs ~130 tiles to cover it, and tiling only part of it would make coverage
- * depend on where the page happened to be cut. Below this bound the tile grid is
- * bounded by FACE_TILE_MAX and covers the frame exactly; above it the caller
- * keeps the single full-frame pass it already had (documented, not silent).
+ * This replaced an absolute frame-size cliff (`max(width, height) > 1280 → no
+ * tiling`) that was meant to exclude stitched page captures and instead
+ * excluded most real frames. It skipped 1440×900 (an ordinary laptop) and every
+ * retina capture — 2560×1440 device pixels, because the capture is taken at the
+ * device pixel ratio — which are exactly the frames where the model's fixed
+ * ~128 px input does the most damage. The rule was invisible in the suite
+ * because the tests happened to use 1280×800. A ratio is scale-invariant, so the
+ * decision no longer depends on which monitor the user has; the one case that
+ * genuinely should not be tiled (a stitched full-page capture, whose crops the
+ * page's own length dominates) is now stated EXPLICITLY by the caller instead of
+ * inferred from a number.
  */
-export const FACE_TILE_MAX_FRAME_PX = FACE_TILE_TARGET_PX * 4;
+export const FACE_TILE_MIN_GAIN = 2;
 
 /** Fraction of the SMALLER box's area at which two detections are one face.
  *  Deliberately looser than FACE_DUPLICATE_COVERAGE: overlapping tiles report
@@ -135,7 +151,7 @@ export interface FaceTile {
 export function planFaceTiles(
   frameWidth: number,
   frameHeight: number,
-  opts: { target?: number; maxTiles?: number; overlap?: number } = {},
+  opts: { target?: number; maxTiles?: number; overlap?: number; fullPage?: boolean } = {},
 ): FaceTile[] {
   const target = opts.target ?? FACE_TILE_TARGET_PX;
   const maxTiles = opts.maxTiles ?? FACE_TILE_MAX;
@@ -147,33 +163,87 @@ export function planFaceTiles(
   // Already inside one tile: tiling would be the same pass at the same scale,
   // for the same one detector call. The caller's full-frame pass IS this tile.
   if (Math.max(width, height) <= target) return [];
-  // Too large to cover usefully (see FACE_TILE_MAX_FRAME_PX).
-  if (Math.max(width, height) > target * 4) return [];
+  // A stitched full-page capture: the page's own length, not the viewport, sets
+  // the crop size, so tiling it would spend the whole budget on a handful of
+  // crops that are mostly scroll. Stated by the caller — see FACE_TILE_MIN_GAIN
+  // for why this is no longer inferred from the frame's dimensions.
+  if (opts.fullPage) return [];
 
-  let cols = Math.max(1, Math.ceil(width / target));
-  let rows = Math.max(1, Math.ceil(height / target));
-  // Stay inside the tile budget by giving up tiles on the longer axis.
-  while (cols * rows > maxTiles) {
-    if (cols >= rows && cols > 1) cols--;
-    else if (rows > 1) rows--;
-    else break;
+  let cols = 1;
+  let rows = 1;
+
+  // Two-part grid choice, because both halves of it were wrong before.
+  //
+  // Only the largest crop side matters: the model resizes whatever it is handed
+  // into a fixed ~128×128 input, so the scale a face enjoys is
+  // ~128 / max(cropW, cropH). The previous code took ceil(width / target)
+  // columns and THEN inflated each crop by the overlap factor, so the "320 px"
+  // target produced 400 px crops — the one parameter that exists to preserve the
+  // magnification was giving 25 % of it away.
+  //
+  //   1. PREFER the target: the fewest crops that bring the largest side to the
+  //      target. Past that point more crops buy no magnification a face needs,
+  //      only detector calls. This is the old behaviour, done correctly.
+  //   2. Otherwise the target is unreachable inside the budget, so SPEND the
+  //      budget: the finest crops the cap can cover the frame with. That is the
+  //      case the old code never reached, because the overlap inflation pushed
+  //      every grid past the target and then the cap shaved crops off the longer
+  //      axis without ever asking what the user's display actually was.
+  //
+  // Enumeration costs at most maxTiles iterations and is exact; ties go to fewer
+  // crops.
+  let bestSide = Number.POSITIVE_INFINITY;
+  let targetCost = Number.POSITIVE_INFINITY;
+  let targetCols = 0;
+  let targetRows = 0;
+  for (let candidateCols = 1; candidateCols <= maxTiles; candidateCols++) {
+    for (let candidateRows = 1; candidateCols * candidateRows <= maxTiles; candidateRows++) {
+      const cropW = Math.min(width, Math.ceil((width / candidateCols) * (1 + overlap)));
+      const cropH = Math.min(height, Math.ceil((height / candidateRows) * (1 + overlap)));
+      const side = Math.max(cropW, cropH);
+      const cost = candidateCols * candidateRows;
+      if (side < bestSide || (side === bestSide && cost < cols * rows)) {
+        bestSide = side;
+        cols = candidateCols;
+        rows = candidateRows;
+      }
+      if (side <= target && (cost < targetCost || (cost === targetCost && side < bestSide))) {
+        targetCost = cost;
+        targetCols = candidateCols;
+        targetRows = candidateRows;
+      }
+    }
   }
+  if (targetCols > 0) {
+    cols = targetCols;
+    rows = targetRows;
+  }
+
+  // Tiling that buys no magnification is detector calls for nothing.
+  if (bestSide * FACE_TILE_MIN_GAIN > Math.max(width, height)) return [];
 
   const tileW = Math.min(width, Math.ceil((width / cols) * (1 + overlap)));
   const tileH = Math.min(height, Math.ceil((height / rows) * (1 + overlap)));
   const tiles: FaceTile[] = [];
+  // A degenerate frame (a grid finer than the frame is wide) can place several
+  // crops on top of each other; identical crops are one detector call, not five.
+  const seen = new Set<string>();
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
       // Spread the slack across the gaps so the LAST tile always reaches the
       // frame edge — a face in the bottom-right corner must be inside a tile.
       const x = cols === 1 ? 0 : Math.round((col * (width - tileW)) / (cols - 1));
       const y = rows === 1 ? 0 : Math.round((row * (height - tileH)) / (rows - 1));
-      tiles.push({
+      const tile: FaceTile = {
         x,
         y,
         width: Math.min(tileW, width - x),
         height: Math.min(tileH, height - y),
-      });
+      };
+      const key = `${tile.x},${tile.y},${tile.width},${tile.height}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      tiles.push(tile);
     }
   }
   return tiles;

@@ -16,7 +16,7 @@ import { VISION_SUPPORTED } from "./vision";
 import { tokenizer, maskSample } from "./tokenizer";
 import { clearWire, wireRecords } from "./wire-log";
 import { getActiveNerSpans, getActivePiiTargets } from "./ml-bridge";
-import { findUnlocatedValues } from "../shared/redaction-reconciliation";
+import { findUnlocatedValues, unverifiedElementTargets } from "../shared/redaction-reconciliation";
 import { ensureOffscreenDocument } from "./offscreen-doc";
 import { runTask } from "./agent";
 import { createPlanner } from "./providers";
@@ -333,6 +333,10 @@ async function processScreenshot(
    *  document's triageFrameText. Their verdict decides whether an unplaceable
    *  value withholds the frame. */
   unlocatedValues: string[] = [],
+  /** True only for an actual stitched full-page image, never a requested mode
+   *  (see regionMappingFor). The offscreen face-tile pass needs to be TOLD: it
+   *  cannot distinguish a stitched capture from a very tall viewport. */
+  fullPage: boolean = false,
 ): Promise<ProcessedScreenshotResult> {
   await ensureOffscreenDocument();
 
@@ -383,6 +387,7 @@ async function processScreenshot(
       // pattern to match, but it does have this.
       knownSpans: getActiveNerSpans(),
       unlocatedValues,
+      fullPage,
     });
   });
 }
@@ -512,11 +517,6 @@ async function getSensitiveRegions(tabId: number): Promise<{
       };
     }
     const failures: string[] = [];
-    // The current wire format cannot attribute results to selectors. A value
-    // found elsewhere (or several boxes for one target) cannot prove coverage.
-    if (elementTargets.length > 0) {
-      failures.push("dom-selector-coverage-unverified");
-    }
     const checkLocator = (reply: typeof nerResult, required: boolean, name: string) => {
       if (!required) return;
       const data = reply?.ok ? reply.value as typeof value | null : null;
@@ -554,6 +554,18 @@ async function getSensitiveRegions(tabId: number): Promise<{
     const unlocatedValues = findUnlocatedValues(locateValues.map((value) => ({ value })), validRegions);
     if (unlocatedValues.length > 0) {
       failures.push("dom-targets-unresolved");
+    }
+    // Element-target coverage is decided PER TARGET now that the boxes name the
+    // target they were drawn for. Only a target that has no value to report and
+    // no box of its own is unverifiable — that one still withholds the frame, so
+    // the strictness that matters is unchanged while the blanket flag (which
+    // fired on every page with a form field) is gone.
+    const elementCoverage = unverifiedElementTargets(elementTargets, validRegions);
+    if (elementCoverage.unattributable.length > 0) {
+      // Selectors only — they carry no value, so nothing here can leak.
+      console.log(`[PRY] Element targets with no box and no value to report: ` +
+        elementCoverage.unattributable.join(", "));
+      failures.push("dom-selector-coverage-unverified");
     }
     if (!Number.isFinite(value.dpr) || (value.dpr ?? 0) <= 0 ||
         !Number.isFinite(value.viewportWidth) || (value.viewportWidth ?? 0) <= 0 ||
@@ -739,6 +751,10 @@ export async function captureAndProcessScreenshot(
     // the frame-text channel can report on them. Without this the pipeline knew
     // only THAT something was unplaced, never whether it was still readable.
     unlocatedValues,
+    // Whether this image is the whole page stitched, which the face-tile pass
+    // needs and cannot infer from the pixels. `capturedFullPage` is true only
+    // for an actual stitched result, never merely a requested mode.
+    capturedFullPage,
   );
   // ─── Coverage, decided on evidence rather than on where it was noticed ───
   // "The DOM scanner could not name a rectangle for this value" and "this value
@@ -1504,6 +1520,13 @@ chrome.runtime.onMessage.addListener(
               },
               inspectorMapping.scale,
               inspectorMapping.offsetY,
+              // No unplaceable-value list here: this path refuses to run at all
+              // when region collection did not complete (see the throw above),
+              // which is the only way that list is ever non-empty.
+              [],
+              // Same explicit signal: an inspector full-page scan is a stitched
+              // frame, so the face-tile pass should not spend its budget on it.
+              capturedFullPage,
             );
 
             // 5. Run tokenization pass so vault and tokens are populated

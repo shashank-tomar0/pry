@@ -243,7 +243,10 @@ const STUBS = {
         ? globalThis.__pryOcrScript.shift()
         : null;
     };
-    export const ocrWordLines = async () => null;
+    // globalThis.__pryOcrLines lets a test hand the frame-text triage real
+    // words. Default null keeps every existing case on the "OCR read nothing"
+    // path. (No backticks here: this whole stub is a template literal.)
+    export const ocrWordLines = async () => globalThis.__pryOcrLines ?? null;
     export const warmOcrWorker = () => {
       globalThis.__pryOcrWarmed = (globalThis.__pryOcrWarmed ?? 0) + 1;
     };
@@ -261,6 +264,11 @@ const STUBS = {
   // the probe exists for — a face the ORIGINAL pass missed but the re-probe over
   // the SHIPPED frame still finds. A stub that always returned [] would make the
   // probe untestable ("no uncovered faces" every time, whatever the wiring).
+  //
+  // `tileFind` models what a short-range model with a fixed ~128×128 input
+  // actually does with a SMALL face: invisible in the whole frame, visible in a
+  // crop. Boxes come back only on call 2 — the first TILE, which sits at the
+  // frame origin, so its tile-local coordinates are frame coordinates.
   "@mediapipe/tasks-vision": `
     export const FilesetResolver = { forVisionTasks: async () => ({}) };
     export class FaceDetector {
@@ -269,7 +277,11 @@ const STUBS = {
         const probe = globalThis.__pryFaceProbe;
         if (!probe) return { detections: [] };
         probe.calls = (probe.calls ?? 0) + 1;
-        if (probe.calls < (probe.from ?? 1)) return { detections: [] };
+        if (probe.tileFind) {
+          if (probe.calls !== 2) return { detections: [] };
+        } else if (probe.calls < (probe.from ?? 1)) {
+          return { detections: [] };
+        }
         return {
           detections: (probe.boxes ?? []).map((b) => ({
             boundingBox: { originX: b.x, originY: b.y, width: b.width, height: b.height },
@@ -394,7 +406,14 @@ function isBlack(canvas, x, y, width, height, threshold = 60) {
   return total === 0 ? 0 : black / total;
 }
 
-async function runPipeline({ width = PAGE_WIDTH, height = PAGE_HEIGHT, sensitiveRegions = [], privacy = {}, glyphs = [] } = {}) {
+async function runPipeline({
+  width = PAGE_WIDTH,
+  height = PAGE_HEIGHT,
+  sensitiveRegions = [],
+  privacy = {},
+  glyphs = [],
+  unlocatedValues = [],
+} = {}) {
   const page = makePage(width * DPR, height * DPR, glyphs);
   const dataUrl = `data:image/png;base64,${Buffer.from(
     Buffer.from(page.data.buffer, page.data.byteOffset, page.data.length),
@@ -440,6 +459,7 @@ async function runPipeline({ width = PAGE_WIDTH, height = PAGE_HEIGHT, sensitive
         ...privacy,
       },
       knownSpans: [],
+      unlocatedValues,
     },
     {},
     () => {},
@@ -867,10 +887,14 @@ ok("the gate is on the residual, so it is independent of the sharpening amount",
 // Simulates the failure this probe exists for: the detector finds nothing over
 // the original pixels but finds a face over the shipped frame (detection runs are
 // not deterministic across the redaction pass — and a face near a redacted field
-// is exactly the case the channels were fixed for). Call 1 is the original pass;
-// the probe's calls are 2 and 3.
+// is exactly the case the channels were fixed for).
+//
+// The call arithmetic, because the main pass now tiles: for this 400×240 frame
+// the detector is called 1 time over the whole frame plus 2 times over crops (see
+// planFaceTiles — 2 columns, 1 row at a 320px target), so calls 1-3 are the main
+// pass and calls 4+ are the two probes (first ship, then the rebuilt frame).
 const MISSED_FACE = { x: 300, y: 150, width: 40, height: 40 };
-globalThis.__pryFaceProbe = { from: 2, boxes: [MISSED_FACE] };
+globalThis.__pryFaceProbe = { from: 4, boxes: [MISSED_FACE] };
 const escalateRun = await runPipeline({
   sensitiveRegions: [{ x: 10, y: 10, width: 120, height: 20, kind: "input_field", label: "Search" }],
   glyphs: [{ x: 10, y: 10, width: 120, height: 20 }],
@@ -902,6 +926,115 @@ ok("the escalated summary names the coverage failure that caused it",
   escalated.summary);
 ok("and does not claim zero recoverable blurs as a finding",
   !/0 blur/.test(escalated.summary), escalated.summary);
+
+// ── 9b. A SMALL face the whole-frame pass cannot see, found by a tile ──────
+// The reported miss at the level the model experiences it. The detector is
+// handed the whole frame (call 1, finds nothing — a 44px face is ~4px in its
+// fixed 128×128 input) and then a native-resolution crop (call 2, finds it). The
+// assertions are on the FRAME coordinates of the shipped bytes, so this pins the
+// tile offset end-to-end rather than only in the pure geometry test.
+const TILE_FACE_LOCAL = { x: 200, y: 150, width: 40, height: 40 }; // tile 0 sits at (0,0)
+globalThis.__pryFaceProbe = { tileFind: true, boxes: [TILE_FACE_LOCAL] };
+const tileRun = await runPipeline({
+  sensitiveRegions: [{ x: 10, y: 10, width: 120, height: 20, kind: "input_field", label: "Search" }],
+  glyphs: [{ x: 10, y: 10, width: 120, height: 20 }],
+});
+const tileDetectCalls = globalThis.__pryFaceProbe.calls;
+globalThis.__pryFaceProbe = null;
+
+ok("the main pass runs the whole frame AND its tiles before any probe",
+  tileDetectCalls === 4, `${tileDetectCalls} detector call(s): 1 frame + 2 tiles + 1 coverage probe`);
+const tileFace = tileRun.result.detections.find((d) => d.kind === "face");
+ok("a face the whole-frame pass never saw is found by a tile",
+  Boolean(tileFace), JSON.stringify(tileRun.result.detections.map((d) => `${d.kind}:${d.label}`)));
+// The audit box is the painted rect as a FRACTION of the frame (that is what the
+// side panel's overlay scales by), so the tile offset is checked through the
+// normalisation: 194/400 and 144/240 are the raw coordinates the tile produced.
+ok("its reported box is the tile box placed in FRAME coordinates",
+  tileFace &&
+    Math.abs(tileFace.box.x - 194 / (PAGE_WIDTH * DPR)) < 0.001 &&
+    Math.abs(tileFace.box.y - 144 / (PAGE_HEIGHT * DPR)) < 0.001 &&
+    Math.abs(tileFace.box.width - 52 / (PAGE_WIDTH * DPR)) < 0.001,
+  JSON.stringify(tileFace?.box));
+ok("and it counts as a redaction that was actually painted",
+  tileFace && /destroyed/i.test(tileFace.label) && tileFace.tier === "opaque",
+  JSON.stringify(tileFace));
+const tileDecoded = Buffer.from(tileRun.result.redactedDataUrl.split(",")[1], "base64");
+const tileShipped = {
+  width: PAGE_WIDTH * DPR,
+  height: PAGE_HEIGHT * DPR,
+  data: new Uint8ClampedArray(
+    tileDecoded.buffer.slice(tileDecoded.byteOffset, tileDecoded.byteOffset + tileDecoded.byteLength),
+  ),
+};
+ok("the rescued face is BLACK in the bytes that ship",
+  isBlack(tileShipped, TILE_FACE_LOCAL.x, TILE_FACE_LOCAL.y, TILE_FACE_LOCAL.width, TILE_FACE_LOCAL.height) > 0.9,
+  `black=${isBlack(tileShipped, TILE_FACE_LOCAL.x, TILE_FACE_LOCAL.y, TILE_FACE_LOCAL.width, TILE_FACE_LOCAL.height).toFixed(3)}`);
+ok("and the tile pass did not turn the frame into a leftover-leak report",
+  tileRun.result.verification.attack.uncoveredFaces === 0, JSON.stringify(tileRun.result.verification.attack));
+
+// ── 9c. A value the DOM could not place, and what the pixels can say ──────
+// `dom-targets-unresolved` used to withhold the frame outright: a value was
+// detected, no rectangle could be named for it, so the pixels never shipped. The
+// frame-text channel is the one channel that can see text the DOM never had — an
+// image, a canvas, a video frame — so it is handed these exact values now. When
+// it FINDS one and paints it, the frame ships: strictly better than withholding,
+// because the value is covered instead of merely refused.
+const UNPLACED = "Priya Sharma";
+globalThis.__pryOcrLines = [
+  {
+    words: [
+      { text: "Priya", x: 20, y: 20, width: 44, height: 14, confidence: 92 },
+      { text: "Sharma", x: 68, y: 20, width: 56, height: 14, confidence: 92 },
+    ],
+  },
+];
+const foundRun = await runPipeline({
+  privacy: { scanFrameText: true },
+  unlocatedValues: [UNPLACED],
+  // The tile must look readable or the conservative pre-OCR gate skips it.
+  glyphs: [{ x: 20, y: 20, width: 124, height: 14 }],
+});
+const foundEvidence = foundRun.result.unlocatedText;
+ok("the unplaced value is searched for in the frame's own pixels",
+  foundEvidence?.requested === 1 && foundEvidence.searched === true,
+  JSON.stringify(foundEvidence));
+ok("and it is found there, so the frame can be cleared on proof rather than on absence",
+  foundEvidence.legible === 1 && foundEvidence.stillLegible === 0,
+  JSON.stringify(foundEvidence));
+ok("the found value is painted as an opaque redaction",
+  foundRun.result.detections.some((d) => /in image/i.test(d.label) && d.tier === "opaque"),
+  JSON.stringify(foundRun.result.detections.map((d) => `${d.label}:${d.tier}`)));
+
+// The frame-text channel read this frame and did NOT find the value. That is an
+// OCR miss as easily as an absence, so it must NOT be reported as clearance —
+// the channel's own documentation is explicit that an unread value is a value it
+// cannot box. `legible` exists in the evidence precisely so a caller cannot
+// mistake this for proof.
+globalThis.__pryOcrLines = [
+  { words: [{ text: "Unrelated", x: 20, y: 60, width: 70, height: 14, confidence: 92 }] },
+];
+const missedRun = await runPipeline({
+  privacy: { scanFrameText: true },
+  unlocatedValues: [UNPLACED],
+  glyphs: [{ x: 20, y: 60, width: 70, height: 14 }],
+});
+globalThis.__pryOcrLines = null;
+const missedEvidence = missedRun.result.unlocatedText;
+ok("a value the frame-text channel read nothing for is NOT cleared",
+  missedEvidence.searched === true && missedEvidence.legible === 0 && missedEvidence.stillLegible === 0,
+  JSON.stringify(missedEvidence));
+
+// No OCR at all is no proof at all: without pixels read there is nothing to
+// certify, and `searched` says so.
+const unsearchedRun = await runPipeline({
+  privacy: { scanFrameText: false },
+  unlocatedValues: [UNPLACED],
+});
+const unsearchedEvidence = unsearchedRun.result.unlocatedText;
+ok("with the frame-text scan off there is no search and no claim",
+  unsearchedEvidence === undefined || unsearchedEvidence.searched === false,
+  JSON.stringify(unsearchedEvidence));
 
 const escalatedDecoded = Buffer.from(escalateRun.result.redactedDataUrl.split(",")[1], "base64");
 const escalatedShipped = {

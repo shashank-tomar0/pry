@@ -4,7 +4,8 @@
  * Manifest V3 service workers cannot access DOM APIs, WebGPU, or run
  * long-lived inference. This offscreen document provides the environment for:
  *   1. DOM-guided screenshot redaction (masking/blurring PII regions)
- *   2. Face detection (BlazeFace → Chrome FaceDetector → skin-colour)
+ *   2. Face detection (BlazeFace over the frame and over tiles of it →
+ *      Chrome FaceDetector → skin-colour)
  *   3. Canvas-based redaction engine
  *
  * Redaction tiers, weakest to strongest:
@@ -51,12 +52,19 @@ import {
   type OcrLine,
   type TriageBox,
 } from "../shared/ocr-pii-triage";
-import type { ScreenshotProtection, VerificationResult } from "../shared/types";
+import type { ProcessedScreenshotResult, ScreenshotProtection, VerificationResult } from "../shared/types";
 import { detectSpans, warmUpNer } from "../ml/ner";
 import { classifyInjection, warmUpGuard } from "../ml/guard";
 import { FilesetResolver, FaceDetector as MpFaceDetector } from "@mediapipe/tasks-vision";
 import { tileLooksReadable } from "../shared/frame-text";
-import { coversExistingFace, mergeFaceBoxes, shouldRunSecondaryFaceDetector, type FaceBox } from "../shared/face-regions";
+import {
+  coversExistingFace,
+  dedupeFaceBoxes,
+  mergeFaceBoxes,
+  planFaceTiles,
+  shouldRunSecondaryFaceDetector,
+  type FaceBox,
+} from "../shared/face-regions";
 import { normalizePaintedRect } from "../shared/region-mapping";
 import {
   BLUR_RADIUS_CSS_PX,
@@ -141,6 +149,58 @@ async function detectFacesWithBlazeFace(
   } finally {
     bitmap.close();
   }
+}
+
+/**
+ * The tiled pass: the SAME detector over overlapping NATIVE-RESOLUTION crops.
+ *
+ * Why this exists, in one number. The model's input is a fixed ~128×128, so a
+ * whole 1280×800 viewport is scaled to 0.1 before the first convolution: a 44 px
+ * thumbnail face — the one reported at 359,198 — arrives as ~4 px and is lost
+ * before any threshold can see it. That is a resolution problem, not a
+ * sensitivity problem, so no confidence tuning fixes it; only handing the model
+ * a bigger version of the face does. Each 375 px crop scales at ~0.34, which puts
+ * that same face at ~15 px in model space.
+ *
+ * Tiles are drawn at 1:1 from the frame, so boxes come back in FRAME pixels after
+ * the tile offset — the same space the blur loop and the audit already use.
+ * Overlapping tiles report one face several times, so the results are deduped
+ * (see dedupeFaceBoxes) before they reach the paint loop: a face must be painted
+ * once, not once per tile that happened to contain it.
+ */
+async function detectFacesWithBlazeFaceTiles(
+  canvas: OffscreenCanvas,
+  width: number,
+  height: number,
+): Promise<Array<{ x: number; y: number; width: number; height: number; confidence: number }>> {
+  const detector = await getBlazeFace();
+  if (!detector) return [];
+  const tiles = planFaceTiles(width, height);
+  if (tiles.length === 0) return [];
+  const found: Array<{ x: number; y: number; width: number; height: number; confidence: number }> = [];
+  for (const tile of tiles) {
+    const tileCanvas = new OffscreenCanvas(tile.width, tile.height);
+    const tileCtx = tileCanvas.getContext("2d")!;
+    tileCtx.drawImage(canvas, tile.x, tile.y, tile.width, tile.height, 0, 0, tile.width, tile.height);
+    const bitmap = await createImageBitmap(tileCanvas);
+    try {
+      const result = await detector.detect(bitmap);
+      for (const detection of result.detections ?? []) {
+        const bb = detection.boundingBox ?? { originX: 0, originY: 0, width: 0, height: 0 };
+        if (!(bb.width > 16 && bb.height > 16)) continue;
+        found.push({
+          x: bb.originX + tile.x,
+          y: bb.originY + tile.y,
+          width: bb.width,
+          height: bb.height,
+          confidence: detection.categories?.[0]?.score ?? 0.8,
+        });
+      }
+    } finally {
+      bitmap.close();
+    }
+  }
+  return found;
 }
 
 // ─── Chrome FaceDetector API (Chrome 100+, Shape Detection API) ─────────────
@@ -480,7 +540,14 @@ async function processScreenshot(
   regionOffsetY: number = 0,
   /** Spans the on-device NER already found on this page — see triageFrameText. */
   knownSpans: string[] = [],
+  /**
+   * Values the DOM channel detected and could NOT place on screen. Handed to
+   * the frame-text channel so its verdict on them is evidence rather than a
+   * guess — see triageFrameText's `unlocatedText`.
+   */
+  unlocatedValues: string[] = [],
 ): Promise<{
+  unlocatedText?: ProcessedScreenshotResult["unlocatedText"];
   redactedDataUrl: string;
   detections: Array<{
     kind: string;
@@ -660,11 +727,33 @@ async function processScreenshot(
     // ("BlazeFace pass over the ORIGINAL pixels"). Feeding masks to the
     // detector is how a face near a redacted field goes undetected and stays
     // readable in a frame the pipeline believes it cleaned.
-    modelFaces = (await detectFacesWithBlazeFace(originalCanvas)).map((f) => ({ ...f, source: "model" as const }));
+    const fullFrameFaces = (await detectFacesWithBlazeFace(originalCanvas)).map((f) => ({ ...f, source: "model" as const }));
     faceChannelRan = true;
-    if (modelFaces.length > 0) {
-      console.log(`[PRY Offscreen] BlazeFace found ${modelFaces.length} faces`);
+    if (fullFrameFaces.length > 0) {
+      console.log(`[PRY Offscreen] BlazeFace found ${fullFrameFaces.length} faces`);
     }
+    // Then the same detector over native-resolution crops, which is the ONLY way
+    // a small face survives the model's fixed 128×128 input (see
+    // detectFacesWithBlazeFaceTiles). Deduped against the full-frame result, so a
+    // large face found by both is one face.
+    let tiledFaces: FaceBox[] = [];
+    try {
+      tiledFaces = (await detectFacesWithBlazeFaceTiles(originalCanvas, width, height)).map(
+        (f) => ({ ...f, source: "model" as const }),
+      );
+    } catch (err) {
+      // A tile failure must not cost the full-frame result the pipeline already
+      // has — and must not be recorded as "the face channel ran" on its own.
+      faceChannelFailure = err instanceof Error ? err.message : String(err);
+    }
+    const dedupedFaces = dedupeFaceBoxes([...fullFrameFaces, ...tiledFaces]);
+    if (dedupedFaces.length > fullFrameFaces.length) {
+      console.log(
+        `[PRY Offscreen] Face tiles found ${dedupedFaces.length - fullFrameFaces.length} face(s) ` +
+        `the full-frame pass missed (${planFaceTiles(width, height).length} tiles)`,
+      );
+    }
+    modelFaces = dedupedFaces;
   } catch (err) {
     faceChannelFailure = err instanceof Error ? err.message : String(err);
     // Fall through to the next channel.
@@ -804,11 +893,16 @@ async function processScreenshot(
   let triageBoxes = 0;
   let triageDropped = 0;
   let triageRan = false;
+  /** Evidence about the values the DOM channel could not place — see the type. */
+  let unlocatedText: ProcessedScreenshotResult["unlocatedText"];
   if (privacy?.scanFrameText !== false) {
     try {
-      const triage = await triageFrameText(canvas, width, height, redactionRegions, knownSpans);
+      const triage = await triageFrameText(
+        canvas, width, height, redactionRegions, knownSpans, unlocatedValues,
+      );
       triageRan = triage.ran;
       triageDropped = triage.dropped;
+      unlocatedText = triage.unlocatedText;
       for (const box of triage.boxes) {
         ctx.fillStyle = "#000000";
         ctx.fillRect(box.x, box.y, box.width, box.height);
@@ -1023,6 +1117,9 @@ async function processScreenshot(
     processingTimeMs: performance.now() - startTime,
     verification,
     protection,
+    // The frame-text channel's verdict on the values the DOM could not place.
+    // Absent when no such value was asked about, which is the common case.
+    unlocatedText,
   };
 }
 
@@ -1032,6 +1129,19 @@ const TRIAGE_TILE_HEIGHT = 900;
 const TRIAGE_MAX_TILES = 6;
 /** Per-tile OCR bound; a tile that times out is reported, not retried. */
 const TRIAGE_TILE_TIMEOUT_MS = 8000;
+/**
+ * Wall-clock budget for the WHOLE triage pass, across all tiles.
+ *
+ * The per-tile bound above bounds one tile and nothing else: six tiles at 8 s is
+ * 48 s of worst case inside a capture the agent loop waits 15 s for, so the frame
+ * was given up on and the planner went blind — twice in the reported run ("Frame
+ * capture (opening frame) did not finish within 15s", then the same line after
+ * the first action). A budget that fits inside that wait turns "no frame at all"
+ * into "a frame triaged as far as it got", which is strictly more useful and is
+ * what `timedOut` already exists to report. Tiles are read top-down, so the part
+ * that is given up is the bottom of the page, and the record says so.
+ */
+const TRIAGE_TOTAL_BUDGET_MS = 6000;
 
 /**
  * Read the already-redacted canvas back with on-device OCR and return the boxes
@@ -1054,15 +1164,32 @@ async function triageFrameText(
   height: number,
   covered: Array<{ x: number; y: number; width: number; height: number }>,
   knownSpans: string[],
-): Promise<{ boxes: TriageBox[]; dropped: number; tiles: number; timedOut: boolean; ran: boolean }> {
+  unlocatedValues: string[] = [],
+): Promise<{
+  boxes: TriageBox[];
+  dropped: number;
+  tiles: number;
+  timedOut: boolean;
+  ran: boolean;
+  unlocatedText: ProcessedScreenshotResult["unlocatedText"];
+}> {
   const tileHeight = Math.min(TRIAGE_TILE_HEIGHT, height);
   const tileCount = Math.min(TRIAGE_MAX_TILES, Math.max(1, Math.ceil(height / tileHeight)));
   const collected: OcrLine[] = [];
   let tilesRun = 0;
   let tilesBlank = 0;
   let timedOut = false;
+  // See TRIAGE_TOTAL_BUDGET_MS: the per-tile timeout bounds one tile, and this
+  // bounds the pass. Whichever runs out first ends the pass, and either way the
+  // result is reported as partial rather than as a complete scan.
+  const deadline = Date.now() + TRIAGE_TOTAL_BUDGET_MS;
 
   for (let index = 0; index < tileCount; index++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      timedOut = true;
+      break;
+    }
     const top = index * tileHeight;
     const sliceHeight = Math.min(tileHeight, height - top);
     if (sliceHeight <= 0) break;
@@ -1082,7 +1209,10 @@ async function triageFrameText(
       // PNG, not JPEG: compression artifacts around small UI text cost real
       // recognition accuracy, and this image never leaves the machine.
       const tileUrl = await blobToDataUrl(await tile.convertToBlob({ type: "image/png" }));
-      const lines = await ocrWordLines(tileUrl, TRIAGE_TILE_TIMEOUT_MS);
+      const lines = await ocrWordLines(
+        tileUrl,
+        Math.max(1, Math.min(TRIAGE_TILE_TIMEOUT_MS, deadline - Date.now())),
+      );
       if (!lines) {
         // A null result is either "nothing legible in this tile" or a failure;
         // only a total absence across all tiles means OCR itself was down.
@@ -1102,13 +1232,55 @@ async function triageFrameText(
   // Any tile left unprocessed (budget reached) means partial coverage.
   if (tileCount < Math.ceil(height / tileHeight)) timedOut = true;
 
-  const found = findTriageBoxes(collected, { spans: knownSpans });
+  // The unplaceable values ride along with the NER spans: this channel is the
+  // designated catch-all for text the DOM never had (image, canvas, video), so
+  // it is also the only thing that can say whether a value the DOM could not
+  // place is legible in the frame or simply not there at all.
+  const spans = [...knownSpans, ...unlocatedValues];
+  const found = findTriageBoxes(collected, { spans });
   const uncovered = dropCoveredBoxes(found, covered);
+  // Boxes dropCoveredBoxes removed were already covered by a painted region, so
+  // they are clean too; only what the CAP discards is left legible.
+  const coveredAlready = found.filter((box) => !uncovered.includes(box));
   const { kept, dropped } = capTriageBoxes(uncovered);
+  const ran = tilesRun + tilesBlank > 0;
+
+  // Which of the asked-about values are still legible in the shipped frame?
+  const wanted = [...new Set(unlocatedValues.map((value) => (value ?? "").trim()).filter(Boolean))];
+  const named = (list: TriageBox[], value: string): boolean =>
+    list.some((box) => box.value.toLowerCase() === value.toLowerCase());
+  const readInFrame = wanted.filter((value) => named(found, value));
+  const stillLegible = readInFrame.filter(
+    (value) => !named(kept, value) && !named(coveredAlready, value),
+  );
+  // What the caller may conclude from this, and what it may NOT: a value this
+  // channel FOUND and painted (or found already covered) is proven covered. A
+  // value it did not find is NOT proven absent — OCR misreads and low-confidence
+  // lines are real limits of this channel, which is why it reports `legible`
+  // alongside `stillLegible` instead of only the count of survivors. The caller
+  // must require `legible === requested` before treating a frame as safe; a bare
+  // "stillLegible === 0" would clear a frame on the strength of an OCR miss.
+
   // `ran` means the frame was EXAMINED, not that it produced boxes: a page that
   // is mostly whitespace was triaged and is clean. Reporting that as "triage
   // unavailable" would be the wrong story for the common case.
-  return { boxes: kept, dropped, tiles: tilesRun + tilesBlank, timedOut, ran: tilesRun + tilesBlank > 0 };
+  return {
+    boxes: kept,
+    dropped,
+    tiles: tilesRun + tilesBlank,
+    timedOut,
+    ran,
+    unlocatedText: {
+      requested: wanted.length,
+      // Proof needs pixels to have been read. No OCR means no claim.
+      searched: ran && wanted.length > 0,
+      legible: readInFrame.length,
+      stillLegible: stillLegible.length,
+      // Deliberately no samples: masking is a background concern and this
+      // document must never hold an unmasked value in a report. The caller
+      // already has the value list it supplied, and masks it for the warning.
+    },
+  };
 }
 
 /**
@@ -1334,6 +1506,14 @@ async function attackShippedFrame(
       // false positive here would escalate the frame (blacking out an innocent
       // region) on the strength of a colour histogram.
       //
+      // Deliberately NOT the tiled pass either, and the reason is remediation:
+      // escalation repaints the regions the pipeline already knows about, so a
+      // small face this probe found outside every region would be reported on
+      // every frame and could never be fixed by the rebuild that follows it.
+      // The tiled pass belongs where detection can still act on what it finds
+      // (the main pass above); this probe's job is to catch a LARGE face the
+      // pipeline lost between detecting it and shipping the frame.
+      //
       // AWAITED, not fire-and-forget: an unawaited probe would hand back an
       // empty finding list before the detector resolved, so the attack would
       // silently report "no uncovered faces" on every frame — a check that
@@ -1401,6 +1581,8 @@ chrome.runtime.onMessage.addListener(
       width?: number;
       height?: number;
       sensitiveRegions?: SensitiveRegion[];
+      /** Values the DOM channel detected but could not place — see triageFrameText. */
+      unlocatedValues?: string[];
       dpr?: number;
       regionScale?: number;
       regionOffsetY?: number;
@@ -1434,6 +1616,7 @@ chrome.runtime.onMessage.addListener(
         message.regionScale ?? message.dpr ?? 1,
         message.regionOffsetY ?? 0,
         message.knownSpans ?? [],
+        message.unlocatedValues ?? [],
       )
         .then((result) => {
           // Send result back via sendMessage, NOT sendResponse.

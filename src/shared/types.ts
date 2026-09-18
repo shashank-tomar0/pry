@@ -181,6 +181,32 @@ export interface ProcessedScreenshotResult {
   processingTimeMs: number;
   /** Re-OCR proof that redaction actually worked on the shipped pixels. */
   verification?: VerificationResult;
+  /**
+   * What the frame-text channel found when it was handed the values the DOM
+   * channel could not place (`dom-targets-unresolved`).
+   *
+   * This is the evidence that decides whether an unplaceable value is a leak or
+   * merely an unplaceable value. "Could not locate it in the DOM" and "it is not
+   * legible in the frame" are different findings, and only the second one means
+   * the frame is safe — which is why the pixel channel is asked directly rather
+   * than the first being treated as the second.
+   */
+  unlocatedText?: {
+    /** How many values the DOM channel asked to have cleared. */
+    requested: number;
+    /** True when the frame's pixels were actually read (no OCR, no proof). */
+    searched: boolean;
+    /**
+     * Values the OCR read in the frame, wherever they were. Clearance requires
+     * this to equal `requested`: an unfound value is NOT proven absent, because
+     * OCR misreads and low-confidence lines are real limits of this channel.
+     */
+    legible: number;
+    /** Values it read but which were left unpainted — none may be left. */
+    stillLegible: number;
+    /** Masked samples of anything still legible, for the warning line. */
+    samples?: string[];
+  };
 }
 
 /** Messages the content script accepts. */

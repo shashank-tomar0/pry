@@ -329,6 +329,10 @@ async function processScreenshot(
    */
   regionScale: number = dpr,
   regionOffsetY: number = 0,
+  /** Values the DOM channel detected but could not place — see the offscreen
+   *  document's triageFrameText. Their verdict decides whether an unplaceable
+   *  value withholds the frame. */
+  unlocatedValues: string[] = [],
 ): Promise<ProcessedScreenshotResult> {
   await ensureOffscreenDocument();
 
@@ -378,6 +382,7 @@ async function processScreenshot(
       // in-image text triage can recognise them: a bare name in a photo has no
       // pattern to match, but it does have this.
       knownSpans: getActiveNerSpans(),
+      unlocatedValues,
     });
   });
 }
@@ -397,6 +402,13 @@ async function getSensitiveRegions(tabId: number): Promise<{
   viewportWidth: number;
   /** Set when region collection did not complete — text PII is NOT redacted. */
   failure: string | null;
+  /**
+   * Values that WERE detected but could not be placed on screen. Never empty
+   * when `failure` contains `dom-targets-unresolved` — these are the values the
+   * pixel channel is asked to clear, so the frame is not withheld merely
+   * because the DOM scanner could not name a rectangle for them.
+   */
+  unlocatedValues: string[];
 } | null> {
   // Distinguish "no receiver" (content script not injected — reinject) from
   // "receiver busy" (script exists but hung — reinjecting would only create a
@@ -485,7 +497,7 @@ async function getSensitiveRegions(tabId: number): Promise<{
         ? "the page's main thread did not answer in time (heavy script, or a frozen tab)"
         : "the content script is not reachable on this page";
       console.log(`[PRY] Sensitive-region collection failed: ${result.reason}`);
-      return { regions: [], dpr: 1, scrollY: 0, viewportWidth: 0, failure: why };
+      return { regions: [], dpr: 1, scrollY: 0, viewportWidth: 0, failure: why, unlocatedValues: [] };
     }
     const value = result.value as { sensitiveRegions?: unknown[]; dpr?: number; scrollY?: number; viewportWidth?: number };
     if (!Array.isArray(value?.sensitiveRegions)) {
@@ -496,6 +508,7 @@ async function getSensitiveRegions(tabId: number): Promise<{
         scrollY: value?.scrollY ?? 0,
         viewportWidth: value?.viewportWidth ?? 0,
         failure: "the content script returned no region list",
+        unlocatedValues: [],
       };
     }
     const failures: string[] = [];
@@ -535,7 +548,11 @@ async function getSensitiveRegions(tabId: number): Promise<{
       [region.x, region.y, region.width, region.height].every(Number.isFinite) &&
       region.width > 0 && region.height > 0);
     if (validRegions.length !== regions.length) failures.push("dom-region-geometry-invalid");
-    if (findUnlocatedValues(locateValues.map((value) => ({ value })), validRegions).length > 0) {
+    // Kept, not just counted: these values are what the pixel channel is asked
+    // about below, so its verdict can turn "we could not place it" into "it is
+    // not legible in the frame" (or into a refusal, when it is).
+    const unlocatedValues = findUnlocatedValues(locateValues.map((value) => ({ value })), validRegions);
+    if (unlocatedValues.length > 0) {
       failures.push("dom-targets-unresolved");
     }
     if (!Number.isFinite(value.dpr) || (value.dpr ?? 0) <= 0 ||
@@ -549,6 +566,7 @@ async function getSensitiveRegions(tabId: number): Promise<{
       scrollY: value.scrollY ?? Number.NaN,
       viewportWidth: value.viewportWidth ?? Number.NaN,
       failure: failures.length ? failures.join(", ") : null,
+      unlocatedValues,
     };
   } catch (err) {
     console.warn("[PRY] getSensitiveRegions failed:", err);
@@ -558,6 +576,7 @@ async function getSensitiveRegions(tabId: number): Promise<{
       scrollY: 0,
       viewportWidth: 0,
       failure: err instanceof Error ? err.message : String(err),
+      unlocatedValues: [],
     };
   }
 }
@@ -687,11 +706,6 @@ export async function captureAndProcessScreenshot(
   // list also carries coverage problems that are not geometry problems.
   let geometryConfirmed = mapping.valid && captureVerified;
   if (!captureVerified) captureReasons.push("capture-verification-missing");
-  const textComplete = Boolean(sensitiveData) && !sensitiveData!.failure;
-  if (!textComplete) {
-    captureReasons.push(`dom-coverage-incomplete: ${sensitiveData?.failure ?? "no response"}`);
-  }
-  if (unlocated.length > 0) captureReasons.push("dom-targets-unresolved");
   if (capturedFullPage) {
     // Restored-viewport boxes do not establish coverage of every captured tile.
     captureReasons.push("fullpage-dom-coverage-unverified");
@@ -710,6 +724,7 @@ export async function captureAndProcessScreenshot(
   console.log(`[PRY] Screenshot (tab ${tabId}): ${width}x${height} @ ${dpr}x DPR, ${sensitiveRegions.length} sensitive regions found` +
     (fullPageImage ? `, region scale ${regionScale.toFixed(3)}, offset y ${Math.round(regionOffsetY)}px` : ""));
 
+  const unlocatedValues = sensitiveData?.unlocatedValues ?? [];
   const processed = await processScreenshot(
     rawDataUrl, width, height, sensitiveRegions, dpr,
     {
@@ -720,7 +735,73 @@ export async function captureAndProcessScreenshot(
     },
     regionScale,
     regionOffsetY,
+    // The values the DOM channel could not place ride INTO the pixel pipeline so
+    // the frame-text channel can report on them. Without this the pipeline knew
+    // only THAT something was unplaced, never whether it was still readable.
+    unlocatedValues,
   );
+  // ─── Coverage, decided on evidence rather than on where it was noticed ───
+  // "The DOM scanner could not name a rectangle for this value" and "this value
+  // is legible in the frame that ships" are two different findings, and only the
+  // second one makes the frame unsafe. Treating the first as the second is what
+  // withheld the frame on the reported YouTube run: the planner never saw the
+  // page, and the run then looped on read_page against a page it could not see.
+  //
+  // The frame-text channel is handed those exact values, so it can answer the
+  // question directly: it either found the value and painted it, or read the
+  // frame and did not find it. Either way the shipped pixels do not hold it
+  // legibly, and that is proof. Without OCR having run there is NO proof, and the
+  // frame is withheld exactly as before — the excuse is bought with pixels read,
+  // never assumed.
+  const failureParts = (sensitiveData?.failure ?? "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const onlyUnplacedTargets =
+    failureParts.length > 0 && failureParts.every((part) => part === "dom-targets-unresolved");
+  // Clearance requires the pixel channel to have FOUND every value and covered
+  // it — not merely to have failed to find it. "The frame-text channel did not
+  // see it" is not proof of absence: that channel's own limits (OCR misreads,
+  // low-confidence lines) mean an unfound value may simply be unread. Requiring
+  // `legible === requested` is the difference between proving coverage and
+  // assuming it, and assuming it here would ship a frame holding exactly the
+  // value the DOM scan said it could not redact.
+  const unlocatedText = processed.unlocatedText;
+  const unplacedCount = new Set(unlocatedValues).size;
+  const pixelsClearedUnplaced =
+    onlyUnplacedTargets &&
+    unplacedCount > 0 &&
+    unlocatedText?.searched === true &&
+    unlocatedText.legible >= unplacedCount &&
+    unlocatedText.stillLegible === 0;
+  const textComplete =
+    Boolean(sensitiveData) && (failureParts.length === 0 || pixelsClearedUnplaced);
+  if (!textComplete) {
+    captureReasons.push(`dom-coverage-incomplete: ${sensitiveData?.failure ?? "no response"}`);
+  }
+  if (unlocated.length > 0 && !pixelsClearedUnplaced) captureReasons.push("dom-targets-unresolved");
+  if (pixelsClearedUnplaced) {
+    // Say the thing that changed, once per distinct set of values: the warning
+    // above told the user text detection did not complete, and this is its
+    // resolution. Silence here would leave the transcript claiming the frame was
+    // withheld when it shipped.
+    const resolvedSignature = `cleared\u0000${[...new Set(unlocatedValues)].join("\u0000")}`;
+    if (resolvedSignature !== lastUnlocatedSignature) {
+      lastUnlocatedSignature = resolvedSignature;
+      emit({
+        kind: "entry",
+        entry: {
+          id: `unlocated-cleared-${Date.now()}`,
+          role: "system",
+          text:
+            `Privacy: ${unplacedCount} item(s) the DOM scanner could not place were found in this ` +
+            `frame's own pixels and destroyed before it ships. They were inside an image, a canvas ` +
+            `or a video frame — the one place a DOM scan cannot see.`,
+        },
+      });
+    }
+  }
+
   // Assemble the egress evidence: the offscreen half (its own scan results)
   // plus the two facts only this process holds — whether the DOM text channel
   // completed and whether the region→image geometry was verified. Without this

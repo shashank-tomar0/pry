@@ -2339,6 +2339,98 @@ ok("the rescued thumbnail face is painted once, as a model box",
 ok("the large portrait is still kept alongside it",
   rescuedThumb.some((f) => f.width === 220 && f.source === "model"));
 
+// ── Tiling: the resolution half of the same reported miss ───────────────────
+// Confidence thresholds and the size floor were NOT the reason the face at
+// 359,198 was dropped — the pixels were. BlazeFace's short-range model has a
+// fixed ~128×128 input, so a 1280×800 viewport is scaled to 0.1 first: a 44 px
+// face arrives as ~4 px and no threshold can recover it. The fix is to hand the
+// model a native-resolution CROP, which is a geometry decision and is pinned
+// here as geometry.
+const {
+  planFaceTiles, dedupeFaceBoxes, offsetFaceBoxes,
+  FACE_TILE_TARGET_PX, FACE_TILE_MAX, FACE_TILE_MAX_FRAME_PX, FACE_TILE_DUPLICATE_COVERAGE,
+} = await import("../src/shared/face-regions.ts");
+const { FACE_DUPLICATE_COVERAGE: FACE_CHANNEL_DUPLICATE_COVERAGE } = await import("../src/shared/face-regions.ts");
+
+ok("a frame that already fits one tile is not tiled (the full-frame pass IS that tile)",
+  planFaceTiles(320, 240).length === 0 && planFaceTiles(200, 120).length === 0);
+// Above the bound the grid could not cover the frame inside the tile budget, so
+// the caller keeps its single full-frame pass. Stated, not silent.
+ok("a stitched full-page capture is not tiled",
+  planFaceTiles(1280, 10000).length === 0 && FACE_TILE_MAX_FRAME_PX === 1280);
+ok("a zero-sized frame has no tiles",
+  planFaceTiles(0, 0).length === 0);
+
+const viewportTiles = planFaceTiles(1280, 800);
+ok("a 1280×800 viewport is tiled",
+  viewportTiles.length > 1 && viewportTiles.length <= FACE_TILE_MAX,
+  `${viewportTiles.length} tiles`);
+ok("every tile is smaller than the frame, which is the whole point",
+  viewportTiles.every((t) => t.width < 1280 && t.height < 800));
+ok("tiles stay bounded on their longest side, so the model's scale stays usable",
+  viewportTiles.every((t) => Math.max(t.width, t.height) <= FACE_TILE_TARGET_PX * 1.3),
+  JSON.stringify(viewportTiles.map((t) => `${t.width}x${t.height}`)));
+ok("the tiles COVER the frame: the first reaches the origin and one reaches each far edge",
+  viewportTiles.some((t) => t.x === 0 && t.y === 0) &&
+    viewportTiles.some((t) => t.x + t.width === 1280) &&
+    viewportTiles.some((t) => t.y + t.height === 800),
+  JSON.stringify(viewportTiles));
+ok("no tile falls outside the frame",
+  viewportTiles.every((t) => t.x >= 0 && t.y >= 0 && t.x + t.width <= 1280 && t.y + t.height <= 800));
+ok("neighbouring tiles overlap, so a face on a seam is whole in one of them",
+  (() => {
+    const a = viewportTiles.find((t) => t.x === 0 && t.y === 0);
+    const right = viewportTiles.find((t) => t.y === a.y && t.x > 0);
+    return right !== undefined && a.x + a.width > right.x;
+  })(), JSON.stringify(viewportTiles));
+
+// The arithmetic that makes the reported face findable: the model input is 128.
+const facePx = 44;
+const fullFrameScale = 128 / 1280;
+const tileScale = 128 / (viewportTiles[0].height < viewportTiles[0].width ? viewportTiles[0].width : viewportTiles[0].height);
+ok("a 44px face is ~4px in the whole-frame pass — gone before the first convolution",
+  Math.round(facePx * fullFrameScale) <= 5, String(facePx * fullFrameScale));
+ok("and ~15px inside a tile — detectable, without moving any threshold",
+  Math.round(facePx * tileScale) >= 12, String(facePx * tileScale));
+ok("the tile budget is what keeps the pass inside the frame wait",
+  FACE_TILE_MAX <= 16 && viewportTiles.length <= FACE_TILE_MAX);
+
+// Tile-local boxes must land in FRAME pixels, or every small face would be
+// redacted at the wrong place — worse than not finding it.
+const tile = { x: 300, y: 200, width: 375, height: 281 };
+const localFace = { x: 59, y: -2, width: 44, height: 44, confidence: 0.7, source: "model" };
+const placed = offsetFaceBoxes([localFace], tile);
+ok("a tile-local box is offset into frame coordinates",
+  placed.length === 1 && placed[0].x === 359 && placed[0].y === 198,
+  JSON.stringify(placed));
+ok("offsetting does not disturb size, confidence or channel",
+  placed[0].width === 44 && placed[0].height === 44 && placed[0].confidence === 0.7 && placed[0].source === "model");
+
+// One face, seen by every tile that contains it, is still one face.
+const seamFace = { x: 340, y: 190, width: 44, height: 44, confidence: 0.8, source: "model" };
+const fromTileA = { x: 336, y: 186, width: 46, height: 46, confidence: 0.62, source: "model" };
+const fromTileB = { x: 344, y: 194, width: 42, height: 42, confidence: 0.71, source: "model" };
+const deduped = dedupeFaceBoxes([fromTileA, seamFace, fromTileB]);
+ok("overlapping tiles' reports of one face collapse to one box",
+  deduped.length === 1, JSON.stringify(deduped));
+ok("and the survivor is the biggest report — the tile that saw all of the face",
+  deduped[0].width === 46 && deduped[0].height === 46, JSON.stringify(deduped[0]));
+ok("two faces side by side in one tile stay two boxes",
+  dedupeFaceBoxes([
+    { x: 40, y: 500, width: 44, height: 44, confidence: 0.7, source: "model" },
+    { x: 100, y: 500, width: 44, height: 44, confidence: 0.7, source: "model" },
+  ]).length === 2);
+ok("the tile duplicate threshold is looser than the cross-channel one (crops differ)",
+  FACE_TILE_DUPLICATE_COVERAGE > FACE_CHANNEL_DUPLICATE_COVERAGE &&
+    FACE_TILE_DUPLICATE_COVERAGE === 0.5);
+ok("a larger box is preferred when a face is clipped by a tile edge",
+  dedupeFaceBoxes([
+    { x: 340, y: 190, width: 20, height: 20, confidence: 0.9, source: "model" },
+    { x: 336, y: 186, width: 44, height: 44, confidence: 0.5, source: "model" },
+  ])[0].width === 44);
+
+
+
 // ── Scenario AI: a NER span that is not on the page is not a detection ────
 // Tier-0 spans are scored per page now, but the fusion layer is the last line
 // of defence: nothing downstream can act on a span that is not literally on
@@ -4694,5 +4786,88 @@ ok("the diagnostics come from the finding, so the words match the shape",
 ok("the old boolean guard is gone (no second copy of the policy in the loop)",
   !/function isLooping\(\)/.test(agentSource2) &&
     !/recentActions\.every\(\(a\) => !actionChangesFrame/.test(agentSource2));
+
+// ── The tiled face pass is WIRED, not merely available ─────────────────────
+// A pure policy that nothing calls is the failure mode this file keeps finding.
+// Asserted against the offscreen source here because that file is read above.
+console.log("\n=== Scenario BB: the tiled face pass is wired into the pipeline ===\n");
+
+ok("the offscreen pipeline runs a tiled pass over the original pixels",
+  /detectFacesWithBlazeFaceTiles\(originalCanvas, width, height\)/.test(offscreenSource));
+ok("and dedupes it against the full-frame pass before painting",
+  /dedupeFaceBoxes\(\[\.\.\.fullFrameFaces, \.\.\.tiledFaces\]\)/.test(offscreenSource));
+ok("a tile failure cannot take the full-frame result down with it",
+  /A tile failure must not cost the full-frame result/.test(offscreenSource));
+ok("the tile pass draws crops 1:1, so boxes are frame pixels after the offset",
+  /drawImage\(canvas, tile\.x, tile\.y, tile\.width, tile\.height, 0, 0, tile\.width, tile\.height\)/.test(offscreenSource));
+ok("the pure geometry comes from the shared module rather than being re-derived",
+  /planFaceTiles\(width, height\)/.test(offscreenSource));
+ok("the secondary model detector is gated on evidence, not on a count",
+  /shouldRunSecondaryFaceDetector\(modelFaces, skinFaces\)/.test(offscreenSource) &&
+    !/if \(modelFaces\.length === 0\) \{\s*const chromeDetector/.test(offscreenSource));
+ok("the attack re-probe stays a single full-frame pass, and says why",
+  /await detectFacesWithBlazeFace\(shippedCanvas\)/.test(offscreenSource) &&
+    /Deliberately NOT the tiled pass either/.test(offscreenSource));
+
+// ── The frame budget: what a capture may spend before the planner gives up ──
+// The per-tile OCR bound bounded ONE tile and nothing else: six tiles at 8 s is
+// 48 s inside a wait of 15 s, so the capture was abandoned and the planner went
+// blind — twice in the reported run. And the OCR worker's own cold start was not
+// inside any timeout at all, so the FIRST capture could sit ~10.5 s in
+// createWorker before its per-call budget had even started.
+const ocrSource = await readFile(new URL("../src/offscreen/ocr.ts", import.meta.url), "utf8");
+const typesSource = await readFile("src/shared/types.ts", "utf8");
+ok("a whole-triage wall-clock budget exists and fits inside the frame wait",
+  /TRIAGE_TOTAL_BUDGET_MS = (\d+)/.exec(offscreenSource) !== null &&
+    Number(/TRIAGE_TOTAL_BUDGET_MS = (\d+)/.exec(offscreenSource)[1]) <= 10_000,
+  /TRIAGE_TOTAL_BUDGET_MS = (\d+)/.exec(offscreenSource)?.[1] ?? "(missing)");
+ok("and it is checked per tile, including before the OCR call burns its share",
+  /if \(remaining <= 0\)/.test(offscreenSource) &&
+    /deadline - Date\.now\(\)\)/.test(offscreenSource));
+ok("running out of budget is reported as a PARTIAL scan, never as a complete one",
+  /timedOut = true;\s*\n\s*break;/.test(offscreenSource));
+ok("the OCR worker's cold start is inside the call's own timeout",
+  /await withTimeout\(getWorker\(\), timeoutMs\)/.test(ocrSource));
+ok("and a timed-out acquisition leaves the warm-up in flight for the next capture",
+  // The reset that DOES exist is the post-recognize one: a wedged job's worker
+  // is terminated and rebuilt. Discarding the warm-up on an acquisition timeout
+  // would restart a ~10 s build on the next capture instead of inheriting it.
+  /if \(!acquired\) return null;/.test(ocrSource) &&
+    !/withTimeout\(getWorker\(\), timeoutMs\);\s*\n\s*if \(!acquired\)[\s\S]{0,60}?workerPromise = null/.test(ocrSource));
+
+// ── The unplaceable-value certificate ──────────────────────────────────────
+// `dom-targets-unresolved` withheld the whole frame: a value was detected, no
+// rectangle could be named for it, so the pixels never shipped. The frame-text
+// channel is handed those exact values now. The rule that decides whether the
+// frame ships is a PRIVACY rule, and it must not be relaxed into "the OCR did not
+// see it": that channel's own documentation says an unread value is a value it
+// cannot box, so an OCR miss is not proof of absence.
+ok("the values the DOM could not place are handed to the pixel pipeline",
+  /unlocatedValues/.test(workerSource) && /unlocatedValues,/.test(workerSource) &&
+    /knownSpans: getActiveNerSpans\(\),\s*\n\s*unlocatedValues,/.test(workerSource));
+ok("the offscreen pipeline asks the frame-text channel about exactly those values",
+  /const spans = \[\.\.\.knownSpans, \.\.\.unlocatedValues\]/.test(offscreenSource));
+ok("clearance requires the pixels to have been READ",
+  /unlocatedText\?\.searched === true/.test(workerSource));
+ok("clearance requires the value to have been FOUND, not merely not found",
+  /unlocatedText\.legible >= unplacedCount/.test(workerSource));
+ok("and nothing it found may be left unpainted",
+  /unlocatedText\.stillLegible === 0/.test(workerSource));
+ok("the evidence carries both counts, so a caller cannot lean on survivors alone",
+  /legible: readInFrame\.length/.test(offscreenSource) &&
+    /stillLegible: stillLegible\.length/.test(offscreenSource) &&
+    /legible: number;/.test(typesSource) &&
+    /stillLegible: number;/.test(typesSource));
+ok("and the offscreen document explains why legible is required",
+  /NOT proven absent/.test(offscreenSource));
+ok("only the unplaceable-targets failure is ever excused",
+  /failureParts\.every\(\(part\) => part === "dom-targets-unresolved"\)/.test(workerSource));
+ok("every other region-collection failure still withholds the frame",
+  /const textComplete =\s*\n\s*Boolean\(sensitiveData\) && \(failureParts\.length === 0 \|\| pixelsClearedUnplaced\)/.test(workerSource));
+ok("and the resolution is said out loud rather than left implied",
+  /were found in this\s*\n\s*`?\s*`frame's own pixels and destroyed/.test(workerSource) ||
+    /were found in this/.test(workerSource));
+ok("the offscreen document reports the evidence as counts, never a sample",
+  /stillLegible: stillLegible\.length,\s*\n\s*\/\/ Deliberately no samples/.test(offscreenSource));
 
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

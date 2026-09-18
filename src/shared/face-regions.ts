@@ -3,8 +3,12 @@
  *
  * Three face channels exist, in descending precision:
  *   1. BlazeFace (bundled tflite, short-range) — accurate, but a short-range
- *      model misses small faces: thumbnail grids, avatars, video tiles.
- *   2. Chrome's shape-detection FaceDetector — same class of limitation.
+ *      model misses small faces: thumbnail grids, avatars, video tiles. It is
+ *      also run over overlapping TILES of the frame, because the miss is a
+ *      resolution problem (its input is a fixed ~128×128) rather than a
+ *      sensitivity one — see planFaceTiles.
+ *   2. Chrome's shape-detection FaceDetector — same class of limitation, asked
+ *      only when the cheap channels leave a face unexplained.
  *   3. Skin-colour clustering — noisy, but the only channel that reliably
  *      reaches the 28–120 px faces channels 1 and 2 drop.
  *
@@ -75,6 +79,130 @@ function byAreaThenConfidence(a: FaceBox, b: FaceBox): number {
   const areaDiff = b.width * b.height - a.width * a.height;
   if (areaDiff !== 0) return areaDiff;
   return b.confidence - a.confidence;
+}
+
+// ─── Tiling: how a short-range face model is made to see a small face ───────
+//
+// BlazeFace's short-range model has a fixed ~128×128 input, so the image it is
+// handed is resized to that before any face is looked for. Handed a whole
+// viewport — 1280×800 — that is a scale of 0.1: a 44 px thumbnail face arrives
+// as ~4 px and is gone before the first convolution, no matter how good the
+// detector is. This is why the reported face at 359,198 was missed, and why
+// "tune the confidence threshold" cannot fix it: the pixels are not there.
+//
+// The remedy is the one the frame-text channel already uses for the same reason
+// (see TRIAGE_TILE_HEIGHT in the offscreen document): hand the model a CROP at
+// native resolution instead of the whole frame. A 375 px tile scales at 0.34, so
+// the same 44 px face arrives as ~15 px — detectable, and detectable because the
+// crop made it bigger in model space, not because a threshold was loosened.
+
+/** Largest side a tile should have, in frame pixels. 128/320 ≈ 0.4 scale. */
+export const FACE_TILE_TARGET_PX = 320;
+
+/** Overlap between neighbouring tiles, as a fraction of the tile size. A face
+ *  on a seam is half in each tile and found in neither, so tiles must overlap. */
+export const FACE_TILE_OVERLAP = 0.25;
+
+/** Hard cap on tiles per frame — the whole pass must stay well inside the
+ *  frame budget the agent loop allows for a capture. */
+export const FACE_TILE_MAX = 16;
+
+/**
+ * Frames taller/wider than this are NOT tiled.
+ *
+ * A stitched full-page capture is the case: tiling 1280×10000 into 320 px crops
+ * needs ~130 tiles to cover it, and tiling only part of it would make coverage
+ * depend on where the page happened to be cut. Below this bound the tile grid is
+ * bounded by FACE_TILE_MAX and covers the frame exactly; above it the caller
+ * keeps the single full-frame pass it already had (documented, not silent).
+ */
+export const FACE_TILE_MAX_FRAME_PX = FACE_TILE_TARGET_PX * 4;
+
+/** Fraction of the SMALLER box's area at which two detections are one face.
+ *  Deliberately looser than FACE_DUPLICATE_COVERAGE: overlapping tiles report
+ *  the same face from slightly different crops, so their boxes differ. */
+export const FACE_TILE_DUPLICATE_COVERAGE = 0.5;
+
+/** One crop of the frame handed to the detector, in frame pixel coordinates. */
+export interface FaceTile {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** The crops to run the detector over; empty means "do not tile this frame". */
+export function planFaceTiles(
+  frameWidth: number,
+  frameHeight: number,
+  opts: { target?: number; maxTiles?: number; overlap?: number } = {},
+): FaceTile[] {
+  const target = opts.target ?? FACE_TILE_TARGET_PX;
+  const maxTiles = opts.maxTiles ?? FACE_TILE_MAX;
+  const overlap = opts.overlap ?? FACE_TILE_OVERLAP;
+  const width = Math.max(0, Math.floor(frameWidth));
+  const height = Math.max(0, Math.floor(frameHeight));
+  if (width <= 0 || height <= 0 || target <= 0) return [];
+
+  // Already inside one tile: tiling would be the same pass at the same scale,
+  // for the same one detector call. The caller's full-frame pass IS this tile.
+  if (Math.max(width, height) <= target) return [];
+  // Too large to cover usefully (see FACE_TILE_MAX_FRAME_PX).
+  if (Math.max(width, height) > target * 4) return [];
+
+  let cols = Math.max(1, Math.ceil(width / target));
+  let rows = Math.max(1, Math.ceil(height / target));
+  // Stay inside the tile budget by giving up tiles on the longer axis.
+  while (cols * rows > maxTiles) {
+    if (cols >= rows && cols > 1) cols--;
+    else if (rows > 1) rows--;
+    else break;
+  }
+
+  const tileW = Math.min(width, Math.ceil((width / cols) * (1 + overlap)));
+  const tileH = Math.min(height, Math.ceil((height / rows) * (1 + overlap)));
+  const tiles: FaceTile[] = [];
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      // Spread the slack across the gaps so the LAST tile always reaches the
+      // frame edge — a face in the bottom-right corner must be inside a tile.
+      const x = cols === 1 ? 0 : Math.round((col * (width - tileW)) / (cols - 1));
+      const y = rows === 1 ? 0 : Math.round((row * (height - tileH)) / (rows - 1));
+      tiles.push({
+        x,
+        y,
+        width: Math.min(tileW, width - x),
+        height: Math.min(tileH, height - y),
+      });
+    }
+  }
+  return tiles;
+}
+
+/** Detector boxes are tile-local; the redaction loop works in frame pixels. */
+export function offsetFaceBoxes(boxes: readonly FaceBox[], tile: FaceTile): FaceBox[] {
+  return boxes.map((box) => ({ ...box, x: box.x + tile.x, y: box.y + tile.y }));
+}
+
+/**
+ * Collapse the same face reported by several overlapping tiles into one box.
+ *
+ * Keeps the largest/most confident of each group, so a face clipped by a tile
+ * boundary is represented by the tile that saw all of it. Without this, one face
+ * on an overlap would be painted and audited up to four times, and the audit's
+ * face count would report detections rather than faces.
+ */
+export function dedupeFaceBoxes(
+  boxes: readonly FaceBox[],
+  coverage: number = FACE_TILE_DUPLICATE_COVERAGE,
+): FaceBox[] {
+  const ordered = [...boxes].sort(byAreaThenConfidence);
+  const kept: FaceBox[] = [];
+  for (const candidate of ordered) {
+    if (coversExistingFace(candidate, kept, coverage)) continue;
+    kept.push(candidate);
+  }
+  return kept;
 }
 
 /**

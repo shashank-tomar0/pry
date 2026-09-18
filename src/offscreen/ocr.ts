@@ -52,10 +52,34 @@ async function getWorker(): Promise<Worker> {
  * Single choke point for the worker so the text and word-box callers share
  * exactly one warm-up, one timeout policy and one recovery path.
  */
+/** Resolve `promise`, or null once `timeoutMs` has passed. */
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function recognize(dataUrl: string, timeoutMs: number): Promise<Page | null> {
   let worker: Worker;
   try {
-    worker = await getWorker();
+    // The worker's own COLD START is inside this call's budget now. It used to be
+    // unbounded — only `worker.recognize(...)` was raced — so the first capture of
+    // a run could sit ~10.5 s in createWorker before its timeout had even started,
+    // which is how a frame blew the 15 s audit wait with neither an OCR result nor
+    // an OCR failure to show for it. A timed-out acquisition returns null for THIS
+    // call and deliberately leaves the in-flight promise in place: the warm-up is
+    // still useful, and the next capture starts from a worker that is already up.
+    const acquired = await withTimeout(getWorker(), timeoutMs);
+    if (!acquired) return null;
+    worker = acquired;
   } catch {
     return null;
   }

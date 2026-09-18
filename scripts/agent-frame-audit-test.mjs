@@ -818,7 +818,104 @@ ok(
   String(stable.executed[1].snapshotGeneration),
 );
 
-// ─── Scenario 4b: glitch output is never presented as the answer ───────────
+// ─── Scenario 4b: a task that needs no element id can still be done ────────
+//
+// The reported dead end: "open youtube and search harkirat singh". The run reached
+// the page, the read carried no id for the search box, and with no way to type
+// without one the model re-read the page five times until the loop guard killed
+// the run. This drives the real loop through that exact shape, with the box named
+// instead of numbered, and checks the two things that make the fix real: the action
+// REACHES the page as a page action, and a run whose only action is type_text is
+// still a run that acted.
+console.log("\n=== agent loop: typing into a field with no element id ===\n");
+
+/** A read of youtube.com with ids for chrome and none for the search box. */
+const NO_ID_FOR_SEARCH = {
+  url: "https://www.youtube.com/",
+  title: "YouTube",
+  text: "Home Shorts Subscriptions",
+  elements: [
+    { id: 0, role: "link", name: "Home" },
+    { id: 1, role: "link", name: "Shorts" },
+    { id: 2, role: "link", name: "Subscriptions" },
+  ],
+  truncated: true,
+  scroll: { y: 0, maxY: 800 },
+  generation: 1,
+};
+
+const typed = await (async () => {
+  globalThis.chrome = chromeStub;
+  const emitted = [];
+  const executed = [];
+  globalThis.__pry = {
+    planner: makePlanner(
+      [
+        {
+          text: "Searching YouTube.",
+          toolCalls: [
+            {
+              id: "c1",
+              name: "type_text",
+              input: { field: "Search", text: "harkirat singh", submit: true, reason: "run the search" },
+            },
+          ],
+        },
+        finishTurn,
+      ],
+      { plannerMs: 10 },
+    ),
+    ledger: [],
+    snapshot: () => NO_ID_FOR_SEARCH,
+    execute: async (controller, action) => {
+      executed.push(JSON.parse(JSON.stringify(action)));
+      return {
+        result: {
+          ok: true,
+          detail:
+            'Matched the field named "Search" (exact match). Typed "harkirat singh" into ' +
+            '<input "Search">. Field now shows: "harkirat singh", and pressed Enter.',
+        },
+        controller,
+      };
+    },
+    observeWithVision: async () => ({ text: "", model: "stub", bytes: 0 }),
+    capture: async () => null,
+  };
+  await mod.runTask("open youtube and search harkirat singh", 1, {
+    settings: baseSettings({ vision: { enabled: false } }),
+    emit: (e) => emitted.push(e),
+    askConfirm: async () => true,
+    signal: new AbortController().signal,
+    captureScreenshot: async () => null,
+    recordAudit: () => {},
+  });
+  return { emitted, executed };
+})();
+
+const typedAction = typed.executed.find((a) => a.name === "type_text");
+ok("the field-named action reaches the page instead of being dropped as unknown",
+  Boolean(typedAction),
+  JSON.stringify(typed.executed.map((a) => a.name)));
+ok("it arrives with the field's name and the text intact — no id is invented for it",
+  typedAction?.input.field === "Search" &&
+  typedAction?.input.text === "harkirat singh" &&
+  typedAction?.input.submit === true &&
+  typedAction?.input.element_id === undefined,
+  JSON.stringify(typedAction?.input));
+ok("the transcript says what it is doing in the user's terms, not \"element undefined\"",
+  typed.emitted.some((e) => e.kind === "entry" && /field named "Search"/.test(e.entry?.text ?? "")),
+  typed.emitted.map((e) => (e.kind === "entry" ? e.entry?.text : e.text)).filter(Boolean).slice(0, 4).join(" | ").slice(0, 140));
+ok("a run whose only action is naming a field still counts as having acted",
+  typed.emitted.find((e) => e.kind === "experience")?.experience?.taskSuccess === true,
+  JSON.stringify({ taskSuccess: typed.emitted.find((e) => e.kind === "experience")?.experience?.taskSuccess }));
+ok("and the tool result the planner reads back is the matched field, not a guess",
+  typed.emitted.length > 0 &&
+  globalThis.__pry.planner.seen.some((messages) =>
+    messages.some((m) => m.role === "tool" && m.results.some((r) => /Matched the field named/.test(r.content)))),
+  "");
+
+// ─── Scenario 4c: glitch output is never presented as the answer ───────────
 //
 // The live run: asked to "open youtube and search for harkirat singh", the model
 // streamed 83 s of punctuation and mixed-script fragments, made ZERO tool calls,

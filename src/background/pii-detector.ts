@@ -42,6 +42,10 @@ export interface DetectedPII {
 }
 
 import { isAadhaarNumber, isCardNumber } from "../shared/checksums";
+// One email shape for both channels, built from the shared source rather than
+// re-typed: the two copies drifted once already, and the result was a value
+// tokenized for the model while staying readable pixels on screen.
+import { EMAIL_PATTERN_SOURCE } from "../shared/text-pii-patterns";
 
 // ─── DOM-Based PII Detection ───────────────────────────────────────────────
 
@@ -88,7 +92,7 @@ const INTERNATIONAL_ID_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
 ];
 
 const CARD_NUMBER_PATTERN = /\b(?:\d{4}[\s-]?){3}\d{4}\b/;
-const EMAIL_PATTERN = /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/;
+const EMAIL_PATTERN = new RegExp(EMAIL_PATTERN_SOURCE, "i");
 // Indian mobile: +91 prefix or bare 10 digits starting 6-9, optional internal
 // separator ("98765 43210"). Matches the pixel-channel matcher in
 // shared/text-pii-patterns.ts so both channels see the same classes.

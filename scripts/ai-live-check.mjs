@@ -207,11 +207,23 @@ check("no call carries arguments that are not in the schema", calls.every((c) =>
   return Object.keys(c.input ?? {}).every((k) => allowed.includes(k));
 }), JSON.stringify(calls.map((c) => c.input)));
 
-// The reported failure: the model re-reads the page forever instead of typing
-// into the search box it was just shown. With `type` on the table it must use it.
-const typed = calls.find((c) => c.name === "type" && String(c.input?.text ?? "").toLowerCase().includes("harkirat"));
-check("it types the query into the search field rather than re-reading", Boolean(typed),
-  typed ? JSON.stringify(typed.input) : `got ${calls.map((c) => c.name).join(", ") || "no calls"}`);
+// The reported failure: the model re-reads the page forever instead of typing into
+// the search box it was just shown. Either handle is a pass — the query has to
+// reach the field — but which one it chose is worth printing, because preferring a
+// name over an available id is a real (if survivable) regression: a name can match
+// several controls, an id from the current read names exactly one.
+const typedById = calls.find(
+  (c) => c.name === "type" && String(c.input?.text ?? "").toLowerCase().includes("harkirat"),
+);
+const typedByName = calls.find(
+  (c) => c.name === "type_text" && /harkirat/i.test(String(c.input?.text ?? "")),
+);
+check("it types the query into the search field rather than re-reading",
+  Boolean(typedById || typedByName),
+  JSON.stringify((typedById ?? typedByName)?.input) || `got ${calls.map((c) => c.name).join(", ") || "no calls"}`);
+console.log(
+  `    handle used: ${typedById ? "type (id from the read)" : typedByName ? "type_text (field name)" : "none"}`,
+);
 
 // ─── Turn 2: it must finish in language ──────────────────────────────────────
 
@@ -271,7 +283,49 @@ check("it actually mentions what it found rather than answering generically",
   JSON.stringify(answer.slice(0, 140)));
 
 console.log("\n  answer: " + JSON.stringify(answer.slice(0, 220)) + (answer.length > 220 ? "…" : ""));
-console.log(`\n  total: ${((first.ms + second.ms) / 1000).toFixed(1)}s for 2 turns`);
+
+// ─── Turn 3: does it reach for the id-free typing tool? ──────────────────────
+//
+// A new tool the model does not choose is not a fix. The reported YouTube run had
+// ids for the page chrome and NONE for the search box — the box is visible on
+// screen while absent from the read — so this shows the model exactly that page
+// and checks which tool it picks. The failure to catch is a second read_page (the
+// behaviour that looped) or a guessed id; the pass is type_text, named by the
+// field rather than numbered.
+console.log("\n── turn 3: a search box with no element id ──");
+
+const NO_ID_TASK =
+  "Task: search YouTube for harkirat singh.\n\n--- Current page ---\n" +
+  "URL: https://www.youtube.com/\nTitle: YouTube\nElements:\n" +
+  "[0] link \"Home\"\n[1] link \"Shorts\"\n[2] link \"Subscriptions\"\n" +
+  "Page text:\nHome  Shorts  Subscriptions  Search  Sign in";
+
+let third;
+try {
+  third = await runTurn("turn 3", [{ role: "user", content: NO_ID_TASK }]);
+} catch (error) {
+  check("turn 3 answered", false, String(error?.message ?? error).slice(0, 300));
+  third = null;
+}
+if (third) {
+  const thirdCalls = third.turn.toolCalls ?? [];
+  const names = thirdCalls.map((c) => c.name);
+  const fieldTyped = thirdCalls.find((c) => c.name === "type_text");
+  check("it does not simply re-read a page it has already been shown",
+    !names.includes("read_page"), names.join(", ") || "(none)");
+  check("it types into the field by name when the field has no id",
+    Boolean(fieldTyped), names.join(", ") || "(none)");
+  if (fieldTyped) {
+    check("and it names the field the way it appears on screen, with the query to type",
+      /search/i.test(String(fieldTyped.input.field ?? "")) &&
+      /harkirat/i.test(String(fieldTyped.input.text ?? "")),
+      JSON.stringify(fieldTyped.input));
+  }
+  console.log(`  · turn 3: ${(third.ms / 1000).toFixed(1)}s · chose ${names.join(", ") || "no tool"}`);
+}
+
+const totalMs = first.ms + second.ms + (third?.ms ?? 0);
+console.log(`\n  total: ${(totalMs / 1000).toFixed(1)}s for ${third ? 3 : 2} turns`);
 
 if (failed > 0) {
   console.log(`\n${failed} check(s) FAILED — the model did not work through PRY's plumbing.\n`);

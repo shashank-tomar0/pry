@@ -1689,14 +1689,20 @@ export async function runTask(
     // clock (see the budget constants). The turn-local abort cancels the
     // request; the user's Stop always wins.
     const isColdTurn = step === 0;
-    const firstOutputBudgetMs = isColdTurn ? FIRST_OUTPUT_TIMEOUT_COLD_MS : FIRST_OUTPUT_TIMEOUT_MS;
 
-    // Honest, reason-specific failure text (see turnCutShortMessage).
-    const turnCutShortMessage = (
-      reason: "silent" | "ceiling" | "deliberation" | "degenerate" | "salad",
-      liveness: TurnLiveness,
-      waitedMs: number,
-    ): string => turnCutShortMessageFor(planner.label, reason, liveness, waitedMs, firstOutputBudgetMs);
+    /**
+     * The first-output budget for a turn, which is not one number.
+     *
+     * A retry does NOT get the cold budget: its only job is to learn whether the
+     * connection hiccuped, and a hiccup answers in seconds. Re-spending the cold
+     * 90 s is how a stalled endpoint cost the reported run 268 s — 148 s of
+     * streaming, 30 s of silence, then 90 more seconds on a retry that produced
+     * nothing before concluding "switch to a faster provider".
+     */
+    const budgetFor = (retry: boolean): number =>
+      retry ? RETRY_FIRST_OUTPUT_MS
+        : isColdTurn ? FIRST_OUTPUT_TIMEOUT_COLD_MS
+          : FIRST_OUTPUT_TIMEOUT_MS;
 
     // ─── Live reasoning status ───
     // The reasoning block is display-capped (MAX_THOUGHT_CHARS), so past that
@@ -1796,7 +1802,7 @@ export async function runTask(
       });
     };
 
-    const runPlannerTurn = async (turnAbort: AbortController, liveness: TurnLiveness) =>
+    const runPlannerTurn = async (turnAbort: AbortController, liveness: TurnLiveness, isRetry = false) =>
       withTurnBudget(
         planner.run({
           system: systemPrompt,
@@ -1841,13 +1847,14 @@ export async function runTask(
         }),
         liveness,
         {
-          firstOutputMs: firstOutputBudgetMs,
+          firstOutputMs: budgetFor(isRetry),
           idleMs: STREAM_IDLE_TIMEOUT_MS,
           maxMs: MAX_TURN_MS,
           maxReasoningChars: MAX_REASONING_CHARS,
           maxReasoningMs: MAX_REASONING_MS,
           onTimeout: () => turnAbort.abort(),
-          messageFor: turnCutShortMessage,
+          messageFor: (reason, liveness, waitedMs) =>
+            turnCutShortMessageFor(planner.label, reason, liveness, waitedMs, budgetFor(isRetry)),
         },
       );
 
@@ -1883,10 +1890,7 @@ export async function runTask(
       // A salad cut joins the ceiling and loop cuts: the model was answering
       // and what it answered was unusable, so re-sending the same prompt buys
       // the same garbage. Only a genuine silence is worth one retry.
-      const cutWhileStreaming =
-        firstTurnLiveness.ended === "ceiling" ||
-        firstTurnLiveness.ended === "degenerate" ||
-        firstTurnLiveness.ended === "salad";
+      const policy = retryPolicyFor(firstTurnLiveness, firstMessage);
       const deliberated = firstTurnLiveness.ended === "deliberation";
 
       // A deliberation cut is steered, not failed: the model has everything it
@@ -1908,9 +1912,14 @@ export async function runTask(
           },
         });
         messages.push({ role: "user", content: ACT_NOW_DIRECTIVE });
-      } else if (!isRetryablePlannerError(firstMessage) || cutWhileStreaming) {
+      } else if (!policy.retry) {
         settleWait("failed");
         errorCount++;
+        // Say WHY the prompt was not re-sent. The failure text alone ("...the
+        // network stalled or the connection dropped") invites exactly the wrong
+        // conclusion on a stall that was really throughput, and the user's next
+        // move depends on knowing which it was.
+        const failureText = policy.because ? `${firstMessage} (${policy.because})` : firstMessage;
         // A collapse cut has the same display problem as the final-answer guard
         // further down: the deltas were already painted into the answer card, so
         // the transcript would show the glitch as PRY's answer directly above a
@@ -1923,7 +1932,7 @@ export async function runTask(
         }
         emit({
           kind: "entry",
-          entry: { id: nextId(), role: "error", text: firstMessage },
+          entry: { id: nextId(), role: "error", text: failureText },
         });
         finishTask();
         return;
@@ -1948,7 +1957,8 @@ export async function runTask(
       waitEntryId = null;
       waitStart = performance.now();
       try {
-        turn = await runPlannerTurn(new AbortController(), newTurnLiveness());
+        // The retry gets the short budget — see `runPlannerTurn`'s `isRetry`.
+        turn = await runPlannerTurn(new AbortController(), newTurnLiveness(), true);
         settleWait("responded");
       } catch (secondError) {
         if (signal.aborted) { settleWait("cancelled"); finishTask(); return; }
@@ -2928,6 +2938,14 @@ interface TurnLiveness {
   outputTail: string;
   /** How the turn ended; the retry policy reads this. */
   ended: "settled" | "silent" | "ceiling" | "deliberation" | "degenerate" | "salad";
+  /**
+   * How long the turn ran before it was cut, in ms (0 while it is still going).
+   *
+   * The retry policy needs this to tell the two silences apart: an endpoint that
+   * answered and then stopped is a throughput problem, while one that never said
+   * anything is a dropped connection. Both look identical in `events`.
+   */
+  endedAfterMs: number;
 }
 
 export function newTurnLiveness(): TurnLiveness {
@@ -2938,7 +2956,69 @@ export function newTurnLiveness(): TurnLiveness {
     reasoningStartedAt: 0,
     outputTail: "",
     ended: "settled",
+    endedAfterMs: 0,
   };
+}
+
+/**
+ * How long a turn must have been running before a mid-stream silence stops
+ * being a hiccup and starts being throughput.
+ *
+ * A dropped connection dies early — the socket is gone before much has crossed
+ * it. An endpoint that delivered output for this long and then stalled is telling
+ * you it cannot serve the request at this speed, and re-sending the same prompt
+ * to it spends another full budget to be told the same thing. The reported run:
+ * 148 s of streaming, a 30 s silence, then a retry that produced nothing for 90 s
+ * — 268 s and zero actions for a task that could have failed at 178 s.
+ */
+const LONG_STALL_MS = 45_000;
+
+/**
+ * The first-output budget a RETRY gets, deliberately far shorter than a cold
+ * start's.
+ *
+ * A retry exists to answer one question — was that a dropped connection or a
+ * provider that cannot serve this request? — and a hiccup answers it in seconds.
+ * Re-spending the cold 90 s budget does not gather evidence.
+ */
+export const RETRY_FIRST_OUTPUT_MS = 20_000;
+
+/**
+ * Whether a failed turn deserves the one automatic retry, and why not when it
+ * does not.
+ *
+ * Pure and exported because this policy has been the source of two reported
+ * failures already (an endless "retrying once…" on a slow model, and a stall
+ * retried until the user gave up), and a decision stated only inside a `catch`
+ * block cannot be pinned by a test.
+ *
+ * `deliberation` is absent on purpose: it is a STEER, not a failure, and the loop
+ * handles it before reaching here.
+ */
+export function retryPolicyFor(
+  liveness: TurnLiveness,
+  message: string,
+): { retry: boolean; because: string } {
+  if (
+    liveness.ended === "ceiling" ||
+    liveness.ended === "degenerate" ||
+    liveness.ended === "salad"
+  ) {
+    return {
+      retry: false,
+      because: "the turn was cut while it was still answering, so the prompt is not re-sent",
+    };
+  }
+  if (liveness.ended === "silent" && liveness.events > 0 && liveness.endedAfterMs >= LONG_STALL_MS) {
+    return {
+      retry: false,
+      because:
+        `the endpoint streamed for ${Math.round(liveness.endedAfterMs / 1000)}s before going quiet — ` +
+        `throughput rather than a dropped connection, so the prompt is not re-sent`,
+    };
+  }
+  if (!isRetryablePlannerError(message)) return { retry: false, because: "" };
+  return { retry: true, because: "" };
 }
 
 /**
@@ -3113,6 +3193,7 @@ export function withTurnBudget<T>(
       done = true;
       clearInterval(ticker);
       liveness.ended = reason;
+      liveness.endedAfterMs = waitedMs;
       opts.onTimeout();
       reject(new Error(opts.messageFor(reason, liveness, waitedMs)));
     };
@@ -3249,6 +3330,8 @@ function describeIntent(name: string, input: Record<string, unknown>): string {
       return "Read the page";
     case "click_text":
       return `Click "${String(input.text ?? "").slice(0, 60)}"`;
+    case "type_text":
+      return `Type into the field named "${String(input.field ?? "").slice(0, 60)}"`;
     case "scroll":
       return `Scroll ${input.direction}`;
     case "find_text":

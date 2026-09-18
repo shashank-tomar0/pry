@@ -155,6 +155,41 @@ function matchesValuePattern(text: string): string | undefined {
 }
 
 /**
+ * Refusals that depend only on the VALUE being typed.
+ *
+ * Shared by `type` and `type_text` rather than duplicated: the two differ in how
+ * they FIND the field, never in what they are allowed to put in it, and a second
+ * copy is how one of them quietly stops refusing a password.
+ */
+function refuseUnsafeTypedValue(text: string): Gate | null {
+  // Check if the value itself is a secret.
+  const matchLabel = matchesValuePattern(text);
+  if (matchLabel) {
+    return {
+      verdict: "refuse",
+      reason:
+        `Refusing to type that value — it looks like a ${matchLabel}. ` +
+        `The user should enter it themselves.`,
+    };
+  }
+
+  // Check whether the value CONTAINS a checksum-valid identifier. Validating
+  // rather than shape-matching is the difference between refusing a real
+  // Aadhaar/card and refusing every twelve-digit run with spaces in it.
+  const identifier = matchedIdentifierLabel(text);
+  if (identifier) {
+    return {
+      verdict: "refuse",
+      reason:
+        `Refusing to type that value — it validates as a ${identifier}. ` +
+        `Identity and payment documents are the user's to enter, not the agent's; ` +
+        `ask them to fill the field, then continue once they confirm.`,
+    };
+  }
+  return null;
+}
+
+/**
  * The main safety gate. Called before every action the planner requests.
  */
 export function gate(
@@ -177,29 +212,27 @@ export function gate(
       };
     }
 
-    // Check if the value itself is a secret.
-    const text = String(action.input.text ?? "");
-    const matchLabel = matchesValuePattern(text);
-    if (matchLabel) {
-      return {
-        verdict: "refuse",
-        reason:
-          `Refusing to type that value — it looks like a ${matchLabel}. ` +
-          `The user should enter it themselves.`,
-      };
-    }
+    const unsafe = refuseUnsafeTypedValue(String(action.input.text ?? ""));
+    if (unsafe) return unsafe;
+  }
 
-    // Check whether the value CONTAINS a checksum-valid identifier. Validating
-    // rather than shape-matching is the difference between refusing a real
-    // Aadhaar/card and refusing every twelve-digit run with spaces in it.
-    const identifier = matchedIdentifierLabel(text);
-    if (identifier) {
+  // A text-anchored type must not be a way around those value checks. It cannot
+  // inspect the TARGET (the model named a field, not an id), but every check that
+  // depends only on the value being typed still applies — and this is the path a
+  // model would reach for precisely when it could not resolve a credential field
+  // by id.
+  if (action.name === "type_text") {
+    const unsafe = refuseUnsafeTypedValue(String(action.input.text ?? ""));
+    if (unsafe) return unsafe;
+    // Typing into "the field called a" is not typing, it is guessing: the target
+    // would be whichever field matched a two-letter query, which is how a value
+    // lands in a box nobody named.
+    if (normalizeForMatch(String(action.input.field ?? "")).length < 2) {
       return {
         verdict: "refuse",
         reason:
-          `Refusing to type that value — it validates as a ${identifier}. ` +
-          `Identity and payment documents are the user's to enter, not the agent's; ` +
-          `ask them to fill the field, then continue once they confirm.`,
+          "type_text needs the field's visible name (at least 2 characters) so it knows " +
+          "which field to type into.",
       };
     }
   }
@@ -250,6 +283,19 @@ export function gate(
       return {
         verdict: "confirm",
         summary: `Fill ${JSON.stringify(el.name)} and submit the form on ${snapshot?.title ?? "this page"}?`,
+      };
+    }
+  }
+
+  // The same rule for the text-anchored path, with the field's NAME standing in
+  // for the element's accessible name — otherwise naming a field instead of
+  // resolving it would be a way to submit a form without the prompt.
+  if (action.name === "type_text" && action.input.submit === true) {
+    const field = String(action.input.field ?? "");
+    if (!/search|query|find|filter/i.test(field)) {
+      return {
+        verdict: "confirm",
+        summary: `Type into ${JSON.stringify(field)} and submit the form on ${snapshot?.title ?? "this page"}?`,
       };
     }
   }

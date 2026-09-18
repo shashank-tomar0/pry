@@ -113,12 +113,86 @@ export function pickTextMatch<T extends TextRun>(
   query: string,
   index: number = 0,
 ): TextMatch<T> | null {
-  const ranked = rankTextMatches(runs, query);
+  return pickFromRanked(rankTextMatches(runs, query), index);
+}
+
+/**
+ * The equal-standing rule both pickers share: `index` counts among the matches
+ * that scored the same, and an out-of-range index falls back to the first
+ * rather than failing — the caller wants a target, and the best match is a
+ * better answer than a refusal.
+ */
+function pickFromRanked<T extends TextRun>(
+  ranked: Array<TextMatch<T>>,
+  index: number,
+): TextMatch<T> | null {
   if (ranked.length === 0) return null;
   const best = ranked[0].score;
   const sameStanding = ranked.filter((m) => m.score === best);
   const wanted = Number.isFinite(index) && index > 0 ? Math.floor(index) : 0;
   return sameStanding[Math.min(wanted, sameStanding.length - 1)] ?? sameStanding[0];
+}
+
+/**
+ * A text FIELD to type into, named the way a person names it.
+ *
+ * Separate from `TextRun` because the match is against what the control is
+ * CALLED, never the text it contains: an empty search box has no text to match
+ * on, and matching a field's current value would aim typing at whatever the
+ * page happened to prefill.
+ */
+export interface FieldRun extends TextRun {
+  /**
+   * Every name the field answers to, best first: aria-label, aria-labelledby,
+   * an associated <label>, placeholder, title, name. A person says "Search",
+   * "search youtube" or "Search YouTube" for the same box depending on which of
+   * those the page happens to use, so all of them are searched.
+   */
+  labels: string[];
+  tag: string;
+  role: string | null;
+}
+
+/**
+ * Score a field against a query using its strongest label match.
+ *
+ * Scored per label and not on a concatenation: joining every source would let a
+ * long combination of weak matches (name + title + placeholder) outrank one
+ * clean exact label, which is how a box ends up matched by its form's name.
+ */
+export function scoreFieldMatch(field: FieldRun, query: string): TextMatch["reason"] | null {
+  let best: TextMatch["reason"] | null = null;
+  for (const label of field.labels ?? []) {
+    const reason = scoreTextMatch(label, query);
+    if (!reason) continue;
+    if (!best || SCORES[reason] > SCORES[best]) best = reason;
+  }
+  return best;
+}
+
+/** Every field whose name matches, best first, then in reading order. */
+export function rankFieldMatches<T extends FieldRun>(
+  fields: T[],
+  query: string,
+): Array<TextMatch<T>> {
+  const matches: Array<TextMatch<T>> = [];
+  for (const field of fields ?? []) {
+    const reason = scoreFieldMatch(field, query);
+    if (!reason) continue;
+    matches.push({ run: field, score: SCORES[reason], reason });
+  }
+  return matches.sort(
+    (a, b) => b.score - a.score || a.run.y - b.run.y || a.run.x - b.run.x,
+  );
+}
+
+/** The field to type into, with the same `index` rule as `pickTextMatch`. */
+export function pickFieldMatch<T extends FieldRun>(
+  fields: T[],
+  query: string,
+  index: number = 0,
+): TextMatch<T> | null {
+  return pickFromRanked(rankFieldMatches(fields, query), index);
 }
 
 /**

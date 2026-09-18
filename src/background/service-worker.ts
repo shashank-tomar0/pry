@@ -11,7 +11,7 @@ import type {
 import { createTripwireAggregator } from "./tripwire-aggregator";
 import { normaliseSettings } from "../shared/types";
 import { redactionTally, rollupFrameVerification, type RedactionTally } from "../shared/metrics";
-import { regionMappingFor } from "../shared/region-mapping";
+import { regionMappingFor, reconcileCaptureShift } from "../shared/region-mapping";
 import { VISION_SUPPORTED } from "./vision";
 import { tokenizer, maskSample } from "./tokenizer";
 import { clearWire, wireRecords } from "./wire-log";
@@ -763,18 +763,38 @@ export async function captureAndProcessScreenshot(
   // list also carries coverage problems that are not geometry problems.
   let geometryConfirmed = mapping.valid && captureVerified;
   if (!captureVerified) captureReasons.push("capture-verification-missing");
+  // Regions are measured AFTER the pixels were taken, so a page that scrolls or
+  // reflows in that window measures them against a different moment than the one
+  // in the image. That used to be judged by exact equality of the whole geometry
+  // record, and failing it withheld the frame — which is how a tab that updates
+  // its DOM hundreds of times per click lost its vision channel. A pure scroll is
+  // not a mismatch, it is a known shift, and it is corrected (see
+  // reconcileCaptureShift); what remains a refusal is a different document, a
+  // resized viewport, a different DPR, or a jump too large to be a scroll.
+  let paintedRegions = sensitiveRegions;
   if (capturedFullPage) {
     // Restored-viewport boxes do not establish coverage of every captured tile.
     captureReasons.push("fullpage-dom-coverage-unverified");
   } else {
     const measuredGeometry = await captureGeometry(tabId);
-    if (!geometry || !measuredGeometry ||
-        JSON.stringify(geometry) !== JSON.stringify(measuredGeometry) ||
-        geometry.dpr !== sensitiveData?.dpr ||
-        geometry.viewportWidth !== sensitiveData?.viewportWidth ||
-        geometry.scrollY !== sensitiveData?.scrollY) {
+    // The DOM's own numbers must agree with the capture's, because the region
+    // coordinates and the painted pixels have to come from one moment.
+    const domAgrees = geometry?.dpr === sensitiveData?.dpr &&
+      geometry?.viewportWidth === sensitiveData?.viewportWidth &&
+      geometry?.scrollY === sensitiveData?.scrollY;
+    const reconciled = reconcileCaptureShift(geometry, measuredGeometry, paintedRegions);
+    if (!domAgrees || !reconciled.verifiable) {
       captureReasons.push("capture-dom-geometry-unverified");
       geometryConfirmed = false;
+    } else {
+      paintedRegions = reconciled.regions;
+      if (reconciled.shiftX !== 0 || reconciled.shiftY !== 0) {
+        console.log(
+          `[PRY] The page scrolled between the capture and the region scan ` +
+          `(${reconciled.shiftX}, ${reconciled.shiftY} CSS px); regions were shifted to match ` +
+          `the image instead of discarding the frame.`,
+        );
+      }
     }
   }
 
@@ -783,7 +803,7 @@ export async function captureAndProcessScreenshot(
 
   const unlocatedValues = sensitiveData?.unlocatedValues ?? [];
   const processed = await processScreenshot(
-    rawDataUrl, width, height, sensitiveRegions, dpr,
+    rawDataUrl, width, height, paintedRegions, dpr,
     {
       destroyFaces: privacy.destroyFaces,
       maskCredentials: privacy.maskCredentials,

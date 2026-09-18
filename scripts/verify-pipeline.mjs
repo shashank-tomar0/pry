@@ -799,6 +799,8 @@ console.log("\n=== Scenario L: blank-model fallback + friendly model errors ===\
 
 const { modelUnavailableReason } = await import("../src/background/providers/errors.ts");
 const { createPlanner } = await import("../src/background/providers/index.ts");
+const { PROVIDERS, PROVIDER_IDS } = await import("../src/shared/models.ts");
+const { DEFAULT_SETTINGS } = await import("../src/shared/types.ts");
 
 ok("410 (NVIDIA EOL) recognised as model-unavailable",
   modelUnavailableReason(410, "{\"detail\":\"end of life\"}") !== null);
@@ -822,6 +824,39 @@ const ollamaFallback = createPlanner({
   apiKeys: { ollama: "" },
   models: { ollama: "" },
 });
+// "Fast planner mode": first-token latency is the reported complaint, and on a
+// reasoning model it is spent on chain-of-thought the user never sees. The
+// substitution happens in the ONE place a model is chosen, so every consumer
+// (the run, the lesson generator, the vision pass) gets the same answer, and
+// the planner's own label carries the model so a run cannot announce one model
+// and use another.
+const fastOn = createPlanner({
+  provider: "nvidia",
+  apiKeys: { nvidia: "nvapi_test" },
+  models: { nvidia: "nvidia/nemotron-3.5-lightning-30b-a3b" },
+  fastPlanner: true,
+});
+ok("fast planner mode uses the provider's plain model",
+  /llama-3.1-8b-instruct/.test(fastOn.label), `label=${fastOn.label}`);
+ok("and the label names the model that will actually be called",
+  fastOn.label.includes("meta/llama-3.1-8b-instruct") &&
+    !fastOn.label.includes("nemotron-3.5-lightning"));
+const fastOff = createPlanner({
+  provider: "nvidia",
+  apiKeys: { nvidia: "nvapi_test" },
+  models: { nvidia: "nvidia/nemotron-3.5-lightning-30b-a3b" },
+  fastPlanner: false,
+});
+ok("with the mode off the configured model is used, unchanged",
+  /nemotron-3.5-lightning/.test(fastOff.label), `label=${fastOff.label}`);
+ok("and opting in is off by default",
+  DEFAULT_SETTINGS.fastPlanner === false);
+ok("every provider offers a fast model",
+  Object.values(PROVIDERS).every((p) => typeof p.fastModel === "string" && p.fastModel.length > 0),
+  Object.entries(PROVIDERS).filter(([, p]) => !p.fastModel).map(([id]) => id).join(",") || "all set");
+ok("a stored install without the flag gains it as false rather than undefined",
+  normaliseSettings({ provider: "groq" }).fastPlanner === false);
+
 ok("blank ollama model falls back to its default (no key needed)",
   ollamaFallback.label.includes("qwen2.5:1.5b"), `label=${ollamaFallback.label}`);
 
@@ -2506,7 +2541,113 @@ ok("omitting the haystack keeps the previous behaviour (callers opt in)",
 // page-tall image — the misaligned "faces masked, text readable" ledger frame.
 console.log("\n=== Scenario AJ: region→image mapping ===\n");
 
-const { regionMappingFor } = await import("../src/shared/region-mapping.ts");
+const { regionMappingFor, reconcileCaptureShift, MAX_RECONCILED_SCROLL_PX } =
+  await import("../src/shared/region-mapping.ts");
+
+// ── Scenario BE: a field named by its container, and one audit chip ────────
+// Two user-visible defects, both about a decision being made in the wrong
+// place. (1) The text channels read a field's accessible name off the WRAPPER
+// (Gmail's recipient area is a labelled `<div>` around the real `<input>`), so
+// "type into Recipients" was refused with "is not a text field" and cost a
+// planner round trip before the model guessed the input's own name. (2) The
+// privacy-audit chip is appended from a render function that runs twice — once
+// for the live event at the end of a run, once for the `get-audit` pull when
+// the panel is opened (which INSPECT PROOF does) — so the transcript grew a
+// second identical card every time it was opened.
+console.log("\n=== Scenario BE: container-named fields, and the duplicated audit chip ===\n");
+
+const { boxContains } = await import("../src/shared/text-target.ts");
+const outer = { left: 100, top: 50, right: 400, bottom: 80 };
+ok("a field inside its container's box IS that container's field",
+  boxContains(outer, { left: 110, top: 55, right: 390, bottom: 75 }));
+ok("a field that pokes out of the container is not claimed",
+  boxContains(outer, { left: 90, top: 55, right: 390, bottom: 75 }) === false &&
+    boxContains(outer, { left: 110, top: 55, right: 390, bottom: 120 }) === false);
+ok("a field merely adjacent is not claimed either",
+  boxContains(outer, { left: 100, top: 200, right: 400, bottom: 230 }) === false);
+ok("a little slack is allowed, so a padded field still counts",
+  boxContains(outer, { left: 95, top: 46, right: 402, bottom: 82 }));
+const descendSource = await readFile("src/content/act.ts", "utf8");
+ok("typing descends into a container that holds exactly one rendered field",
+  /const editables = editableDescendants\(el\);/.test(descendSource) &&
+    /if \(editables\.length > 1\) return null;/.test(descendSource) &&
+    /boxContains\(el\.getBoundingClientRect\(\), editables\[0\]\.getBoundingClientRect\(\)\)/.test(descendSource));
+ok("and the ARIA role that means \"text field\" is still trusted on its own",
+  /role === "combobox" \|\| role === "textbox" \|\| role === "searchbox"/.test(descendSource));
+const panelSource = await readFile("src/sidepanel/sidepanel.ts", "utf8");
+ok("the audit chip is keyed on the evidence it displays",
+  /function auditChipSignature\(/.test(panelSource) &&
+    /lastChip\.dataset\.auditSignature === signature/.test(panelSource));
+ok("so a re-render of the same payload does not append a second card",
+  /lastChip\.classList\.contains\("audit-chip"\)/.test(panelSource) &&
+    /chip\.dataset\.auditSignature = signature;/.test(panelSource));
+ok("and a later run with different numbers still gets its own card",
+  /totalScreenshots/.test(panelSource.slice(panelSource.indexOf("function auditChipSignature"),
+    panelSource.indexOf("function appendAuditVerificationChip"))));
+
+// ── Scenario BD: the page moved between the capture and the region scan ────
+// Regions are measured AFTER the pixels were taken (a message round trip, plus
+// the DOM scan itself), so a page that scrolls in that window measures them
+// against a different moment than the one in the image. The gate used to be
+// exact equality of the whole geometry record and failing it WITHHELD the frame
+// — which is how a tab doing hundreds of DOM updates per click lost its vision
+// channel. A pure scroll is not a mismatch, it is a known shift.
+console.log("\n=== Scenario BD: a scroll between capture and region scan is corrected, not fatal ===\n");
+
+const geom = (over) => ({
+  url: "https://mail.google.com/mail/u/0/",
+  scrollX: 0, scrollY: 400, viewportWidth: 1280, viewportHeight: 800, dpr: 2,
+  ...over,
+});
+const regionsAt = [{ x: 100, y: 200, width: 40, height: 20 }];
+
+const still = reconcileCaptureShift(geom(), geom(), regionsAt);
+ok("an unmoved page reconciles with no shift at all",
+  still.verifiable && still.shiftX === 0 && still.shiftY === 0 && still.regions === regionsAt);
+// The sign matters: a point measured at scroll `after` sits FURTHER DOWN the
+// image by exactly (after - before). Subtracting it would paint every box twice
+// as far off as not correcting at all.
+const scrolled = reconcileCaptureShift(geom(), geom({ scrollY: 460 }), regionsAt);
+ok("a page that scrolled down is corrected in the right direction",
+  scrolled.verifiable && scrolled.shiftY === 60 && scrolled.regions[0].y === 260 &&
+    scrolled.regions[0].x === 100);
+ok("and the shift reaches the regions that get painted",
+  scrolled.regions !== regionsAt && scrolled.regions[0].height === 20);
+const sideways = reconcileCaptureShift(geom(), geom({ scrollX: -30, scrollY: 400 }), regionsAt);
+ok("a horizontal scroll shifts x and leaves y alone",
+  sideways.verifiable && sideways.shiftX === -30 && sideways.regions[0].x === 70 &&
+    sideways.regions[0].y === 200);
+
+// What is NOT a scroll, and must stay a refusal: a different document, a
+// resized viewport, a different pixel ratio, or a jump too large to attribute
+// to scrolling at all (a reflow, a new page rendered under the same URL).
+ok("a different document is not reconciled",
+  reconcileCaptureShift(geom(), geom({ url: "https://www.youtube.com/" }), regionsAt)
+    .verifiable === false);
+ok("a resized viewport is not reconciled",
+  reconcileCaptureShift(geom(), geom({ viewportWidth: 1024 }), regionsAt).verifiable === false &&
+  reconcileCaptureShift(geom(), geom({ viewportHeight: 600 }), regionsAt).verifiable === false);
+ok("a changed pixel ratio is not reconciled",
+  reconcileCaptureShift(geom(), geom({ dpr: 1 }), regionsAt).verifiable === false);
+ok("a jump too large to be a scroll is not reconciled",
+  reconcileCaptureShift(geom(), geom({ scrollY: 400 + MAX_RECONCILED_SCROLL_PX + 1 }), regionsAt)
+    .verifiable === false &&
+  reconcileCaptureShift(geom(), geom({ scrollY: 400 + MAX_RECONCILED_SCROLL_PX }), regionsAt)
+    .verifiable === true);
+ok("missing geometry on either side is not reconciled",
+  reconcileCaptureShift(null, geom(), regionsAt).verifiable === false &&
+  reconcileCaptureShift(geom(), null, regionsAt).verifiable === false);
+ok("a refused reconciliation leaves the regions untouched",
+  reconcileCaptureShift(geom(), geom({ url: "https://x.test/" }), regionsAt).regions === regionsAt);
+
+// The wiring: the capture path must USE it, and the exact-equality test that
+// discarded frames has to be gone.
+const mappingWorkerSource = await readFile("src/background/service-worker.ts", "utf8");
+ok("the capture path reconciles the shift instead of comparing whole records",
+  /reconcileCaptureShift\(geometry, measuredGeometry, paintedRegions\)/.test(mappingWorkerSource) &&
+    !/JSON\.stringify\(geometry\) !== JSON\.stringify\(measuredGeometry\)/.test(mappingWorkerSource));
+ok("and the corrected regions are what the pipeline paints",
+  /processScreenshot\(\s*\n\s*rawDataUrl, width, height, paintedRegions, dpr,/.test(mappingWorkerSource));
 
 const viewportMap = regionMappingFor({
   imageWidth: 1424, dpr: 2, viewportWidth: 712, scrollY: 0, fullPage: false,

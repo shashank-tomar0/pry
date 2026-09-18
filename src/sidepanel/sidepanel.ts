@@ -789,6 +789,31 @@ function rollupClass(rollup: AuditVerificationRollup): "ok" | "warn" | "neutral"
   return rollup.allVerified ? "ok" : "neutral";
 }
 
+/**
+ * The verdict + counts a chip displays, as one comparable string.
+ *
+ * Used to recognise a chip that is already showing THIS evidence, because the
+ * audit is rendered from two sources: the live `privacy-audit` event at the end
+ * of a run, and the `get-audit` pull when the user opens Privacy Audit (which
+ * INSPECT PROOF does). Both call `renderPrivacyAudit`, and appending from there
+ * put a SECOND identical card in the transcript every time the panel was
+ * opened — the reported "why are there two of these" — while the numbers and
+ * the badge were identical in both.
+ */
+function auditChipSignature(audit: {
+  totalScreenshots: number;
+  verificationRollup?: AuditVerificationRollup;
+  tally?: { pageItems: number; frameRegions: number; tokens: number; total: number };
+}): string {
+  const rollup = audit.verificationRollup;
+  return [
+    audit.totalScreenshots,
+    audit.tally?.total ?? "-",
+    audit.tally?.tokens ?? "-",
+    rollup ? `${rollup.framesTotal}/${rollup.framesVerified}/${rollup.framesFailed}/${rollup.framesWithheld}` : "none",
+  ].join("|");
+}
+
 function appendAuditVerificationChip(audit: {
   totalRedacted: number;
   totalScreenshots: number;
@@ -797,8 +822,18 @@ function appendAuditVerificationChip(audit: {
   verificationRollup?: AuditVerificationRollup;
   tally?: { pageItems: number; frameRegions: number; tokens: number; total: number };
 }): void {
+  // Idempotent by evidence, not by timing: the same payload rendered twice is
+  // one card. A later run whose numbers differ still gets its own card, so this
+  // dedupes a re-render without hiding a new result.
+  const signature = auditChipSignature(audit);
+  const lastChip = transcriptEl.lastElementChild;
+  if (lastChip instanceof HTMLElement && lastChip.classList.contains("audit-chip") &&
+      lastChip.dataset.auditSignature === signature) {
+    return;
+  }
   const chip = document.createElement("div");
   chip.className = "entry audit-chip";
+  chip.dataset.auditSignature = signature;
   // "ZERO-LEAK VERIFIED" claimed something this check cannot measure: it proves
   // the regions PRY redacted are unrecoverable in the shipped bytes, not that
   // PRY found every sensitive thing on the page (see README §6.5). The claim is

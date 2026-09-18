@@ -77,6 +77,90 @@ export function regionMappingFor(input: RegionMappingInput): RegionMapping {
   return { scale, offsetY, mapped: input.fullPage, valid: true, reasons: [] };
 }
 
+// ─── The page moved between the capture and the region measurement ──────────
+//
+// Regions arrive from a message round trip that happens AFTER the pixels were
+// taken, so a page that scrolls, reflows or lazy-loads in that window measures
+// its regions against a different moment than the one in the image. The check
+// for that was exact equality of the whole geometry record, and failing it
+// withheld the frame — which is how a Gmail tab doing 447 DOM updates per click
+// lost its vision channel, with the planner reading the page over and over
+// instead.
+//
+// Exact equality is the wrong test. A pure SCROLL is not a mismatch: it is a
+// known, computable shift, and the arithmetic is the same one the full-page
+// path already does. What actually invalidates a mapping is a different
+// document, a different viewport or a different pixel ratio, or a jump too
+// large to attribute to a scroll at all.
+
+/** Largest shift (CSS px, either axis) that is reconciled instead of refused. */
+export const MAX_RECONCILED_SCROLL_PX = 600;
+
+/** The facts that must MATCH for a shift to be the only difference. */
+export interface CaptureGeometryRecord {
+  url: string;
+  scrollX: number;
+  scrollY: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  dpr: number;
+}
+
+export interface ShiftReconciliation<T> {
+  verifiable: boolean;
+  /** Scroll delta that was applied, in device px (0 when nothing moved). */
+  shiftX: number;
+  shiftY: number;
+  regions: T[];
+  reason?: string;
+}
+
+/**
+ * Reconcile regions measured after a scroll with the image captured before it.
+ *
+ * A point at viewport `y` measured at scroll `after.scrollY` sits at viewport
+ * `y + (after.scrollY - before.scrollY)` in an image taken at `before.scrollY`,
+ * so the correction is the delta ADDED, not subtracted — getting this backwards
+ * would paint every box exactly twice as far off as not correcting at all.
+ */
+export function reconcileCaptureShift<T extends { x: number; y: number }>(
+  captured: CaptureGeometryRecord | null | undefined,
+  measured: CaptureGeometryRecord | null | undefined,
+  regions: T[],
+): ShiftReconciliation<T> {
+  if (!captured || !measured) {
+    return { verifiable: false, shiftX: 0, shiftY: 0, regions, reason: "capture-verification-missing" };
+  }
+  // A different document is a different mapping, whatever the numbers say.
+  if (captured.url !== measured.url) {
+    return { verifiable: false, shiftX: 0, shiftY: 0, regions, reason: "capture-document-changed" };
+  }
+  // These change layout or the CSS→device scale, so a scroll delta cannot
+  // explain a difference in them.
+  if (captured.dpr !== measured.dpr ||
+      captured.viewportWidth !== measured.viewportWidth ||
+      captured.viewportHeight !== measured.viewportHeight) {
+    return { verifiable: false, shiftX: 0, shiftY: 0, regions, reason: "capture-viewport-changed" };
+  }
+  const deltaX = measured.scrollX - captured.scrollX;
+  const deltaY = measured.scrollY - captured.scrollY;
+  if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) {
+    return { verifiable: false, shiftX: 0, shiftY: 0, regions, reason: "capture-scroll-unknown" };
+  }
+  if (Math.abs(deltaX) > MAX_RECONCILED_SCROLL_PX || Math.abs(deltaY) > MAX_RECONCILED_SCROLL_PX) {
+    return { verifiable: false, shiftX: 0, shiftY: 0, regions, reason: "capture-scrolled-too-far" };
+  }
+  if (deltaX === 0 && deltaY === 0) {
+    return { verifiable: true, shiftX: 0, shiftY: 0, regions };
+  }
+  return {
+    verifiable: true,
+    shiftX: deltaX,
+    shiftY: deltaY,
+    regions: regions.map((region) => ({ ...region, x: region.x + deltaX, y: region.y + deltaY })),
+  };
+}
+
 // ─── What gets painted, and what the audit is told was painted ──────────────
 //
 // These two functions exist because the painter and the reporter used to

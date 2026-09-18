@@ -9,6 +9,19 @@ export interface ProviderInfo {
   /** Starting points only — the options page can refresh this list live. */
   suggested: string[];
   defaultModel: string;
+  /**
+   * The plainest, smallest model this provider offers, for "Fast planner mode".
+   *
+   * The reported latency is first-token time, and on a reasoning model that time
+   * is spent emitting chain-of-thought the user never sees — the panel shows it
+   * as "model is reasoning (N chars so far)" while the visible answer has not
+   * started. This is the provider's plain instruct entry from the list above,
+   * offered as a trade (weaker planning, much sooner first token) rather than as
+   * a claim about any model's internals: vendors rename and re-tune these
+   * constantly, which is why it is a starting point like `suggested` and why the
+   * run prints whichever model it actually used.
+   */
+  fastModel: string;
 }
 
 export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
@@ -25,6 +38,7 @@ export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
       "claude-fable-5",
     ],
     defaultModel: "claude-opus-5",
+    fastModel: "claude-haiku-4-5",
   },
   openai: {
     id: "openai",
@@ -35,6 +49,7 @@ export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
     // Refresh button in the options page is the authority, not this list.
     suggested: ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-mini", "gpt-5.1", "gpt-5"],
     defaultModel: "gpt-5.5",
+    fastModel: "gpt-5.4-mini",
   },
   openrouter: {
     id: "openrouter",
@@ -50,6 +65,7 @@ export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
       "deepseek/deepseek-v4-pro",
     ],
     defaultModel: "anthropic/claude-opus-5",
+    fastModel: "openai/gpt-5.5",
   },
   ollama: {
     id: "ollama",
@@ -69,6 +85,7 @@ export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
       "gemma2:9b",
     ],
     defaultModel: "qwen2.5:1.5b",
+    fastModel: "qwen2.5:3b",
   },
   groq: {
     id: "groq",
@@ -82,6 +99,7 @@ export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
       "qwen/qwen3.8-27b",
     ],
     defaultModel: "openai/gpt-oss-20b",
+    fastModel: "openai/gpt-oss-20b",
   },
   nvidia: {
     id: "nvidia",
@@ -97,6 +115,10 @@ export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
       "meta/llama-3.1-8b-instruct",
     ],
     defaultModel: "nvidia/nemotron-3.5-lightning-30b-a3b",
+    // A plain instruction model, and a real trade: it will plan worse than the
+    // 30B reasoning default, in exchange for a first token that arrives now
+    // instead of after a chain-of-thought.
+    fastModel: "meta/llama-3.1-8b-instruct",
   },
 };
 

@@ -291,8 +291,12 @@ export async function verifyLedgerChain(entries: LedgerEntry[]): Promise<ChainVe
       hashesIntact = false;
       if (firstBadSeq === undefined) firstBadSeq = entry.seq;
       // Do NOT push a reason per entry: one tampered entry is one finding.
+      // The entry's TYPE is named because it is the only handle an operator has
+      // on which write went wrong — "entry 1512" alone sent the reader looking at
+      // a ledger of 500 without saying whether it was a snapshot, a redaction or
+      // a verification, and those are three different code paths.
       if (reasons.length === 0) {
-        reasons.push(`entry ${entry.seq} does not match its recorded digest`);
+        reasons.push(`entry ${entry.seq} (${entry.type}) does not match its recorded digest`);
       }
     }
     if (i > 0 && entry.prevHash !== entries[i - 1].hash) {

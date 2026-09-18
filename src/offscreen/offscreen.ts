@@ -34,6 +34,7 @@ import {
   detectPIIInText,
   layoutRegionCrops,
   ocrCheckableRegions,
+  escalationDecision,
 } from "../background/reocr-verification";
 import {
   attackSoftRegions,
@@ -55,7 +56,7 @@ import { detectSpans, warmUpNer } from "../ml/ner";
 import { classifyInjection, warmUpGuard } from "../ml/guard";
 import { FilesetResolver, FaceDetector as MpFaceDetector } from "@mediapipe/tasks-vision";
 import { tileLooksReadable } from "../shared/frame-text";
-import { mergeFaceBoxes, type FaceBox } from "../shared/face-regions";
+import { coversExistingFace, mergeFaceBoxes, shouldRunSecondaryFaceDetector, type FaceBox } from "../shared/face-regions";
 import { normalizePaintedRect } from "../shared/region-mapping";
 import {
   BLUR_RADIUS_CSS_PX,
@@ -639,8 +640,10 @@ async function processScreenshot(
   // A short-range detector reliably finds one large portrait and reliably
   // misses 40 px thumbnail faces, so on a video grid the pipeline destroyed the
   // big face and shipped every small one — the "faces are not being blacked
-  // out" report. Model channels still run only as a pair (Chrome's detector is
-  // the same class of accuracy as BlazeFace and costs a full-image encode).
+  // out" report. The same exclusivity survived between the two MODEL channels
+  // (`if (modelFaces.length === 0)` around Chrome's detector), so the fix is the
+  // same shape here: every channel is asked when the evidence says it might know
+  // something the others do not, and nothing a channel finds is discarded.
   let modelFaces: FaceBox[] = [];
   // Evidence for the egress contract: a channel counts as "ran" only when it
   // completed without throwing. A model that is missing and a model that threw
@@ -667,39 +670,10 @@ async function processScreenshot(
     // Fall through to the next channel.
   }
 
-  if (modelFaces.length === 0) {
-    const chromeDetector = await getChromeFaceDetector();
-    if (chromeDetector) {
-      try {
-        const bitmap = await createImageBitmap(await (async () => {
-          const c = new OffscreenCanvas(width, height);
-          // Original pixels here too — same reason as BlazeFace above.
-          c.getContext("2d")!.drawImage(originalCanvas, 0, 0);
-          return c.convertToBlob();
-        })());
-        const faces = await chromeDetector.detect(bitmap);
-        bitmap.close();
-        modelFaces = faces.map((f) => ({
-          x: f.boundingBox.x,
-          y: f.boundingBox.y,
-          width: f.boundingBox.width,
-          height: f.boundingBox.height,
-          confidence: 0.95,
-          source: "model" as const,
-        }));
-        faceChannelRan = true;
-        if (modelFaces.length > 0) {
-          console.log(`[PRY Offscreen] Chrome FaceDetector found ${modelFaces.length} faces`);
-        }
-      } catch (err) {
-        faceChannelFailure = faceChannelFailure || (err instanceof Error ? err.message : String(err));
-        // Fall through to skin-color.
-      }
-    }
-  }
-
-  // Always run the supplementary pass, on the ORIGINAL pixels (not the already
-  // redacted canvas, which may contain black masks). It adds faces the model
+  // Supplementary pass runs BEFORE the secondary model detector, because its
+  // output is the evidence that detector is gated on (see
+  // shouldRunSecondaryFaceDetector). On the ORIGINAL pixels (not the already
+  // redacted canvas, which may contain black masks): it adds faces the model
   // missed and never removes one the model found.
   let skinFaces: FaceBox[] = [];
   try {
@@ -712,6 +686,47 @@ async function processScreenshot(
   } catch (err) {
     faceChannelFailure = faceChannelFailure || (err instanceof Error ? err.message : String(err));
     // No supplementary channel — the model's boxes still stand.
+  }
+
+  // Chrome's FaceDetector — a DIFFERENT algorithm from BlazeFace, asked only
+  // when the cheap channels left a face unexplained. This used to be gated on
+  // `modelFaces.length === 0`, which is how a large portrait suppressed the one
+  // detector that might have seen a 40 px thumbnail face in the same frame.
+  if (shouldRunSecondaryFaceDetector(modelFaces, skinFaces)) {
+    const chromeDetector = await getChromeFaceDetector();
+    if (chromeDetector) {
+      try {
+        const bitmap = await createImageBitmap(await (async () => {
+          const c = new OffscreenCanvas(width, height);
+          // Original pixels here too — same reason as BlazeFace above.
+          c.getContext("2d")!.drawImage(originalCanvas, 0, 0);
+          return c.convertToBlob();
+        })());
+        const faces = await chromeDetector.detect(bitmap);
+        bitmap.close();
+        const secondary = faces
+          .map((f) => ({
+            x: f.boundingBox.x,
+            y: f.boundingBox.y,
+            width: f.boundingBox.width,
+            height: f.boundingBox.height,
+            confidence: 0.95,
+            source: "model" as const,
+          }))
+          // The two model channels can now both answer on one frame, so the
+          // same face must not be painted and audited twice. A secondary box
+          // that only re-finds what BlazeFace already reported is dropped.
+          .filter((candidate) => !coversExistingFace(candidate, modelFaces));
+        modelFaces = [...modelFaces, ...secondary];
+        faceChannelRan = true;
+        if (secondary.length > 0) {
+          console.log(`[PRY Offscreen] Chrome FaceDetector added ${secondary.length} face(s) BlazeFace missed`);
+        }
+      } catch (err) {
+        faceChannelFailure = faceChannelFailure || (err instanceof Error ? err.message : String(err));
+        // The primary model's boxes still stand.
+      }
+    }
   }
 
   const faceBoxes = mergeFaceBoxes(modelFaces, skinFaces);
@@ -860,9 +875,21 @@ async function processScreenshot(
       //    reconstruction probe can still read is no different from a region OCR
       //    can still read: both mean the blur did not destroy the content, and
       //    both must be lifted to an opaque fill before the frame ships.
+      //    A PIXEL finding feeds it too. Those are the verifier's own findings —
+      //    a destroyed region that is not opaque, a soft region whose paint did
+      //    not land — and they were the one class that could not ask for the
+      //    rebuild that fixes them, so the frame was withheld instead (see
+      //    `escalationDecision`).
       const reconstructionHits = first.attack.reconstruction.length;
       const uncoveredFaces = first.attack.uncoveredFaces;
-      if (first.ocrLeaks.length > 0 || reconstructionHits > 0 || uncoveredFaces.length > 0) {
+      const escalation = escalationDecision({
+        ocrLeaks: first.ocrLeaks,
+        reconstruction: reconstructionHits,
+        uncoveredFaces: uncoveredFaces.length,
+        attackDetails: first.attack.details,
+        pixelFindings: first.pixelFindings,
+      });
+      if (escalation.escalate) {
         // A face the detector found only in the SHIPPED frame is not in
         // `redactionRegions` — nothing painted it — so the rebuild has to be
         // told about it, or the escalation would repaint the frame and still
@@ -899,20 +926,32 @@ async function processScreenshot(
         // (correctly) empty — the leaks were destroyed — but a record with no
         // trace of what the first paint got wrong is not an audit, it is a
         // clean bill of health for a failure nobody wrote down.
-        const escalationReasons = [
-          ...first.ocrLeaks.map((l) => `OCR: ${l} was still readable in a soft region`),
-          ...first.attack.details,
-        ];
+        // `escalation.reasons` now carries the first paint's PIXEL findings too.
+        // They were absent before, so when the rebuild was triggered by an
+        // unrelated OCR leak the record of what the first paint got wrong — the
+        // reversible region — was dropped, and the audit showed a frame whose
+        // only recorded story was a clean rebuild.
+        const escalationReasons = escalation.reasons;
         verification = {
           ...second.result,
           escalated: true,
           escalationReasons: [...new Set(escalationReasons)],
-          // The FIRST pass's attack evidence is kept: the second run attacks a
-          // rebuild it just proved clean, so it reports nothing by construction.
+          // Both passes' EVIDENCE is kept, and the counts are the second pass's
+          // own — the numbers that describe the image that actually ships.
+          //
+          // They used to be overwritten with the first pass's counts, on the
+          // theory that the second run attacks a rebuild it just proved clean
+          // and therefore reports nothing by construction. That theory is false,
+          // and it produced a record that argued with itself: a panel printing
+          // "no uncovered face" directly above a FACE COVERAGE line the second
+          // probe had just written. A face the re-probe finds on the REBUILT
+          // frame is outside every region the rebuild painted — the one kind of
+          // finding escalation cannot fix — and the panel's own counts said it
+          // did not exist. A count that disagrees with the list under it is
+          // worse than no count. What the first paint got wrong is still in
+          // `escalationReasons` and in the first pass's details below.
           attack: {
             ...(second.result.attack ?? { ran: true, reconstructableRegions: 0, uncoveredFaces: 0, details: [] }),
-            reconstructableRegions: reconstructionHits,
-            uncoveredFaces: uncoveredFaces.length,
             details: [
               ...first.attack.details,
               ...(second.result.attack?.details ?? []),
@@ -920,9 +959,12 @@ async function processScreenshot(
           },
           leakedText: verification.leakedText ?? second.result.leakedText,
           summary: second.result.verified
-            ? `ESCALATED: ${escalationReason(reconstructionHits, uncoveredFaces.length, first.ocrLeaks)}, ` +
+            ? `ESCALATED: ${escalationReason(reconstructionHits, uncoveredFaces.length, first.ocrLeaks, first.pixelFindings.length)}, ` +
               `so every region was destroyed and the image re-verified. ${second.result.summary}`
             : `ESCALATED and still failing: ${second.result.summary}`,
+          // (`escalationReason` describes the FIRST paint's findings, which is
+          // what the rebuild was for. The shipped image's own findings are
+          // `attack` above and `leakedPatterns` on this object.)
         };
       }
       finalScanRan = true;
@@ -956,6 +998,9 @@ async function processScreenshot(
     finalScanFailure: finalScanFailure || undefined,
     // Proven leaks only: the pixel re-read and the OCR re-read both write here.
     residualDetections: verification.leakedPatterns?.length ?? 0,
+    // …and WHICH ones, so a withheld frame names its region in the transcript
+    // instead of reporting a count the user cannot act on.
+    residualDetails: verification.leakedPatterns ?? [],
     policyEnabled: destroyFaces && maskCredentials,
   });
 
@@ -1088,7 +1133,7 @@ async function verifyShippedImage(
   height: number,
   /** The tiers this frame was painted with — see verifyRegions. */
   policy: { destroyFaces: boolean; maskCredentials: boolean },
-): Promise<{ result: VerificationResult; ocrLeaks: string[]; attack: AttackOutcome }> {
+): Promise<{ result: VerificationResult; ocrLeaks: string[]; attack: AttackOutcome; pixelFindings: string[] }> {
   const bitmap = await createImageBitmap(blob);
   const verifyCanvas = new OffscreenCanvas(width, height);
   const verifyCtx = verifyCanvas.getContext("2d", { willReadFrequently: true })!;
@@ -1097,6 +1142,13 @@ async function verifyShippedImage(
 
   const shippedData = verifyCtx.getImageData(0, 0, width, height);
   let result = verifyRegions(originalData, shippedData, regions, Date.now(), policy);
+  // The PIXEL findings of the FIRST paint, captured before the adversarial and
+  // OCR passes append their own lines to `leakedPatterns`. The escalation
+  // decision needs them as their own class: they were the one kind of finding
+  // that could not trigger the rebuild that fixes them. Captured here rather
+  // than recovered by string prefix later, because a prefix is a formatting
+  // convention and this is a decision.
+  const pixelFindings = [...result.leakedPatterns];
   let ocrLeaks: string[] = [];
 
   // ── Adversarial attack, on the SHIPPED pixels ────────────────────────────
@@ -1190,7 +1242,7 @@ async function verifyShippedImage(
     },
   };
 
-  return { result, ocrLeaks, attack };
+  return { result, ocrLeaks, attack, pixelFindings };
 }
 
 /**
@@ -1199,7 +1251,12 @@ async function verifyShippedImage(
  * as nonsense ("proved 0 recoverable blur(s) and 1 uncovered face(s)") if the
  * counts are simply concatenated.
  */
-function escalationReason(reconstructionHits: number, uncoveredFaces: number, ocrLeaks: string[]): string {
+function escalationReason(
+  reconstructionHits: number,
+  uncoveredFaces: number,
+  ocrLeaks: string[],
+  pixelFindings: number = 0,
+): string {
   const reasons: string[] = [];
   if (reconstructionHits > 0) {
     reasons.push(`${reconstructionHits} blur${reconstructionHits === 1 ? "" : "s"} the adversarial pass proved recoverable`);
@@ -1209,6 +1266,11 @@ function escalationReason(reconstructionHits: number, uncoveredFaces: number, oc
   }
   if (ocrLeaks.length > 0) {
     reasons.push(`OCR still reading ${ocrLeaks.join(", ")}`);
+  }
+  if (pixelFindings > 0) {
+    reasons.push(
+      `${pixelFindings} region${pixelFindings === 1 ? "" : "s"} the pixel check found unredacted`,
+    );
   }
   const last = reasons.pop() ?? "a redaction the auditor could not accept";
   return reasons.length > 0 ? `${reasons.join(", ")} and ${last}` : last;

@@ -50,6 +50,17 @@ export interface OffscreenProtectionEvidence {
   finalScanFailure?: string;
   /** Residual content the final scan proved still readable. Must be 0. */
   residualDetections: number;
+  /**
+   * WHICH regions those were, in the verifier's own words — label, kind and pixel
+   * coordinates ("PIXEL: \"Email address\" (credential) at 412,180 was not visibly
+   * redacted").
+   *
+   * A bare count leaves the user with nowhere to look: a withheld frame reads as
+   * "1 residual detection survived" and the next question — the one that decides
+   * whether this is a real leak or a mapping mistake — has no answer in the
+   * transcript. The detail was already produced; it just never left this object.
+   */
+  residualDetails?: string[];
   /** User policy fully enabled: faces destroyed AND credentials masked. */
   policyEnabled: boolean;
 }
@@ -80,7 +91,11 @@ export function deriveOffscreenProtection(
     ? Math.max(0, Math.trunc(evidence.residualDetections))
     : Number.POSITIVE_INFINITY;
   if (residual > 0) {
-    reasons.push(`${residual} residual detection(s) survived the redaction pass`);
+    const details = (evidence.residualDetails ?? []).filter(Boolean);
+    reasons.push(
+      `${residual} residual detection(s) survived the redaction pass` +
+      (details.length > 0 ? `: ${details.join("; ")}` : ""),
+    );
   }
   if (!evidence.policyEnabled) {
     reasons.push("Required protection disabled by settings");

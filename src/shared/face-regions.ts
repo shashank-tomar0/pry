@@ -78,6 +78,42 @@ function byAreaThenConfidence(a: FaceBox, b: FaceBox): number {
 }
 
 /**
+ * Should the SECOND model detector be asked for a second opinion on this frame?
+ *
+ * Chrome's shape-detection `FaceDetector` is a different algorithm from
+ * BlazeFace with a different failure mode, and the two disagree most on exactly
+ * the case that matters here: small faces. The pipeline used to gate the
+ * secondary detector on `model.length === 0` — "BlazeFace found nothing" — the
+ * same exclusive-chain shape that had already been removed between the model
+ * and skin channels. The consequence on a YouTube results page is concrete: the
+ * short-range model finds the one large channel avatar and drops a 40 px
+ * thumbnail face, and because SOMETHING was found, the second detector — the one
+ * that might have seen it — is never asked. The portrait is destroyed, the
+ * thumbnail face ships readable.
+ *
+ * The gate is therefore evidence-driven rather than count-driven. The supplied
+ * skin pass is cheap and has already run; when it reports a face that no model
+ * box covers, that is the signature of a face the primary model downscaled away
+ * (or of skin-like pixels it was never going to return), and the extra detector
+ * is worth its encode. When the primary model already explains every skin blob,
+ * the secondary detector is skipped exactly as before — so the common frame
+ * costs nothing extra.
+ *
+ * @param model  boxes from the primary model detector (BlazeFace)
+ * @param skin   boxes from the skin-colour heuristic
+ */
+export function shouldRunSecondaryFaceDetector(
+  model: FaceBox[],
+  skin: FaceBox[],
+  coverage: number = FACE_DUPLICATE_COVERAGE,
+): boolean {
+  // Nothing detected at all: the secondary detector is the only real detector
+  // this frame can still have, so it always gets a turn.
+  if (model.length === 0) return true;
+  return skin.some((candidate) => !coversExistingFace(candidate, model, coverage));
+}
+
+/**
  * Fuse every channel's boxes into the list the redaction loop draws.
  *
  * @param model  boxes from BlazeFace / Chrome FaceDetector (trusted)

@@ -18,7 +18,7 @@ import assert from "node:assert";
 import { readFile } from "node:fs/promises";
 // The one copy of the observed glitch stream, shared with the agent-loop
 // harness so the two suites cannot disagree about what it contained.
-import { GLITCH_OUTPUT as SALAD } from "./fixtures/glitch-output.mjs";
+import { GLITCH_OUTPUT as SALAD, GLITCH_OUTPUT_CHURN as SALAD_CHURN } from "./fixtures/glitch-output.mjs";
 
 // ─── chrome.storage shim (what the modules call) ───────────────────────────
 const mem = new Map();
@@ -65,7 +65,7 @@ const {
   getApplicableRules, buildSuppressionKeys, recommendsLLMOnly,
 } = await import("../src/background/learned-rules.ts");
 const { recordRedaction, recordVerification, recordSnapshot, getLedgerSummary, clearLedger } = await import("../src/background/privacy-ledger.ts");
-const { verifyRegions, emptyVerification, piiKindFromOcrLabel, detectPIIInText, regionGradientEnergy, regionChangedFraction } = await import("../src/background/reocr-verification.ts");
+const { verifyRegions, emptyVerification, escalationDecision, piiKindFromOcrLabel, detectPIIInText, regionGradientEnergy, regionChangedFraction } = await import("../src/background/reocr-verification.ts");
 
 // ─── The exact sanitize flow from agent.ts sanitizeSnapshot() ───────────────
 function sanitizeSnapshot(snapshot) {
@@ -429,6 +429,80 @@ ok("unchanged faint text still FAILS verification (no blur applied)",
   !vD7.verified && vD7.regionsRedacted === 0, JSON.stringify(vD7));
 
 ok("emptyVerification reports nothing-to-verify as verified", emptyVerification().verified === true);
+
+// ── The verifier's own findings must be able to ask for the rebuild ────────
+// A PIXEL finding used to be the one class that could not trigger escalation,
+// so a frame whose only problem was exactly what the rebuild fixes was withheld
+// from the model instead. These pin the trigger, per finding class.
+const escClean = escalationDecision({ ocrLeaks: [], reconstruction: 0, uncoveredFaces: 0, attackDetails: [], pixelFindings: [] });
+ok("a clean first pass does not escalate", escClean.escalate === false && escClean.reasons.length === 0, JSON.stringify(escClean));
+
+const pixelOnly = 'PIXEL: "Card number" (credit_card, surrogate tier) at 40,120 was not visibly redacted — 0.0% of its pixels changed (bar: 10%).';
+const escPixel = escalationDecision({ ocrLeaks: [], reconstruction: 0, uncoveredFaces: 0, attackDetails: [], pixelFindings: [pixelOnly] });
+ok("a PIXEL-only finding ESCALATES (the withheld-frame case)",
+  escPixel.escalate === true, JSON.stringify(escPixel));
+ok("escalating on a PIXEL finding keeps the finding in the record",
+  escPixel.reasons.some((r) => r.includes("Card number") && r.includes("The first paint did not hold")),
+  JSON.stringify(escPixel.reasons));
+
+const escOcr = escalationDecision({ ocrLeaks: ["pry@example.com"], reconstruction: 0, uncoveredFaces: 0, attackDetails: [], pixelFindings: [] });
+ok("an OCR leak still escalates", escOcr.escalate === true, JSON.stringify(escOcr));
+// The count is the trigger, not the notes: a reconstruction hit with no detail
+// line must still rebuild, or the rebuild would depend on formatting.
+const escCountOnly = escalationDecision({ ocrLeaks: [], reconstruction: 1, uncoveredFaces: 0, attackDetails: [], pixelFindings: [] });
+ok("a reconstruction hit escalates from its count alone", escCountOnly.escalate === true, JSON.stringify(escCountOnly));
+const escFaceOnly = escalationDecision({ ocrLeaks: [], reconstruction: 0, uncoveredFaces: 1, attackDetails: [], pixelFindings: [] });
+ok("an uncovered face escalates from its count alone", escFaceOnly.escalate === true, JSON.stringify(escFaceOnly));
+ok("escalation reasons are de-duplicated",
+  escalationDecision({ ocrLeaks: [], reconstruction: 0, uncoveredFaces: 0, attackDetails: [], pixelFindings: [pixelOnly, pixelOnly] }).reasons.length === 1);
+
+// ── A finding the reader can act on: which region, which tier, how far off ──
+function textImage(w, h, opts) {
+  const { pad = 4, fontPx = 15, seed = 1, density = 0.42 } = opts;
+  const cellW = Math.max(4, Math.round(fontPx * 0.6));
+  const bodyH = Math.round(fontPx * 0.72);
+  const top = Math.round((h - bodyH) / 2);
+  return makeImage(w, h, (x, y) => {
+    if (x < pad || y < top || y >= top + bodyH) return white();
+    const cell = Math.floor((x - pad) / cellW);
+    const inCell = (x - pad) % cellW;
+    let hsh = (cell * 2654435761 + (y - top) * 40503 + seed * 97) >>> 0;
+    hsh ^= hsh << 13; hsh >>>= 0;
+    return (hsh % 1000) / 1000 < density || inCell <= 1 ? [30, 41, 59] : white();
+  });
+}
+// A surrogate region that was NEVER painted (the exact failure the surrogate
+// tier's OCR exclusion leans on the pixel check to catch) must still fail — and
+// now must say so with numbers and a tier.
+const surrogateOrig = textImage(240, 28, { seed: 1 });
+const vSurrogateUnpainted = verifyRegions(
+  surrogateOrig, textImage(240, 28, { seed: 1 }),
+  [{ x: 0, y: 0, width: 240, height: 28, kind: "credit_card", label: "Card number" }],
+  0, { destroyFaces: true, maskCredentials: true },
+);
+ok("an unpainted surrogate region still FAILS",
+  !vSurrogateUnpainted.verified && vSurrogateUnpainted.leakedPatterns.length === 1,
+  JSON.stringify(vSurrogateUnpainted));
+ok("the soft/SURROGATE finding names its tier",
+  /credit_card, surrogate tier/.test(vSurrogateUnpainted.leakedPatterns[0]),
+  vSurrogateUnpainted.leakedPatterns[0]);
+ok("the finding reports the measurement, not just a verdict",
+  /0\.0% of its pixels changed \(bar: 10%\)/.test(vSurrogateUnpainted.leakedPatterns[0]) &&
+  /bar: 0\.12/.test(vSurrogateUnpainted.leakedPatterns[0]),
+  vSurrogateUnpainted.leakedPatterns[0]);
+ok("the finding names the region and where it is",
+  /"Card number"/.test(vSurrogateUnpainted.leakedPatterns[0]) && /at 0,0/.test(vSurrogateUnpainted.leakedPatterns[0]),
+  vSurrogateUnpainted.leakedPatterns[0]);
+// The other side of the same coin: a surrogate that WAS painted passes. Without
+// this the tier could "pass" the check above by rejecting surrogates wholesale.
+const vSurrogatePainted = verifyRegions(
+  surrogateOrig, textImage(240, 28, { seed: 7 }),
+  [{ x: 0, y: 0, width: 240, height: 28, kind: "credit_card", label: "Card number" }],
+  0, { destroyFaces: true, maskCredentials: true },
+);
+ok("a correctly painted surrogate region PASSES",
+  vSurrogatePainted.verified && vSurrogatePainted.regionsRedacted === 1,
+  JSON.stringify(vSurrogatePainted));
 
 // Ledger: verification entries land and chain stays intact.
 await recordVerification(true, 4, 0);
@@ -2181,7 +2255,7 @@ ok("short input returns unchanged",
 // detector that finds one large portrait and drops 40px thumbnail faces.
 console.log("\n=== Scenario AH: face-channel fusion policy ===\n");
 
-const { mergeFaceBoxes, coversExistingFace, overlapArea } = await import("../src/shared/face-regions.ts");
+const { mergeFaceBoxes, coversExistingFace, overlapArea, shouldRunSecondaryFaceDetector } = await import("../src/shared/face-regions.ts");
 
 const modelBigFace = { x: 300, y: 100, width: 220, height: 220, confidence: 0.93, source: "model" };
 const skinThumbA = { x: 40, y: 520, width: 60, height: 60, confidence: 0.7, source: "skin" };
@@ -2223,6 +2297,47 @@ ok("supplementary additions are capped so a photo cannot wall the page",
   String(capped.filter((f) => f.source === "skin").length));
 ok("model boxes are ordered largest first",
   capped[0].width === 80);
+
+// ── The secondary MODEL detector is gated on evidence, not on a count ───────
+// The remaining half of the same exclusive-chain bug. Chrome's FaceDetector was
+// asked only when BlazeFace returned NOTHING, so on a YouTube results page a
+// single large channel avatar (which BlazeFace finds easily) suppressed the one
+// detector that might have seen the 40 px thumbnail face. The observed report
+// is a face at a thumbnail-grid coordinate that BlazeFace "missed": it was not
+// merely missed by the model, the second opinion was never requested.
+// The portrait is the channel avatar; the thumbnail is a grid tile well clear
+// of it, which is the geometry that exposed the bug.
+const portraitFace = { x: 900, y: 60, width: 220, height: 220, confidence: 0.93, source: "model" };
+const thumbnailFace = { x: 359, y: 198, width: 44, height: 44, confidence: 0.62, source: "skin" };
+ok("a model hit alone does not excuse skipping the second detector when a face is unexplained",
+  shouldRunSecondaryFaceDetector([portraitFace], [thumbnailFace]));
+ok("with no model hit at all the second detector always runs",
+  shouldRunSecondaryFaceDetector([], []));
+ok("when every supplementary box is already covered, the second detector is skipped",
+  !shouldRunSecondaryFaceDetector([portraitFace], [{ ...portraitFace, x: 905, y: 65, width: 210, height: 210, source: "skin" }]));
+ok("a box entirely inside a model face is the same face, not a reason to re-run the detector",
+  !shouldRunSecondaryFaceDetector([modelBigFace], [skinDuplicate]));
+ok("a supplementary box that merely clips a model face is NOT covered, so the detector still runs",
+  shouldRunSecondaryFaceDetector([portraitFace], [{ x: 1000, y: 250, width: 200, height: 200, confidence: 0.4, source: "skin" }]));
+
+// …and whatever the second detector returns is added to the model channel
+// without painting a face twice: a secondary box that only re-finds what
+// BlazeFace already reported is dropped before merge.
+const blazeFaces = [portraitFace];
+const secondaryRaw = [
+  { x: 900, y: 60, width: 220, height: 220, confidence: 0.95, source: "model" },
+  { x: 359, y: 198, width: 44, height: 44, confidence: 0.95, source: "model" },
+];
+const secondaryKept = secondaryRaw.filter((candidate) => !coversExistingFace(candidate, blazeFaces));
+ok("the second detector's duplicate of an existing face is discarded",
+  secondaryKept.length === 1 && secondaryKept[0].x === 359, JSON.stringify(secondaryKept));
+const rescuedThumb = mergeFaceBoxes([...blazeFaces, ...secondaryKept], [thumbnailFace]);
+ok("the rescued thumbnail face is painted once, as a model box",
+  rescuedThumb.filter((f) => f.width === 44).length === 1
+    && rescuedThumb.some((f) => f.width === 44 && f.source === "model"),
+  JSON.stringify(rescuedThumb.map((f) => [f.x, f.source])));
+ok("the large portrait is still kept alongside it",
+  rescuedThumb.some((f) => f.width === 220 && f.source === "model"));
 
 // ── Scenario AI: a NER span that is not on the page is not a detection ────
 // Tier-0 spans are scored per page now, but the fusion layer is the last line
@@ -2293,7 +2408,7 @@ console.log("\n=== Scenario AK: planner turn liveness policy ===\n");
 
 const {
   withTurnBudget, newTurnLiveness, turnCutShortMessageFor, isRetryablePlannerError,
-  retryPolicyFor, RETRY_FIRST_OUTPUT_MS,
+  retryPolicyFor, RETRY_FIRST_OUTPUT_MS, scriptSwitchRate,
 } = await import("../src/background/agent.ts");
 
 const budgetOpts = (messageFor) => ({
@@ -2334,13 +2449,19 @@ ok("a status-coded transient failure is still retried once",
   isRetryablePlannerError("network error: fetch failed") &&
   isRetryablePlannerError("503 Service Unavailable"));
 
-// A turn that streams and then goes quiet is a dropped connection: retryable.
+// A turn that streams and then goes quiet stays RETRYABLE — that wording is what
+// the retry policy reads. What it must not do is name a cause it cannot know:
+// whether this was a dropped connection or an endpoint that cannot keep up is
+// decided from how long the turn had been streaming, and the policy says which.
+// The two claims used to appear in the same message, arguing with each other.
 const droppedLiveness = newTurnLiveness();
 droppedLiveness.events = 12;
 droppedLiveness.lastEventAt = performance.now() - 5000;
 const droppedMessage = turnCutShortMessageFor("NVIDIA test", "silent", droppedLiveness, 45_000, 60_000);
-ok("a stream that goes quiet is reported as a dropped connection and stays retryable",
-  isRetryablePlannerError(droppedMessage) && /went silent/.test(droppedMessage), droppedMessage);
+ok("a stream that goes quiet stays retryable, because the policy decides from the elapsed time",
+  isRetryablePlannerError(droppedMessage) && /stopped streaming/.test(droppedMessage), droppedMessage);
+ok("and it does not claim to know WHICH silence this was",
+  !/dropped|network stalled|\.\.\.the network/.test(droppedMessage), droppedMessage);
 
 // A turn still streaming when the ceiling hits is NOT a transient hiccup.
 const ceilingLiveness = newTurnLiveness();
@@ -2931,6 +3052,39 @@ ok("the script mixture is what separates them: the salad mixes 4, every legitima
 ok("and the word floor keeps a short fragment out of scope",
   !isWordSalad(SALAD.split(/\s+/).slice(0, 40).join(" ")));
 
+// ── The second glitch shape: real-looking words, churning scripts ────────────
+// The reported run against the same model ended with a wall of this in the
+// transcript. It is not a near-miss of the rule above — punctuation cannot see it
+// at all (0.081 against 0.210 for a legitimate code block), so the guard needed a
+// signal about how fast the script changes rather than how much of it is
+// punctuation.
+ok("the punctuation rule alone does NOT catch the second glitch — the old signal is inverted on it",
+  punctuationDensity(SALAD_CHURN) < 0.25 &&
+  punctuationDensity(SALAD_CHURN) < punctuationDensity(LEGIT_LONG["code block"]),
+  `salad ${punctuationDensity(SALAD_CHURN).toFixed(3)} vs code block ${punctuationDensity(LEGIT_LONG["code block"]).toFixed(3)}`);
+ok("but the script-churn signal does",
+  isWordSalad(SALAD_CHURN),
+  `churn ${scriptSwitchRate(SALAD_CHURN).toFixed(3)} · scripts ${nonLatinLetterScripts(SALAD_CHURN).length}`);
+ok("both observed glitches churn scripts faster than any writing system does",
+  scriptSwitchRate(SALAD) >= 0.09 && scriptSwitchRate(SALAD_CHURN) >= 0.09,
+  `${scriptSwitchRate(SALAD).toFixed(3)} · ${scriptSwitchRate(SALAD_CHURN).toFixed(3)}`);
+// The honest margin, stated rather than implied: the two populations are 9.2-13.1%
+// against 4.8%, which is a separation but NOT a wide one — so the threshold is
+// backed by the three-script condition rather than carrying the rule alone.
+ok("the legitimate multilingual answer churns less than half as fast as either glitch",
+  scriptSwitchRate(LEGIT_LONG["two-script translation answer"]) < 0.05 &&
+  scriptSwitchRate(SALAD_CHURN) > 1.5 * scriptSwitchRate(LEGIT_LONG["two-script translation answer"]),
+  `legit ${scriptSwitchRate(LEGIT_LONG["two-script translation answer"]).toFixed(3)} vs glitch ${scriptSwitchRate(SALAD_CHURN).toFixed(3)}`);
+ok("and the bilingual answer is out of the rule's scope on the script count alone",
+  nonLatinLetterScripts(LEGIT_LONG["two-script translation answer"]).length === 2,
+  `${nonLatinLetterScripts(LEGIT_LONG["two-script translation answer"]).length} non-Latin scripts (the rule needs 3)`);
+ok("a `no attempt to fake churn from one script` shape stays out of scope",
+  scriptSwitchRate(LEGIT_LONG["four Latin languages"]) === 0 &&
+  !isWordSalad(LEGIT_LONG["four Latin languages"]));
+ok("and a short fragment is still out of scope, whatever it churns",
+  !isWordSalad(SALAD_CHURN.split(/\s+/).slice(0, 40).join(" ")));
+
+
 // The tail must keep the END of the stream — a guard that kept the start would
 // watch the model's opening and never see the loop it drifts into.
 const tailLiveness = newTurnLiveness();
@@ -2983,21 +3137,27 @@ const coherentChunks = PRY_SYSTEM_PROMPT.split(" ").reduce((acc, word) => {
   return acc;
 }, []);
 const coherentLiveness = newTurnLiveness();
-let coherentIndex = 0;
-const coherentTick = setInterval(() => {
+// Fed SYNCHRONOUSLY, and that is the point. This used to stream on a 5 ms
+// interval while the turn resolved after 1200 ms, so it demanded ~240 timer
+// callbacks at their promised cadence: under a loaded machine it got 253 words
+// instead of 1 400 and failed an assertion about the degenerate-output guard,
+// measuring the environment rather than the code. The guard reads the rolling
+// tail and the last-event time, not the clock the test happens to be running on.
+for (let i = 0; i < coherentChunks.length; i++) {
   coherentLiveness.lastEventAt = performance.now();
   coherentLiveness.events++;
-  recordStreamedOutput(coherentLiveness, `${coherentChunks[coherentIndex++ % coherentChunks.length]} `);
-}, 5);
+  recordStreamedOutput(coherentLiveness, `${coherentChunks[i]} `);
+}
+// The tail is a 4 000-char sliding window, so a full pass of the prompt
+// saturates it — which is exactly the state this assertion wants to test.
 const coherentSurvived = await Promise.race([
-  withTurnBudget(new Promise((r) => setTimeout(() => r("answered"), 1200)), coherentLiveness, {
+  withTurnBudget(new Promise((r) => setTimeout(() => r("answered"), 150)), coherentLiveness, {
     firstOutputMs: 60_000, idleMs: 30_000, maxMs: 600_000, onTimeout() {},
     messageFor: (reason, liveness, waited) =>
       turnCutShortMessageFor("NVIDIA test", reason, liveness, waited, 60_000),
   }).catch(() => "cut"),
   new Promise((r) => setTimeout(() => r("timeout"), 4000)),
 ]);
-clearInterval(coherentTick);
 ok("a turn streaming 1 400 words of coherent prose is not cut — the guard is not a shorter ceiling",
   (coherentSurvived === "answered" || coherentLiveness.ended === "settled") &&
   coherentLiveness.outputTail.split(/\s+/).length > 400,
@@ -3058,11 +3218,48 @@ ok("a stall in the first seconds IS retried — that is what a dropped connectio
     live({ ended: "silent", events: 3, endedAfterMs: 6_000 }),
     turnCutShortMessageFor("NVIDIA test", "silent", live({ events: 3 }), 6_000, 90_000),
   ).retry === true);
-ok("neither is a turn that produced nothing at all — that is a provider failing to serve, already classified as no-retry",
+// ── Total silence: two cases the message cannot tell apart ──────────────────
+// "The provider sent no token" was the documented reason not to retry — two
+// 90 s silent attempts in a row bought a 180 s dead wait. That measurement was
+// taken on an endpoint that had answered NOTHING. The reported run was the
+// other shape: step 0 navigated, step 1 was silent for 60 s, and the task ended
+// after a single action while the evidence that the provider worked sat in the
+// run. The two are now decided by that evidence.
+const silentMessage = turnCutShortMessageFor("NVIDIA test", "silent", live({ events: 0 }), 90_000, 90_000);
+ok("a silent turn on an endpoint that has never answered is NOT retried",
+  retryPolicyFor(live({ ended: "silent", events: 0, endedAfterMs: 90_000 }), silentMessage).retry === false,
+  retryPolicyFor(live({ ended: "silent", events: 0, endedAfterMs: 90_000 }), silentMessage).because);
+ok("and the refusal says it is the unproven endpoint that makes the difference",
+  /had not answered anything in this run/.test(
+    retryPolicyFor(live({ ended: "silent", events: 0, endedAfterMs: 90_000 }), silentMessage).because));
+ok("the same silence IS retried once when a previous turn of this run answered",
   retryPolicyFor(
-    live({ ended: "silent", events: 0, endedAfterMs: 90_000 }),
-    turnCutShortMessageFor("NVIDIA test", "silent", live({ events: 0 }), 90_000, 90_000),
-  ).retry === false);
+    live({ ended: "silent", events: 0, endedAfterMs: 60_000 }),
+    silentMessage,
+    { endpointProvenThisRun: true },
+  ).retry === true,
+  "the reported failure: one action done, then cut at 60s, and the run ended");
+ok("the proven-endpoint retry is bounded by the short budget, not a second 90s wait",
+  retryPolicyFor(live({ ended: "silent", events: 0, endedAfterMs: 60_000 }), silentMessage, { endpointProvenThisRun: true }).retry === true &&
+  RETRY_FIRST_OUTPUT_MS <= 30_000);
+// The new evidence can only ADD a retry case, never remove one: a transport
+// failure on an unproven endpoint is still worth its one attempt.
+ok("the endpoint evidence never suppresses a real hiccup",
+  retryPolicyFor(live({ ended: "settled" }), "Groq returned 503 — the service is overloaded, try again.", { endpointProvenThisRun: false }).retry === true);
+
+// The budget must not shrink as the prompt grows. The prompt of a later turn
+// carries the page read, the history and the frame text — the largest requests
+// of the run — and time-to-first-token scales with prompt size, so the smaller
+// budget used to land on exactly the turns most likely to be cut.
+const agentBudgetSource = await readFile("src/background/agent.ts", "utf8");
+ok("every non-retry turn gets the same first-output budget (no cold/continuation split)",
+  /retry \? RETRY_FIRST_OUTPUT_MS : FIRST_OUTPUT_TIMEOUT_MS/.test(agentBudgetSource) &&
+  !/isColdTurn \? FIRST_OUTPUT_TIMEOUT_COLD_MS/.test(agentBudgetSource));
+ok("the loop hands the retry policy the endpoint evidence instead of the message alone",
+  /retryPolicyFor\(firstTurnLiveness, firstMessage, \{[\s\S]{0,120}?endpointProvenThisRun: endpointServedThisRun/.test(agentBudgetSource));
+ok("and that evidence is set where a turn actually resolved",
+  /turn = await runPlannerTurn\(new AbortController\(\), firstTurnLiveness\);\n\s*endpointServedThisRun = true;/.test(agentBudgetSource) &&
+  /runPlannerTurn\(new AbortController\(\), newTurnLiveness\(\), true\);\n\s*endpointServedThisRun = true;/.test(agentBudgetSource));
 ok("a status-coded transport failure is still retried once",
   retryPolicyFor(live({ ended: "settled" }), "Groq returned 503 — the service is overloaded, try again.").retry === true,
   "the one case a retry genuinely resolves");
@@ -3456,6 +3653,35 @@ ok("tampering with the FIRST entry is detected (the old check was tautological)"
   JSON.stringify(headCheck));
 ok("and the summary names the tampered entry",
   (headCheck.chainReasons ?? []).some((r) => /entry 1/.test(r)), JSON.stringify(headCheck.chainReasons));
+// The seq alone is not actionable: the ledger holds 500 entries and the reader
+// needs to know WHICH write to look at. Reported live as "Hash mismatch: entry
+// 1512 does not match its recorded digest" with no way to tell whether that was
+// a snapshot, a redaction or a verification.
+ok("and it names the entry's TYPE, which is the only handle on which write it was",
+  (headCheck.chainReasons ?? []).some((r) => /entry 1 \(snapshot\)/.test(r)),
+  JSON.stringify(headCheck.chainReasons));
+// A lone surrogate in a page title — the high half of an emoji that an earlier
+// `slice()` cut in half — was a candidate cause for that mismatch, so it is
+// pinned as a NEGATIVE result rather than left as a theory: JSON escaping makes
+// the stored form byte-identical to the hashed form, so this class is ruled out.
+await clearLedger();
+const loneTitle = "title \uD83D\uDE00".slice(0, 7); // cut mid-pair, on purpose
+ok("the fixture really carries a lone surrogate",
+  loneTitle.length === 7 && /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(loneTitle),
+  JSON.stringify(loneTitle));
+await recordSnapshot("https://example.com/lone", loneTitle, 1);
+const loneCheck = await verifyLedgerChain(readStore().entries);
+ok("a lone surrogate in stored content does NOT break the chain (class ruled out)",
+  loneCheck.hashesIntact === true && loneCheck.valid === true,
+  JSON.stringify({ reasons: loneCheck.reasons, firstBadSeq: loneCheck.firstBadSeq }));
+// …while a real edit is still caught, which is the whole point of the chain.
+const editedStore = readStore();
+editedStore.entries[0] = { ...editedStore.entries[0], data: { ...editedStore.entries[0].data, elementCount: 999 } };
+mem.set(storedKey, editedStore);
+const editedCheck = await verifyLedgerChain(readStore().entries);
+ok("a real content edit is still detected",
+  editedCheck.hashesIntact === false && editedCheck.valid === false,
+  JSON.stringify(editedCheck.reasons));
 
 // Restore, then tamper with a middle entry's link only.
 await clearLedger();
@@ -3657,7 +3883,27 @@ const offscreenSource = await readFile(new URL("../src/offscreen/offscreen.ts", 
 ok("the shipped-frame attack is invoked on the real verification path",
   /attackShippedFrame\(originalData, shippedData/.test(offscreenSource));
 ok("and its findings feed the same escalation the OCR leaks use",
-  /reconstructionHits > 0 \|\| uncoveredFaces\.length > 0/.test(offscreenSource));
+  /reconstructionHits > 0 \|\| uncoveredFaces\.length > 0/.test(offscreenSource) ||
+  /escalationDecision\(\{[\s\S]{0,400}?attackDetails: first\.attack\.details/.test(offscreenSource));
+ok("the PIXEL findings reach the escalation decision too (the withheld-frame case)",
+  /pixelFindings: first\.pixelFindings/.test(offscreenSource));
+// The escalated record's counts must describe the image that SHIPS. They used to
+// be overwritten with the first pass's numbers while the details kept both
+// passes, so the panel could print "no uncovered face" directly above a FACE
+// COVERAGE line the second probe had just written — a face found on the REBUILT
+// frame, which is the one thing escalation cannot cover.
+ok("an escalated frame's attack counts are the second pass's own, not the first's",
+  /\.\.\.\(second\.result\.attack \?\? \{ ran: true, reconstructableRegions: 0, uncoveredFaces: 0, details: \[\] \}\),\s*details: \[/.test(offscreenSource) &&
+  // The overwrite itself must be gone. (`uncoveredFaces: uncoveredFaces.length`
+  // still appears once — as an ARGUMENT to the escalation decision, which is
+  // about the first paint and correctly uses the first pass's count.)
+  !/reconstructableRegions: reconstructionHits,/.test(offscreenSource));
+const sidePanelSource = await readFile(new URL("../src/sidepanel/sidepanel.ts", import.meta.url), "utf8");
+ok("and the panel does not claim remediation for a finding the rebuild could not fix",
+  !/remediated and re-verified/.test(sidePanelSource) &&
+  /recorded below/.test(sidePanelSource));
+ok("the rebuild condition is the decision, not a hand-written count",
+  /if \(escalation\.escalate\)/.test(offscreenSource));
 ok("an uncovered face is added to the rebuild region list (or the repaint would miss it)",
   /escalationRegions = \[/.test(offscreenSource) && /rebuildWithOpaqueMasks\(originalCanvas, escalationRegions/.test(offscreenSource));
 ok("the attack evidence is reported on the verification object",
@@ -3679,6 +3925,13 @@ const UNTOUCHED_TASKS = [
   // The report, verbatim.
   "open youtube and suggest me to Harkirat Singh yt channel",
   "i want to open harkirat singh yt channel",
+  // Voice-dictated phrasings, verbatim from the STT transcript. Here the name is
+  // the SEARCH TARGET, so a token in its place makes the run unexecutable — the
+  // planner cannot reason about <PII_1>, and the observed failure is the token's
+  // own spelling typed into the search box.
+  "open yt and search for harkirat singh and play the first video you saw",
+  "open yt and search for harkirat singh",
+  "search for harkirat singh on youtube",
   // Ordinary prose around a preposition is not an addressee.
   "go to Priya Sharma profile and download the file",
   "add Ramesh Gupta to the meeting invite",
@@ -3840,6 +4093,8 @@ const TASK_CASES = [
   { task: "use aadhaar 4111 1111 1111 for the form", want: true },
   // Parameters and prose — must NOT be tokenized.
   { task: "open youtube and suggest me to Harkirat Singh yt channel", want: false },
+  { task: "open yt and search for harkirat singh and play the first video you saw", want: false },
+  { task: "search for harkirat singh on youtube", want: false },
   { task: "find order 1234 5678 9012 in the orders page", want: false },
   { task: "open the video with id 1234567890123456", want: false },
   // Same lookalike digits, NO cue word: not an identity document, so the bare
@@ -4169,5 +4424,275 @@ ok("a renumbered id is never silently accepted without that comparison",
   !/const elExists = snapshot\?\.elements\.some/.test(agentSource2));
 
 tokenizer.clear();
+
+// ── Scenario AY: a dictated task, end to end, keeps its search target ───────
+// The chain the voice path walks, asserted at every hop rather than described:
+//
+//   STT transcript (Scribe final) → tokenizeTask → the task string the planner
+//   is prompted with → the query the executor types.
+//
+// The failure this pins is specific and was observed: the contextual name rule
+// treated "search for <name>"-shaped prose as an addressee, vaulted the name,
+// and handed the planner a token where its search target should have been. The
+// planner then typed the TOKEN'S OWN SPELLING into YouTube's search box.
+console.log("\n=== Scenario AY: a dictated task keeps its search target ===\n");
+
+const dictated = "open yt and search for harkirat singh and play the first video you saw";
+const dictatedTokenizer = new PIITokenizer();
+const dictatedPass1 = dictatedTokenizer.tokenizeTask(dictated);
+
+ok("the dictated task is not tokenized at all (no vault entries created)",
+  dictatedPass1.tokenCount === 0 && dictatedPass1.newEntries.length === 0,
+  JSON.stringify({ out: dictatedPass1.task, entries: dictatedPass1.newEntries.map((e) => e.original) }));
+ok("the task string is byte-identical to what the user said",
+  dictatedPass1.task === dictated);
+
+// Pass 2 is how agent.runTask sees it — the worker already tokenized once. Both
+// passes must agree, or the plan is built from a different sentence than the one
+// that was reported to the user.
+const dictatedPass2 = new PIITokenizer();
+dictatedPass2.tokenizeTask(dictated);
+const dictatedSecondPass = dictatedPass2.tokenizeTask(dictatedPass1.task);
+ok("an already-cleared task is unchanged by the second pass (tokenization is idempotent here)",
+  dictatedSecondPass.task === dictated && dictatedSecondPass.tokenCount === 0);
+
+// The planner's view: the prompt carries the words, and NO legend is emitted
+// (a legend with no tokens is noise the model would try to use).
+const dictatedLegend = buildTokenLegend(
+  dictatedTokenizer.getEntries().filter((e) => dictatedPass1.task.includes(e.token)),
+);
+ok("no token legend is built for a task that vaulted nothing",
+  dictatedLegend === null, String(dictatedLegend));
+const dictatedPrompt = taskPrompt(dictated, "https://www.youtube.com/results?search_query=x", "YouTube");
+ok("the planner prompt contains the name as spoken",
+  dictatedPrompt.includes("harkirat singh"),
+  dictatedPrompt.split("\n").filter((l) => l.startsWith("Task:")).join(" | "));
+ok("the planner prompt contains no vault token",
+  !/<[A-Z]+_\d+>/.test(dictatedPrompt));
+
+// The executor's view: the search target is extracted from the SAME string the
+// planner was given, so what is typed is the name — not a token's spelling.
+const searchTarget = dictatedPrompt.match(/search for ([^\n]+?)(?: and |$)/i)?.[1] ?? "";
+ok("the query the executor types is the name itself",
+  searchTarget === "harkirat singh",
+  JSON.stringify(searchTarget));
+ok("nothing in the chain ever renders the token's spelling as a search value",
+  !/PII_1/.test(dictatedPass1.task) && !/PII_1/.test(dictatedPrompt));
+
+// The counterpart: where the name IS a message payload, it is still vaulted, and
+// the token is what reaches the planner. Both halves are the same rule, so they
+// are asserted together — a fix for one that breaks the other is not a fix.
+const payloadTokenizer = new PIITokenizer();
+const payload = payloadTokenizer.tokenizeTask("send an email to harkirat singh about the video");
+ok("the same name in a message payload IS tokenized",
+  payload.tokenCount === 1 && payload.task === "send an email to <PII_1> about the video",
+  JSON.stringify(payload.task));
+ok("and the payload vault holds the name alone, not the sentence around it",
+  payload.newEntries.length === 1 && payload.newEntries[0].original === "harkirat singh",
+  JSON.stringify(payload.newEntries.map((e) => e.original)));
+
+// ── Scenario AZ: a navigation report describes the TAB, not the request ─────
+// The reported contradiction, verbatim from a run:
+//
+//   ⇢ Navigated to https://youtube.com.
+//   Page after this action — URL: https://mail.google.com/mail/u/0/
+//
+// `chrome.tabs.update({url})` resolves as soon as the navigation is REQUESTED,
+// and the outgoing document is still `status: "complete"`, so a wait keyed on
+// "complete" returned instantly, the caller read the old URL, found it valid,
+// and reported the requested one. The planner then spent turns reconciling what
+// it was told with what it could see. Both halves are driven here: the wait
+// must require the tab to actually leave the old page, and the report must name
+// the URL the tab is really on.
+console.log("\n=== Scenario AZ: a navigation report describes the tab ===\n");
+
+const { execute, TabController, sameSite } = await import("../src/background/executor.ts");
+
+ok("sameSite ignores a leading www.",
+  sameSite("https://www.youtube.com/", "https://youtube.com"));
+ok("sameSite is false across different sites",
+  !sameSite("https://mail.google.com/mail/u/0/", "https://youtube.com"));
+ok("sameSite is false when a side is unparseable rather than guessing",
+  !sameSite("chrome-error://chromewebdata/", "https://youtube.com"));
+
+const realChrome = globalThis.chrome;
+const realDateNow = Date.now;
+
+/**
+ * Answer `chrome.tabs.get` from a scripted list; `update`/`create` are recorded.
+ * The LAST entry repeats forever, which is how "the tab never moved" is spelled.
+ */
+function stubTabs(entries) {
+  let index = 0;
+  const calls = { update: [], create: [], remove: [] };
+  const next = () => entries[Math.min(index++, entries.length - 1)];
+  globalThis.chrome = {
+    ...realChrome,
+    tabs: {
+      get: async () => next(),
+      update: async (tabId, props) => {
+        calls.update.push({ tabId, props });
+        return { id: tabId, ...props };
+      },
+      create: async (props) => {
+        calls.create.push(props);
+        return { id: 99, ...props };
+      },
+      query: async () => [],
+      remove: async (id) => { calls.remove.push(id); },
+      goBack: async () => undefined,
+      sendMessage: async () => ({ ok: true }),
+    },
+  };
+  return calls;
+}
+
+// The tab is still on Gmail (and still reports COMPLETE) for the first poll,
+// then lands on YouTube. The old code returned on the first poll and reported
+// the requested URL as though the tab had arrived.
+stubTabs([
+  { url: "https://mail.google.com/mail/u/0/", status: "complete" },
+  { url: "https://mail.google.com/mail/u/0/", status: "complete" },
+  { url: "https://www.youtube.com/", status: "complete" },
+  { url: "https://www.youtube.com/", status: "complete" },
+]);
+const landed = await execute(new TabController(1), {
+  name: "navigate", input: { url: "https://youtube.com", reason: "open yt" },
+});
+ok("a navigation that lands is reported as success", landed.result.ok === true, JSON.stringify(landed.result));
+ok("and the report names the URL the tab actually landed on (redirects included)",
+  landed.result.detail.includes("https://www.youtube.com/"),
+  landed.result.detail);
+ok("so the action report cannot disagree with the page read that follows it",
+  !/Navigated to https:\/\/youtube\.com\/\.$/.test(landed.result.detail),
+  landed.result.detail);
+
+// The tab never leaves the old page. Deadline forced past so the real wait loop
+// exits on its own terms without an 8-second sleep in the suite.
+stubTabs([{ url: "https://mail.google.com/mail/u/0/", status: "complete" }]);
+Date.now = () => realDateNow() + 60_000;
+const stuck = await execute(new TabController(1), {
+  name: "navigate", input: { url: "https://youtube.com", reason: "open yt" },
+});
+Date.now = realDateNow;
+ok("a navigation that never takes effect is NOT reported as success",
+  stuck.result.ok === false, JSON.stringify(stuck.result));
+ok("the failure names the page the tab is still on",
+  /still on https:\/\/mail\.google\.com\/mail\/u\/0\//.test(stuck.result.detail),
+  stuck.result.detail);
+ok("and says plainly that the page was not replaced",
+  /NOT replaced/.test(stuck.result.detail), stuck.result.detail);
+
+// Asking for the site the tab is already on is a no-op, not a failure — the
+// guard must not turn "open youtube" while on YouTube into an error.
+stubTabs([{ url: "https://www.youtube.com/feed/subscriptions", status: "complete" }]);
+Date.now = () => realDateNow() + 60_000;
+const alreadyThere = await execute(new TabController(1), {
+  name: "navigate", input: { url: "https://youtube.com", reason: "open yt" },
+});
+Date.now = realDateNow;
+ok("re-navigating to the site the tab is already on is a no-op, not a failure",
+  alreadyThere.result.ok === true, JSON.stringify(alreadyThere.result));
+
+// A new tab reports where it actually landed, not where it was asked to go.
+stubTabs([{ url: "https://www.youtube.com/", status: "complete" }]);
+const opened = await execute(new TabController(1), {
+  name: "open_tab", input: { url: "https://youtube.com", reason: "open yt" },
+});
+ok("a new tab reports the URL it actually landed on",
+  /Opened https:\/\/www\.youtube\.com\//.test(opened.result.detail), opened.result.detail);
+
+stubTabs([{ url: "https://www.youtube.com/", status: "complete" }]);
+const restricted = await execute(new TabController(1), {
+  name: "navigate", input: { url: "chrome://history" },
+});
+ok("a browser-internal destination is still refused outright",
+  restricted.result.ok === false && /only http\/https/.test(restricted.result.detail),
+  restricted.result.detail);
+
+globalThis.chrome = realChrome;
+
+// ── Scenario BA: three ways a run gets stuck, and the advice differs ───────
+// The second transcript's shape, taken from the real action stream:
+//
+//   read_page · read_page · find_text("harkirat singh") · read_page ·
+//   read_page · find_text("Videos") · find_text("harkirat") · find_text("1 day ago")
+//
+// Nothing repeats consecutively and no two signatures are equal, so the old
+// guard (consecutive repeats + a signature-matched A→B→A→B) was blind to it and
+// the run died in a planner stall ~60 s later instead.
+console.log("\n=== Scenario BA: action-loop detection, all three shapes ===\n");
+
+const { actionLoopFinding, LOOP_THRESHOLD, LOOP_WINDOW } = await import("../src/background/tools.ts");
+const stamp = (name, signature = name) => ({ name, signature });
+
+ok("LOOP_THRESHOLD and LOOP_WINDOW are the policy's own constants",
+  LOOP_THRESHOLD === 3 && LOOP_WINDOW === 5);
+ok("a run below the threshold is never called a loop",
+  actionLoopFinding([stamp("read_page"), stamp("read_page")]) === null);
+
+// 1. Consecutive repeat.
+const repeated = [stamp("read_page"), stamp("read_page"), stamp("read_page")];
+ok("three identical actions are a repeat, and it names the action",
+  actionLoopFinding(repeated)?.kind === "repeat" && actionLoopFinding(repeated).action === "read_page");
+ok("the same action with a DIFFERENT argument is not a repeat",
+  actionLoopFinding([stamp("click_text", "a"), stamp("click_text", "b"), stamp("click_text", "c")]) === null);
+
+// 2. Oscillation with identical arguments.
+const oscillating = [
+  stamp("click_text", "Google apps"), stamp("find_text", "menu"),
+  stamp("click_text", "Google apps"), stamp("find_text", "menu"),
+];
+ok("A→B→A→B with identical arguments is an oscillation, and names both sides",
+  actionLoopFinding(oscillating)?.kind === "oscillation" &&
+    actionLoopFinding(oscillating).action === "find_text" &&
+    actionLoopFinding(oscillating).other === "click_text",
+  JSON.stringify(actionLoopFinding(oscillating)));
+
+// 3. The shape that used to be invisible: read-only actions only, fresh
+//    argument each time.
+const reported = [
+  stamp("read_page"), stamp("read_page"), stamp("find_text", "harkirat singh"),
+  stamp("read_page"), stamp("read_page"),
+];
+const finding = actionLoopFinding(reported);
+ok("a full window of LOOKING turns is a loop even when every query is new",
+  finding?.kind === "observation", JSON.stringify(finding));
+ok("and it names which read-only actions were cycling",
+  finding.kind === "observation" && finding.actions.includes("read_page") && finding.actions.includes("find_text"),
+  JSON.stringify(finding));
+ok("a shorter stretch of looking is not yet a loop",
+  actionLoopFinding(reported.slice(0, 4)) === null);
+
+// Scrolling cannot be part of an observation loop: it is how the target below
+// the fold is reached, and it IS progress. A guard that fired here would forbid
+// the very remedy its advice recommends.
+ok("a window containing a scroll is not an observation loop",
+  actionLoopFinding([
+    stamp("read_page"), stamp("find_text", "x"), stamp("scroll", "down"),
+    stamp("read_page"), stamp("find_text", "y"),
+  ]) === null);
+ok("and neither is a window containing a click or a type",
+  actionLoopFinding([
+    stamp("read_page"), stamp("find_text", "x"), stamp("click_text", "Next"),
+    stamp("read_page"), stamp("type", "query"),
+  ]) === null);
+ok("an unknown tool counts as progress, not as looking (the conservative read)",
+  actionLoopFinding([
+    stamp("read_page"), stamp("find_text", "x"), stamp("some_future_tool"),
+    stamp("read_page"), stamp("find_text", "y"),
+  ]) === null);
+
+// The guard is wired to the verdict and the diagnostics are the finding's own —
+// a repeat must not be reported with observation wording, or vice versa.
+ok("the loop guard asks the shared policy",
+  /const loopFinding = actionLoopFinding\(recentActions\)/.test(agentSource2));
+ok("the diagnostics come from the finding, so the words match the shape",
+  /loopFinding\.kind === "repeat"/.test(agentSource2) &&
+    /loopFinding\.kind === "oscillation"/.test(agentSource2) &&
+    /LOOP_WINDOW\} turns in a row only LOOKED at the page/.test(agentSource2));
+ok("the old boolean guard is gone (no second copy of the policy in the loop)",
+  !/function isLooping\(\)/.test(agentSource2) &&
+    !/recentActions\.every\(\(a\) => !actionChangesFrame/.test(agentSource2));
 
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

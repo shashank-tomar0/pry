@@ -468,7 +468,7 @@ export interface ElevenLabsSettings {
   apiKey: string;
   /** Voice id for spoken output (ElevenLabs voice id). */
   voiceId: string;
-  /** Hold-to-talk voice task input via Scribe Realtime. */
+  /** Tap-to-toggle voice task input via Scribe Realtime (tap to start, tap again to send). */
   sttEnabled: boolean;
   /** Spoken narration + final answers via streaming TTS. */
   ttsEnabled: boolean;

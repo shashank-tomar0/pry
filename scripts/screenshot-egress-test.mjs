@@ -202,6 +202,50 @@ ok(
   JSON.stringify(dupReasons.reasons),
 );
 
+// ── 5b. One residual is ONE finding, and it names the region ───────────────
+// Verbatim from a reported run: "Screenshot withheld: Residual sensitive content
+// detected; 1 residual detection(s) survived the redaction pass; Mask verification
+// unsuccessful." Three phrases for one region, none of which said WHICH region —
+// so the question that decides whether this is a real leak or a mask painted in the
+// wrong place had no answer in the transcript. The verifier already produced the
+// answer (label, kind and pixel coordinates); it just never left the evidence.
+const LEAK = 'PIXEL: "Email address" (credential) at 412,180 was not visibly redacted — original content may still be visible.';
+const residualOffscreen = deriveOffscreenProtection({
+  faceScanRan: true,
+  finalScanRan: true,
+  residualDetections: 1,
+  residualDetails: [LEAK],
+  policyEnabled: true,
+});
+const withheldFrame = pipelineFrame({
+  offscreenEvidence: residualOffscreen,
+  verification: { verified: false, regionsChecked: 2, regionsRedacted: 1, leakedPatterns: [LEAK] },
+});
+const withheld = screenshotSendDecision(withheldFrame);
+ok("a residual the verifier already named does not also appear as two generic phrases",
+  withheld.reasons.length === 1 &&
+  !withheld.reasons.includes("Residual sensitive content detected") &&
+  !withheld.reasons.includes("Mask verification unsuccessful"),
+  JSON.stringify(withheld.reasons));
+ok("and the one reason it does report says which region, with coordinates",
+  withheld.reasons[0].includes("PIXEL:") && withdrawnCoordinates(withheld.reasons[0]),
+  withheld.reasons[0]);
+function withdrawnCoordinates(reason) {
+  return /at 412,180/.test(reason) && /Email address/.test(reason);
+}
+ok("the frame is still refused — naming the region is not a reason to ship it",
+  withheld.allowed === false);
+
+// A frame whose verification failed for a DIFFERENT reason must still say so: the
+// de-duplication is specifically about the same finding being reported twice, not
+// about suppressing mask failures.
+const otherFailure = pipelineFrame({
+  verification: { verified: false, regionsChecked: 2, regionsRedacted: 1, leakedPatterns: [] },
+});
+ok("a verification failure that is not a residual still reports itself",
+  screenshotSendDecision(otherFailure).reasons.includes("Mask verification unsuccessful"),
+  JSON.stringify(screenshotSendDecision(otherFailure).reasons));
+
 // ── 6. Bad encodings block ────────────────────────────────────────────────
 ok(
   "a non-image payload is refused",

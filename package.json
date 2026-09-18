@@ -12,7 +12,7 @@
     "demo:serve": "node scripts/demo-serve.mjs",
     "bench:latency": "node scripts/latency-bench.mjs",
     "check:ai": "node scripts/ai-live-check.mjs",
-    "verify": "esbuild scripts/verify-pipeline.mjs --bundle --platform=node --format=esm --outfile=scripts/.verify-out.mjs && esbuild src/content/tripwire.ts --bundle --format=iife --platform=browser --target=chrome120 --outfile=scripts/.tripwire-iife.js && node scripts/.verify-out.mjs && node scripts/tripwire-test.mjs && node scripts/ocr-test.mjs && node scripts/screenshot-egress-test.mjs && node scripts/offscreen-integration-test.mjs && node scripts/agent-frame-audit-test.mjs"
+    "verify": "esbuild scripts/verify-pipeline.mjs --bundle --platform=node --format=esm --outfile=scripts/.verify-out.mjs && esbuild src/content/tripwire.ts --bundle --format=iife --platform=browser --target=chrome120 --outfile=scripts/.tripwire-iife.js && node scripts/.verify-out.mjs && node scripts/tripwire-test.mjs && node scripts/ocr-test.mjs && node scripts/screenshot-egress-test.mjs && node scripts/offscreen-integration-test.mjs && node scripts/agent-frame-audit-test.mjs && node scripts/voice-test.mjs"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.287",

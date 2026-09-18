@@ -6,9 +6,11 @@
  *  - Mic capture: getUserMedia -> AudioWorklet (16 kHz PCM16) -> base64 frames
  *    into the Scribe WebSocket. Audio buffers are dropped the moment a chunk
  *    is sent; nothing is persisted.
- *  - Hold-to-talk: capture starts on press and stops on release, at which
- *    point Scribe's `commit()` is called and the final transcript is fed into
- *    submit().
+ *  - Tap-to-toggle: one tap on the mic opens capture, and the NEXT tap closes
+ *    it, at which point Scribe's `commit()` is called and the final transcript
+ *    is fed into submit(). Nothing here listens for press/release: the button
+ *    is a toggle, and this module only exposes startListening/stopListening
+ *    for the panel's click handler to call (see voice-core.micToggleAction).
  *  - TTS: subscribe to the final-answer transcript stream and play each
  *    step's text through the shared AudioContext. Spoken text is run through
  *    voice-core.toSpeakable(), which is the single decision about what may be
@@ -81,6 +83,18 @@ export class VoiceController {
   /** Resolved the moment a committed transcript arrives (or the session dies). */
   private finalWaiter: (() => void) | null = null;
   private heardFinal = false;
+  /**
+   * True when the server committed a transcript that contained no words.
+   *
+   * Distinct from `heardFinal` on purpose. `heardFinal` means "the server
+   * answered", which is what unblocks the commit wait; it is also what the
+   * end-of-recording diagnostic used to be keyed on, so the common empty
+   * utterance — tap, say nothing (or a muted input device), tap to send — set
+   * `heardFinal = true`, skipped the "no transcript" branch, and produced no
+   * feedback whatsoever. From the outside that is a dead button: the recording
+   * badge had appeared, so the user believed words were captured.
+   */
+  private finalWasEmpty = false;
   private readonly config: VoiceControllerConfig;
   private callbacks: VoiceControllerCallbacks;
 
@@ -93,13 +107,20 @@ export class VoiceController {
     return this.state === "listening" || this.state === "connecting";
   }
 
-  /** Begin hold-to-talk capture: opens mic, connects Scribe, streams audio. */
+  /**
+   * Begin dictation capture: opens mic, connects Scribe, streams audio.
+   *
+   * Idempotent by design — this is what makes the button a toggle rather than
+   * a press/release pair. A second call while a recording is open is a no-op,
+   * so a double-tap cannot open two mic streams or lose the first utterance.
+   */
   async startListening(): Promise<void> {
     if (this.isListening) return;
     this.stopSpeaking();
     this.cancelListening = false;
     this.framesSent = 0;
     this.heardFinal = false;
+    this.finalWasEmpty = false;
     this.finalWaiter = null;
     try {
       this.setState("connecting");
@@ -150,6 +171,10 @@ export class VoiceController {
         onFinal: (text) => {
           const trimmed = text.trim();
           this.heardFinal = true;
+          // A committed-but-wordless transcript is a real answer, so record it:
+          // stopListening() reads this to tell "heard nothing" apart from "the
+          // session never answered" (see the class comment on finalWasEmpty).
+          this.finalWasEmpty = trimmed.length === 0;
           this.finalWaiter?.();
           this.finalWaiter = null;
           this.callbacks.onFinal?.(trimmed);
@@ -157,7 +182,7 @@ export class VoiceController {
             this.config.submitTask(trimmed);
             this.config.setUserEntryText("");
           }
-          void this.stopListening();
+          this.finishUtterance();
         },
         onClose: (reason) => {
           // Session dropped: unblock stopListening so the button never hangs.
@@ -246,14 +271,39 @@ export class VoiceController {
     }
   }
 
-  /** Stop capture and commit the in-flight utterance. */
+  /**
+   * Close the session once the server has delivered a final transcript.
+   *
+   * Deliberately NOT `stopListening()`. That method's whole job is to COMMIT the
+   * in-flight utterance, and its only caller on this path is the commit it just
+   * sent — so calling it from `onFinal` re-entered itself and pushed a SECOND
+   * commit frame on a session that had already committed. A redundant commit is
+   * answered with a throttle/duplicate event, which the error branch below would
+   * surface as a failure line after an otherwise clean dictation, and it made
+   * "how many commits did one tap-to-send produce?" depend on microtask
+   * ordering between the re-entrant call and the first one's cleanup.
+   * Tearing down instead is both cheaper and deterministic: no commit, mic
+   * released, state back to idle so the next tap starts a new recording.
+   */
+  private finishUtterance(): void {
+    // Set first: the socket is about to close, and a close that was the
+    // pipeline's own doing must not be reported as a dropped session.
+    this.cancelListening = true;
+    this.cleanup();
+  }
+
+  /**
+   * Stop capture and commit the in-flight utterance — the "send" half of the
+   * toggle. Safe to call when nothing is open (it returns immediately).
+   */
   async stopListening(): Promise<void> {
     if (!this.scribe && !this.isListening) return;
     this.cancelListening = true;
     const scribe = this.scribe;
-    // Quick taps release before the session is live; a commit on a socket that
-    // has not received session_started is accepted but produces no transcript,
-    // so the utterance is silently lost. Wait for the session, then commit.
+    // A tap-to-send can land before the session is live (the user taps twice in
+    // quick succession); a commit on a socket that has not received
+    // session_started is accepted but produces no transcript, so the utterance
+    // is silently lost. Wait for the session, then commit.
     if (scribe) {
       if (scribe.isOpen) {
         const finalArrived = new Promise<void>((resolve) => {
@@ -270,12 +320,22 @@ export class VoiceController {
         ]);
       }
       // Silence here is the failure mode that used to look like a dead button:
-      // say exactly which half (capture vs. transcript) came up empty.
+      // say exactly which third (capture, words, or the server itself) came up
+      // empty. Three cases, because the fix for each is different and the old
+      // two-way check merged the middle one into the first.
       if (!this.heardFinal) {
         this.callbacks.onError?.(
           this.framesSent === 0
             ? "No microphone audio was captured - grant mic access to the side panel and try again."
             : "Scribe returned no transcript. Check that the ElevenLabs key is valid and has STT quota.",
+        );
+      } else if (this.finalWasEmpty) {
+        // The server answered, it just heard no words. Saying "check your
+        // ElevenLabs quota" here sent the user to their billing page over a
+        // muted microphone, so say what to check instead.
+        this.callbacks.onError?.(
+          "Scribe heard no words in that recording, so nothing was sent. Check that the input " +
+            "device is not muted, then tap the mic and speak.",
         );
       }
     }

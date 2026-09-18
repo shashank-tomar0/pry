@@ -254,3 +254,85 @@ export const READ_ONLY_ACTIONS = new Set(["find_text", "wait", "read_page"]);
 export function actionChangesFrame(actionName: string): boolean {
   return !READ_ONLY_ACTIONS.has(actionName);
 }
+
+// ─── Action-loop detection ──────────────────────────────────────────────────
+//
+// Where the agent gets stuck. Pure (it takes names and signatures, nothing
+// else) and exported so the three shapes are pinned by the harness instead of
+// being read out of a closure in the middle of the agent loop.
+
+/** Identical action+signature, this many turns running. */
+export const LOOP_THRESHOLD = 3;
+/** How many recent actions the checks look at. */
+export const LOOP_WINDOW = 5;
+
+/** One recorded action. `signature` is already semantic (role+name for a click
+ *  on an element id), because ids are re-issued on every snapshot. */
+export interface ActionStamp {
+  name: string;
+  signature: string;
+}
+
+/** Why a run of recent actions looks stuck. */
+export type ActionLoopFinding =
+  /** Same action, same argument, LOOP_THRESHOLD turns running. */
+  | { kind: "repeat"; action: string }
+  /** A -> B -> A -> B with identical arguments: two states, no progress. */
+  | { kind: "oscillation"; action: string; other: string }
+  /** A full window of turns that only LOOKED at the page. */
+  | { kind: "observation"; actions: string[] };
+
+/**
+ * The loop verdict for the recent actions, or null when the run is making
+ * progress. The three shapes are separate because they need three different
+ * sentences: "read_page repeated 3 times" is wrong (and misleading) for an
+ * alternation, and a wrong diagnosis is how the planner repeats the very thing
+ * it was told to stop.
+ *
+ * The third shape is the one that used to be missed entirely: alternating
+ * READ-ONLY actions with a fresh argument each time — `read_page`,
+ * `find_text("harkirat singh")`, `read_page`, `find_text("Videos")`,
+ * `find_text("1 day ago")` … — repeats nothing consecutively and has no two
+ * equal signatures to oscillate between, yet cannot change the page, so the
+ * next snapshot is guaranteed to be the one the agent already has.
+ */
+export function actionLoopFinding(
+  recent: readonly ActionStamp[],
+): ActionLoopFinding | null {
+  if (recent.length < LOOP_THRESHOLD) return null;
+
+  // 1. Consecutive identical action.
+  const last = recent[recent.length - 1];
+  let count = 0;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    if (recent[i].name === last.name && recent[i].signature === last.signature) count++;
+    else break;
+  }
+  if (count >= LOOP_THRESHOLD) return { kind: "repeat", action: last.name };
+
+  // 2. Oscillation (A -> B -> A -> B).
+  if (recent.length >= 4) {
+    const a1 = recent[recent.length - 1];
+    const b1 = recent[recent.length - 2];
+    const a2 = recent[recent.length - 3];
+    const b2 = recent[recent.length - 4];
+    if (
+      a1.name === a2.name && a1.signature === a2.signature &&
+      b1.name === b2.name && b1.signature === b2.signature
+    ) {
+      return { kind: "oscillation", action: a1.name, other: b1.name };
+    }
+  }
+
+  // 3. A full window of turns that could not have changed the page. Reusing
+  //    `actionChangesFrame` rather than a list of its own: which actions can
+  //    alter the page is decided in ONE place, and a second opinion here would
+  //    drift from it. Scrolling is NOT read-only, deliberately — it is how a
+  //    target below the fold is reached, and the page that comes back from a
+  //    scroll is a different page.
+  if (recent.length >= LOOP_WINDOW && recent.every((a) => !actionChangesFrame(a.name))) {
+    return { kind: "observation", actions: [...new Set(recent.map((a) => a.name))] };
+  }
+
+  return null;
+}

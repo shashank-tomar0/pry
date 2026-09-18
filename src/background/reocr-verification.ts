@@ -458,17 +458,27 @@ export function verifyRegions(
       // energy and moves a large fraction of pixels, even when the source
       // text is faint gray (placeholder text) and the mean diff stays low.
       // An untouched region keeps its sharpness and pixel identity.
-      if (softKinds.has(region.kind)) {
-        const e0 = regionGradientEnergy(original, region.x, region.y, region.width, region.height);
-        const e1 = regionGradientEnergy(redacted, region.x, region.y, region.width, region.height);
-        const changed = regionChangedFraction(original, redacted, region.x, region.y, region.width, region.height);
-        if ((e0 > 800 && e1 < Math.max(e0 * 0.45, 120)) || changed > 0.1) {
-          regionsRedacted++;
-          continue;
-        }
+      const tier = tierForKind(region.kind, policy);
+      const soft = softKinds.has(region.kind);
+      const e0 = soft ? regionGradientEnergy(original, region.x, region.y, region.width, region.height) : 0;
+      const e1 = soft ? regionGradientEnergy(redacted, region.x, region.y, region.width, region.height) : 0;
+      const changed = soft ? regionChangedFraction(original, redacted, region.x, region.y, region.width, region.height) : 0;
+      if (soft && ((e0 > 800 && e1 < Math.max(e0 * 0.45, 120)) || changed > 0.1)) {
+        regionsRedacted++;
+        continue;
       }
+      // The measurement is part of the finding. "was not visibly redacted" is
+      // the same sentence whether the paint never landed (0% changed) or a
+      // correct repaint of a wide, padded field missed a share-of-pixels bar by
+      // a hair — and those two want opposite responses. Reported without
+      // numbers, one withheld frame became an unresolvable question in the
+      // transcript; with them, the reader can see which side of the bar it fell
+      // on and on what tier.
       leakedPatterns.push(
-        `PIXEL: "${region.label}" (${region.kind}) at ${region.x},${region.y} was not visibly redacted — original content may still be visible.`,
+        `PIXEL: "${region.label}" (${region.kind}, ${tier} tier) at ${region.x},${region.y} was not visibly ` +
+        `redacted — ${(changed * 100).toFixed(1)}% of its pixels changed (bar: 10%), its sharpness ` +
+        `${e0 > 0 ? `${Math.round(e0)} → ${Math.round(e1)}` : "was unmeasurable"}, and the mean pixel ` +
+        `difference was ${diff.toFixed(3)} (bar: 0.12) — the original content may still be readable.`,
       );
     } else {
       // No original for comparison: a mask or a low-variance (blurred/uniform)
@@ -520,6 +530,57 @@ export function emptyVerification(timestamp: number = Date.now()): VerificationR
     // same claim. The panel renders this state as neutral, not as a pass.
     summary: "Nothing to verify on this frame — no region was flagged for redaction.",
     timestamp,
+  };
+}
+
+/**
+ * Should the frame be rebuilt with every region destroyed, and why?
+ *
+ * The rebuilt frame is the remedy for a first paint that did not hold: it
+ * repaints from the untouched original with an opaque fill, re-encodes, and
+ * re-verifies. The escalation used to be triggered only by the findings the
+ * adversarial pass can name — an OCR re-read still legible, a blur proved
+ * recoverable, a face the pipeline never covered. A PIXEL finding was not a
+ * trigger, so a frame whose only problem was exactly what the rebuild fixes was
+ * withheld from the model instead: `residualDetections` stayed at 1, the egress
+ * gate refused the frame, and the vision channel was lost for a region the
+ * pipeline already knew how to destroy.
+ *
+ * The two outcomes are not symmetric. A withheld frame costs the whole visual
+ * channel; an opaque repaint costs one rectangle of the image and can only
+ * reduce what is readable. So every finding the verifier can name is now worth
+ * a rebuild.
+ *
+ * This also settles the ambiguous case in the record rather than in prose. If
+ * the failing measurement was an artifact — a destroyed region that JPEG
+ * ringing leaves a few percent short of opaque, or a correct surrogate on a
+ * wide padded field that misses the share-of-pixels bar — the repaint is
+ * indistinguishable, the second pass fails the same way, and the record reads
+ * "escalated and still failing" with the region, its tier and its numbers. A
+ * real unpainted region cannot survive the rebuild at all. Either way the
+ * answer to "was that a leak or the verifier?" is in the frame's own record.
+ */
+export function escalationDecision(input: {
+  /** Values the OCR re-read could still read inside a region. */
+  ocrLeaks: readonly string[];
+  /** Soft regions the reconstruction probe proved recoverable. */
+  reconstruction: number;
+  /** Faces the detector still finds outside every destroyed region. */
+  uncoveredFaces: number;
+  /** The adversarial pass's evidence lines (one per reconstruction/face hit). */
+  attackDetails: readonly string[];
+  /** `PIXEL:` findings from the first pixel verification pass. */
+  pixelFindings: readonly string[];
+}): { escalate: boolean; reasons: string[] } {
+  const reasons = [
+    ...input.ocrLeaks.map((leak) => `OCR: ${leak} was still readable in a soft region`),
+    ...input.attackDetails,
+    ...input.pixelFindings.map((finding) => `${finding} The first paint did not hold.`),
+  ];
+  return {
+    escalate:
+      input.ocrLeaks.length + input.reconstruction + input.uncoveredFaces + input.pixelFindings.length > 0,
+    reasons: [...new Set(reasons)],
   };
 }
 

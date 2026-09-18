@@ -8,7 +8,7 @@
  *     must never be sent from the extension).
  *   - Token + model id + audio format + commit strategy are connection query
  *     params. commit_strategy=manual is explicit: we call commit() ourselves
- *     when the mic is released, so VAD must not race us.
+ *     when the user taps the mic again to send, so VAD must not race us.
  *   - The ONLY client message the server accepts is an InputAudioChunk:
  *       { message_type: "input_audio_chunk", audio_base_64, commit, sample_rate }
  *     `message_type`, `audio_base_64`, `commit` and `sample_rate` are all
@@ -93,8 +93,9 @@ export function scribeWebSocketUrl(token: string): string {
   u.searchParams.set("model_id", SCRIBE_MODEL);
   u.searchParams.set("audio_format", SCRIBE_AUDIO_FORMAT);
   u.searchParams.set("sample_rate", String(SCRIBE_SAMPLE_RATE));
-  // Manual commit: the mic button's release is the end-of-utterance signal,
-  // so server-side VAD must not commit a segment out from under us.
+  // Manual commit: the mic button's second tap ("send") is the
+  // end-of-utterance signal, so server-side VAD must not commit a segment out
+  // from under us.
   u.searchParams.set("commit_strategy", "manual");
   return u.toString();
 }
@@ -197,7 +198,7 @@ export class ScribeConnection {
     return this.isReady;
   }
 
-  /** Wait for the socket to open (quick taps release before onopen fires). */
+  /** Wait for the socket to open (a quick second tap can precede onopen). */
   async waitForOpen(timeoutMs = 2000): Promise<boolean> {
     if (this.isOpen) return true;
     const deadline = Date.now() + timeoutMs;

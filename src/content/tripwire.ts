@@ -1,10 +1,24 @@
 /**
  * PRY Egress Tripwire (MAIN World)
  *
- * Injected at document_start in the MAIN execution world.
- * Hooks window.fetch, XMLHttpRequest, and navigator.sendBeacon to inspect outbound
- * payloads for unauthorized PII leakage (Aadhaar, Credit Cards, PAN, Emails)
- * to third-party trackers or external endpoints.
+ * Injected at document_start in the MAIN execution world. Hooks window.fetch,
+ * XMLHttpRequest and navigator.sendBeacon to inspect outbound payloads for
+ * PII-shaped values (Aadhaar, cards, PAN, email) and reports them to the panel.
+ *
+ * IT DOES NOT BLOCK ANYTHING. Every hook calls through to the original
+ * unchanged, and it always has — the code says "fail open", the alert says
+ * "observed". The old wording ("Intercepted N third-party PII leaks") claimed a
+ * prevention this script has never performed, which is the kind of claim a
+ * privacy tool must not make: a user who believes the wire is being filtered
+ * stops looking. The console line, the alert detail and the radar badge now all
+ * say the same thing the code does.
+ *
+ * IT IGNORES THE SITE'S OWN TRAFFIC. A page sending your address to its own
+ * backend is the site doing its job — Gmail's compose autosave is only a leak
+ * if Google is the attacker — and counting that as a third-party leak is how a
+ * live run showed "2 third-party PII leaks intercepted" for the address the
+ * user had just asked PRY to email. Those still appear in the radar, labelled
+ * same-site; they no longer raise a third-party alarm.
  */
 
 import {
@@ -135,17 +149,80 @@ import { isAadhaarNumber, luhnValid } from "../shared/checksums";
     return { found: false };
   }
 
+  // ─── Whose destination is this? ───────────────────────────────────────────
+  //
+  // The page's own origin, and an approximate registrable domain to compare a
+  // destination against. A content script has no public-suffix list to consult,
+  // so this is deliberately simple: the last two labels, or three for the
+  // country-code second levels that would otherwise split one company in two
+  // (co.uk, com.au, co.in …). It errs toward "same site", because the point of
+  // the classification is to stop alarming on the site's own traffic, and a
+  // quiet same-site call is a smaller failure than a false exfiltration alarm.
+  const PAGE_HOST = (() => {
+    try {
+      return location.hostname ?? "";
+    } catch {
+      return "";
+    }
+  })();
+
+  function siteOf(host: string): string {
+    const clean = host.toLowerCase().replace(/^www\./, "");
+    const parts = clean.split(".");
+    if (parts.length <= 2) return clean;
+    const lastTwo = parts.slice(-2).join(".");
+    if (/^(?:com|co|org|net|gov|ac|edu|or|ne)\.[a-z]{2}$/.test(lastTwo)) {
+      return parts.slice(-3).join(".");
+    }
+    return lastTwo;
+  }
+
+  /**
+   * Is this request leaving the site the user is actually on?
+   *
+   * `false` means "not evidence of third-party exfiltration": same registrable
+   * domain as the page, a non-web scheme, or a URL this document could not
+   * resolve (a relative path is the page's own API, not somebody else's).
+   */
+  function isThirdParty(rawUrl: string): boolean {
+    try {
+      const base = (() => {
+        try {
+          return location.href;
+        } catch {
+          return undefined;
+        }
+      })();
+      const u = new URL(rawUrl, base);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+      if (!u.hostname) return false;
+      // No page origin to compare against: report it rather than drop it.
+      if (!PAGE_HOST) return true;
+      return siteOf(u.hostname) !== siteOf(PAGE_HOST);
+    } catch {
+      return false;
+    }
+  }
+
   function alertTripwire(url: string, method: string, result: TripwireScanResult) {
+    const thirdParty = isThirdParty(url);
     const detail = {
       url,
       method,
       piiType: result.kind,
       sample: result.sample,
+      thirdParty,
       timestamp: Date.now(),
     };
 
     console.warn(
-      "[PRY Egress Tripwire] Intercepted " + result.kind + " in " + method + " request to " + url,
+      "[PRY Egress Tripwire] " +
+        (thirdParty ? "Third-party" : "Same-site") +
+        " PII in " +
+        method +
+        " request to " +
+        url +
+        " — observed, not blocked",
       detail,
     );
 

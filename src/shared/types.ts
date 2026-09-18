@@ -1,4 +1,5 @@
 import type { ProviderId } from "../background/providers/types";
+import type { AuditVerificationRollup, RedactionTally } from "./metrics";
 
 /**
  * Wire types shared by the side panel, the service worker, and the content
@@ -21,6 +22,18 @@ export interface PageElement {
 
 /** What the agent knows about the page at one point in time. */
 export interface PageSnapshot {
+  /**
+   * Which page read produced these element ids, as a per-document counter.
+   *
+   * Ids are positional indices into the page's element registry, so the same
+   * number means a DIFFERENT control after any re-render — and on a fresh
+   * document it is a different registry entirely. The generation is what lets
+   * an action say which read its id came from, so the page can refuse an id
+   * from an older read instead of silently acting on whatever now sits at that
+   * index. Absent on snapshots from before this field existed; callers treat
+   * that as "unverifiable" rather than as a match.
+   */
+  generation?: number;
   url: string;
   title: string;
   /** Interactive elements plus enough text nodes to give the page meaning. */
@@ -55,6 +68,15 @@ export type ActionName =
 export interface AgentAction {
   name: ActionName;
   input: Record<string, unknown>;
+  /**
+   * The page read whose element ids this action refers to.
+   *
+   * Set by the agent loop from the snapshot it rendered for the planner — never
+   * by the model, which only ever sees a number. The page compares it against
+   * its own current read and refuses a mismatch: a positional id from an older
+   * read may point at a different control by the time the action lands.
+   */
+  snapshotGeneration?: number;
 }
 
 /** Result of executing one action, fed back to the planner as a tool result. */
@@ -145,6 +167,13 @@ export interface ProcessedScreenshotResult {
     box?: { x: number; y: number; width: number; height: number };
     confidence: number;
     label: string;
+    /**
+     * Tier actually painted for this region: `opaque` | `blur` | `surrogate` |
+     * `skip`. Optional so a record written before the field existed still
+     * parses — but a pipeline-produced detection always carries it, and the UI
+     * says `unknown` rather than guessing a tier it was not told.
+     */
+    tier?: string;
   }>;
   redactedCount: number;
   processingTimeMs: number;
@@ -180,13 +209,79 @@ export interface TranscriptEntry {
   pending?: boolean;
 }
 
-/** One MAIN-world tripwire intercept forwarded to the panel's radar drawer. */
+/** One MAIN-world tripwire alert forwarded to the panel's radar drawer. */
 export interface TripwireAlertDetail {
   url: string;
   method: string;
   piiType: string;
   sample: string;
+  /**
+   * Whether the destination is a different site from the page that sent it.
+   * `false` is the page talking to its own backend (Gmail autosaving a draft);
+   * `true` is PII leaving for somebody else. Absent means the producer could
+   * not tell, which the radar counts conservatively as third-party.
+   */
+  thirdParty?: boolean;
   timestamp: number;
+}
+
+/**
+ * The privacy-audit payload — what the panel renders as proof of one run.
+ *
+ * Named rather than inlined in the event union because it travels two ways: the
+ * service worker broadcasts it during a run (`privacy-audit`) and re-serves it
+ * on request (`get-audit`), and both the panel and the test harness assert on
+ * the same shape.
+ */
+export interface PrivacyAuditPayload {
+  screenshots: Array<{
+    original?: string;
+    redacted?: string;
+    timestamp: number;
+    /** This frame's own detections — overlay proof, never another frame's. */
+    detections?: Array<{
+      kind: string;
+      label: string;
+      confidence: number;
+      box?: { x: number; y: number; width: number; height: number };
+      /** Tier the painter recorded for this region (`opaque` | `blur` | ...). */
+      tier?: string;
+    }>;
+  }>;
+  allDetections: Array<{
+    kind: string;
+    label: string;
+    confidence: number;
+    box?: { x: number; y: number; width: number; height: number };
+    tier?: string;
+  }>;
+  allTokens: Array<{ token: string; kind: string; sample?: string }>;
+  totalRedacted: number;
+  totalScreenshots: number;
+  totalPIIDetections: number;
+  durationMs: number;
+  /**
+   * True only when a redacted frame actually left the browser (VLM vision
+   * enabled with a key). With vision off — the default — every screenshot is
+   * captured and redacted locally for the audit, and nothing is sent, so the
+   * panel must not label the frame "what shipped to the model".
+   */
+  shipped?: boolean;
+  /**
+   * The MOST RECENT frame's re-OCR verification — per-frame evidence, and the
+   * detail the audit panel draws its proof card from. It is deliberately not a
+   * run-level verdict: the badge reads `verificationRollup`, which counts every
+   * frame, because one passing frame used to license a run-wide
+   * "✓ REDACTIONS VERIFIED" even when another frame's check had failed.
+   */
+  verification?: VerificationResult;
+  /** Every frame's verification, rolled up into the claim the badge may make. */
+  verificationRollup?: AuditVerificationRollup;
+  /**
+   * The run's redaction counts, each part named by the channel that produced
+   * it, so the panel's numbers reconcile instead of merely coinciding.
+   */
+  tally?: RedactionTally;
 }
 
 /** Privacy audit snapshot — captured after each task for the judges. */
@@ -199,6 +294,7 @@ export interface PrivacyAuditSnapshot {
     label: string;
     confidence: number;
     box?: { x: number; y: number; width: number; height: number };
+    tier?: string;
   }>;
   /** Token replacements made (e.g., <CRED_1> replaced "password123"). */
   tokens: Array<{ token: string; kind: string; sample?: string }>;
@@ -211,7 +307,23 @@ export interface PrivacyAuditSnapshot {
 /** Service worker -> side panel events. */
 export type AgentEvent =
   | { kind: "entry"; entry: TranscriptEntry }
-  | { kind: "patch"; id: string; text?: string; pending?: boolean }  | { kind: "status"; running: boolean }
+  | {
+      kind: "patch";
+      id: string;
+      text?: string;
+      pending?: boolean;
+      /**
+       * Replace the entry's text instead of appending it.
+       *
+       * Assistant text normally arrives as streaming DELTAS, so a patch appends.
+       * The one case that needs the opposite is a stream that has just been
+       * declared not-language: by the time the guard sees it, the card already
+       * painted it as PRY's answer with a Copy button, and leaving it there would
+       * present the glitch as a result the run stood behind.
+       */
+      replace?: boolean;
+    }
+  | { kind: "status"; running: boolean }
   | {
       kind: "egress";
       /** Total bytes sent to remote planners this task (0 for local-only). */
@@ -221,42 +333,7 @@ export type AgentEvent =
       id: string;
       summary: string;
     }
-  | {
-      kind: "privacy-audit";
-      audit: {
-        screenshots: Array<{
-          original?: string;
-          redacted?: string;
-          timestamp: number;
-          /** This frame's own detections — overlay proof, never another frame's. */
-          detections?: Array<{
-            kind: string;
-            label: string;
-            confidence: number;
-            box?: { x: number; y: number; width: number; height: number };
-          }>;
-        }>;
-        allDetections: Array<{
-          kind: string;
-          label: string;
-          confidence: number;
-          box?: { x: number; y: number; width: number; height: number };
-        }>;
-        allTokens: Array<{ token: string; kind: string; sample?: string }>;
-        totalRedacted: number;
-        totalScreenshots: number;      totalPIIDetections: number;
-      durationMs: number;
-      /**
-       * True only when a redacted frame actually left the browser (VLM vision
-       * enabled with a key). With vision off — the default — every screenshot
-       * is captured and redacted locally for the audit, and nothing is sent,
-       * so the panel must not label the frame "what shipped to the model".
-       */
-      shipped?: boolean;
-      /** Latest re-OCR verification result, when a screenshot was redacted. */
-      verification?: VerificationResult;
-      };
-    }
+  | { kind: "privacy-audit"; audit: PrivacyAuditPayload }
   | { kind: "experience"; experience: Record<string, unknown> }
   | { kind: "tripwire-update"; alert: TripwireAlertDetail }
   | {
@@ -326,6 +403,8 @@ export type PanelCommand =
     }
   | { kind: "capture-fullpage"; tabId: number }
   | { kind: "inspect-tab"; tabId: number; fullPage?: boolean }
+  /** Re-serve the current run's privacy audit (see buildPrivacyAudit). */
+  | { kind: "get-audit" }
   | { kind: "export-ledger" };
 
 export interface Settings {
@@ -563,6 +642,8 @@ export interface InspectData {
     label: string;
     confidence: number;
     box?: { x: number; y: number; width: number; height: number };
+    /** See ProcessedScreenshotResult — the tier the painter actually applied. */
+    tier?: string;
   }>;
   redactedCount: number;
   processingTimeMs: number;

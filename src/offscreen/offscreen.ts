@@ -41,8 +41,8 @@ import {
   type PixelRect,
   type ReconstructionFinding,
 } from "../background/redaction-attack";
-import { tierForKind } from "../shared/region-paint";
-import { ocrDataUrl, ocrWordLines } from "./ocr";
+import { tierForKind, type RegionTier } from "../shared/region-paint";
+import { ocrDataUrl, ocrWordLines, warmOcrWorker } from "./ocr";
 import {
   findTriageBoxes,
   dropCoveredBoxes,
@@ -183,6 +183,17 @@ interface AuditDetection {
   box?: { x: number; y: number; width: number; height: number };
   confidence: number;
   label: string;
+  /**
+   * The tier this region was ACTUALLY painted with — recorded where the paint
+   * decision is made, not recomputed by whoever displays it.
+   *
+   * Every consumer used to re-derive this from `kind` (the inspector kept its
+   * own hand-copied rule), so a detection could be displayed as `opaque` by a
+   * viewer that disagreed with the painter — and a face left unpainted was
+   * labelled solid black on the very image meant to prove it was redacted.
+   * The tier now travels with the report.
+   */
+  tier: RegionTier;
 }
 
 interface SensitiveRegion {
@@ -475,6 +486,8 @@ async function processScreenshot(
     box?: { x: number; y: number; width: number; height: number };
     confidence: number;
     label: string;
+    /** The tier actually painted for this region. See AuditDetection. */
+    tier: RegionTier;
   }>;
   redactedCount: number;
   processingTimeMs: number;
@@ -559,6 +572,7 @@ async function processScreenshot(
         box: op.box,
         confidence: 0.95,
         label: `${op.label} — NOT redacted (destruction is off for this kind)`,
+        tier: "skip",
       });
       continue;
     }
@@ -595,6 +609,8 @@ async function processScreenshot(
       box: op.box,
       confidence: 0.95,
       label: op.label,
+      // The plan's own tier — this is the branch that painted it.
+      tier: op.tier,
     });
     // Only painted ops reach the verifier, so "regions checked" is exactly the
     // set of regions whose pixels this pipeline claims to have changed.
@@ -749,7 +765,13 @@ async function processScreenshot(
         // the audit marker inside the mask instead of on it.
         box: normalizePaintedRect({ x: rx, y: ry, width: rw, height: rh }, width, height),
         confidence: face.confidence,
-        label: destroyFaces ? "Face destroyed (opaque)" : "Face detected",
+        // A face left unpainted says so in its label as well as its tier: the
+        // old wording ("Face detected") read as a redaction on the audit image,
+        // and the inspector then labelled it `opaque`.
+        label: destroyFaces
+          ? "Face destroyed (opaque)"
+          : "Face detected — NOT redacted (destruction is off for this kind)",
+        tier: destroyFaces ? "opaque" : "skip",
       });
     }
   }
@@ -792,6 +814,8 @@ async function processScreenshot(
           ),
           confidence: 0.8,
           label: box.label,
+          // Triage paints a solid fill — the opaque tier, always.
+          tier: "opaque",
         });
         triageBoxes++;
       }
@@ -866,6 +890,8 @@ async function processScreenshot(
             box: normalizePaintedRect(box, width, height),
             confidence: 0.7,
             label: "Face found by the adversarial re-probe",
+            // Painted by the opaque rebuild, not by the original plan.
+            tier: "opaque",
           });
         }
         const second = await verifyShippedImage(redactedBlob, originalData, escalationRegions, width, height, { destroyFaces, maskCredentials });
@@ -942,6 +968,7 @@ async function processScreenshot(
       box: d.box,
       confidence: d.confidence,
       label: d.label,
+      tier: d.tier,
     })),
     // Regions actually masked on the canvas, not the number of things noticed.
     // A face that was detected while face destruction is off is a finding, not
@@ -1379,6 +1406,16 @@ chrome.runtime.onMessage.addListener(
         .then((verdict) => sendResponse({ ok: true, verdict }))
         .catch((err) => sendResponse({ ok: false, verdict: null, error: String(err) }));
       return true; // async
+    }
+
+    // ─── Warm the OCR worker ───
+    // Fire-and-forget: the self-test below warms the MODELS, but Tesseract was
+    // never warmed anywhere, so the first capture of every run paid ~10.5 s of
+    // cold start inside the user's first action. See warmOcrWorker.
+    if (message.type === "warm-ocr") {
+      warmOcrWorker();
+      sendResponse({ ok: true, warming: true });
+      return false;
     }
 
     // ─── On-device ML self-test ───

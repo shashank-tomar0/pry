@@ -1019,6 +1019,19 @@ body::after {
   display: block;
   line-height: 1;
 }
+.audit-tally {
+  /* Spans all three stat columns: the line that ADDS UP the stats above it
+     belongs under all of them, not beside one. */
+  grid-column: 1 / -1;
+  padding: 6px 8px;
+  border: 2px solid var(--color-ink);
+  background: var(--color-paper-2);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1.4;
+  text-align: center;
+  color: var(--color-ink-mute);
+}
 .audit-stat .label {
   font-family: var(--font-mono);
   font-size: 8px;
@@ -1096,6 +1109,22 @@ body::after {
   outline: 1px dashed rgba(255, 255, 255, 0.65);
   outline-offset: -2px;
 }
+/* Tier stamp on the proof overlay: which guarantee this exact box carries. */
+.shot-overlay-tier {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font-family: var(--font-mono);
+  font-size: 7px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 2px 3px;
+  background: var(--color-ink);
+  color: var(--color-paper);
+  white-space: nowrap;
+  pointer-events: none;
+}
+.shot-overlay-tier.tier-none { background: var(--color-amber, #d97706); color: #1a1a1a; }
 .zoom-frame .zoom-overlay-mark {
   border-width: 2px;
   outline: 1px dashed rgba(255, 255, 255, 0.6);
@@ -1273,6 +1302,20 @@ body::after {
   box-shadow: 2px 2px 0px var(--color-ink);
   background: var(--color-paper-2);
 }
+/* Redaction tier tag. `none` (a detected region deliberately left readable)
+   is called out in the warning colour, because it is the one label on this
+   chip that describes a leak rather than a fix. */
+.detection-chip .tier {
+  font-size: 8px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 4px;
+  border: 1px solid currentColor;
+  opacity: 0.85;
+}
+.detection-chip .tier-none { color: var(--color-amber, #d97706); border-style: dashed; }
+
 .detection-chip.face { border-color: var(--color-accent); color: var(--color-accent); }
 .detection-chip.credential { border-color: var(--color-teal); color: var(--color-teal); }
 .detection-chip.id_number { border-color: #8e44ad; color: #8e44ad; }
@@ -1900,6 +1943,18 @@ body::after {
 }
 .tl-sample { color: var(--color-teal); flex-shrink: 0; }
 .tl-time { color: var(--color-ink-mute); flex-shrink: 0; font-size: 8px; }
+/* Whose destination this was: the difference between "the site you are using
+   saved your draft" and "your data left for somebody else". */
+.tl-party {
+  flex-shrink: 0;
+  padding: 0 4px;
+  border: 1px solid var(--color-ink);
+  font-size: 7.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.tl-party.third-party { color: var(--color-accent); border-color: var(--color-accent); }
+.tl-party.same-site { color: var(--color-ink-mute); border-color: var(--color-ink-mute); }
 
 /* Outcome feedback row — learns the real outcome from the user. */
 .outcome-feedback {

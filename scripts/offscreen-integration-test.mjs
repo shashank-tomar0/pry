@@ -244,6 +244,9 @@ const STUBS = {
         : null;
     };
     export const ocrWordLines = async () => null;
+    export const warmOcrWorker = () => {
+      globalThis.__pryOcrWarmed = (globalThis.__pryOcrWarmed ?? 0) + 1;
+    };
   `,
   "../ml/ner": `
     export const detectSpans = async () => [];
@@ -454,6 +457,24 @@ async function runPipeline({ width = PAGE_WIDTH, height = PAGE_HEIGHT, sensitive
 // The module logs progress on every frame. Print this test's own lines through
 // process.stdout so the harness can silence the module without silencing itself.
 const log = (line) => process.stdout.write(`${line}\n`);
+
+// ── Warm-up: the OCR worker is started at run start, not on first capture ──
+// Tesseract's first recognition costs ~10.5 s of cold start (measured: WASM
+// core + eng data + engine init). It used to be paid inside the user's FIRST
+// capture, because nothing warmed it — the model self-test warms NER, the
+// injection guard and BlazeFace. The service worker now sends `warm-ocr` when
+// it creates the offscreen document, and this drives that exact message through
+// the real listener.
+ok(
+  "the listener accepts a warm-ocr message without handling it asynchronously",
+  capturedListener({ type: "warm-ocr" }, {}, () => {}) === false,
+);
+ok("and that message actually starts the OCR worker", (globalThis.__pryOcrWarmed ?? 0) === 1,
+  `warm calls=${globalThis.__pryOcrWarmed ?? 0}`);
+ok(
+  "the warm-up is fire-and-forget: unknown message types are still declined",
+  capturedListener({ type: "not-a-real-message" }, {}, () => {}) === false,
+);
 log("\n=== offscreen pipeline: real message path, real pixels ===\n");
 console.log = () => {};
 
@@ -558,6 +579,14 @@ ok(
   /NOT redacted/i.test(faceRun.result.detections[0].label),
   faceRun.result.detections[0].label,
 );
+// The tier is recorded by the painter, so the panel and the inspector can label
+// this box from the record instead of inferring a redaction from its kind. A
+// skipped region's badge must read `none` — the honest word — and not a tier.
+ok(
+  "and its recorded tier is `skip`, which the UI badges as `none`",
+  faceRun.result.detections[0].tier === "skip" && offscreen.tierBadge("skip") === "none",
+  `tier=${faceRun.result.detections[0].tier} badge=${offscreen.tierBadge(faceRun.result.detections[0].tier)}`,
+);
 ok("and NOT counted as a redaction", faceRun.result.redactedCount === 0, `count=${faceRun.result.redactedCount}`);
 ok(
   "and its pixels really were left alone",
@@ -619,6 +648,38 @@ const setsOn = offscreen.tierSetsFor(on);
 const setsOff = offscreen.tierSetsFor(off);
 ok("the verifier's destroyed set follows the painter's opaque tier", setsOn.destroyed.has("face") && setsOn.destroyed.has("email_text") && !setsOn.destroyed.has("password"));
 ok("and with masking off nothing is measured as opaque", setsOff.destroyed.size === 1 && setsOff.destroyed.has("face"), [...setsOff.destroyed].join(","));
+// ── 6b. The reported tier is the PLAN's tier — re-deriving it would lie ─────
+// Viewers used to recompute the tier from a detection's `kind`. That is not
+// equivalent to the paint: a generic input is REPORTED as `credential`, whose
+// derived tier would be `surrogate`, while its pixels were soft-blurred. With
+// the tier carried in the record, the label cannot disagree with the pixels.
+ok(
+  "every reported detection carries the tier it was painted with",
+  fieldRun.result.detections.every((d) => typeof d.tier === "string" && d.tier.length > 0),
+  JSON.stringify(fieldRun.result.detections.map((d) => `${d.kind}:${d.tier ?? "MISSING"}`)),
+);
+ok(
+  "each recorded tier is one the badge vocabulary can name",
+  fieldRun.result.detections.every((d) => offscreen.tierBadge(d.tier) !== null),
+  JSON.stringify(fieldRun.result.detections.map((d) => d.tier)),
+);
+ok(
+  "a generic input records `blur`, not the `surrogate` its reported kind would derive",
+  fieldRun.result.detections.find((d) => d.kind === "credential")?.tier === "blur" &&
+    offscreen.tierForKind("credential", on) === "surrogate",
+  JSON.stringify(fieldRun.result.detections.map((d) => `${d.kind}:${d.tier}`)),
+);
+ok(
+  "an unrecognised tier is reported as unknown rather than guessed",
+  offscreen.tierBadge("opaque-ish") === null && offscreen.tierBadge(undefined) === null,
+);
+ok(
+  "and every tier the vocabulary defines has a badge",
+  ["opaque", "blur", "surrogate", "skip"].every(
+    (t) => offscreen.TIER_BADGES[t] === offscreen.tierBadge(t),
+  ),
+);
+
 ok("a rewritten plan cannot drift from its ops", offsetCheck());
 
 function offsetCheck() {

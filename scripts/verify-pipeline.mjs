@@ -16,6 +16,9 @@
  */
 import assert from "node:assert";
 import { readFile } from "node:fs/promises";
+// The one copy of the observed glitch stream, shared with the agent-loop
+// harness so the two suites cannot disagree about what it contained.
+import { GLITCH_OUTPUT as SALAD } from "./fixtures/glitch-output.mjs";
 
 // ─── chrome.storage shim (what the modules call) ───────────────────────────
 const mem = new Map();
@@ -887,7 +890,7 @@ ok("structured 'From:'/'To:' labels still detect names",
 // ─── Scenario O: digit-glued tokens are repaired before resolution ─────────
 console.log("\n=== Scenario O: token concatenation repair ===\n");
 
-const { repairTokenConcatenation } = await import("../src/background/tokenizer.ts");
+const { repairTokenConcatenation, PIITokenizer: FreshTokenizer } = await import("../src/background/tokenizer.ts");
 ok("digit glued before token is stripped",
   repairTokenConcatenation("7<CRED_1>") === "<CRED_1>",
   `got ${repairTokenConcatenation("7<CRED_1>")}`);
@@ -922,6 +925,47 @@ const repaired = tokenizer.resolveAll(repairTokenConcatenation("7<CRED_1>"));
 ok("resolved value contains no digit prefix",
   repaired === "shashank.tomar.work@gmail.com",
   `got ${repaired}`);
+
+// ─── Scenario O2: re-redaction must not splice in a match OFFSET ────────────
+// With a group-less pattern, String.replace passes the callback the match
+// OFFSET as its second argument. A callback written for the word-bound
+// (one-group) pattern therefore splices that offset into the text as if it
+// were a leading delimiter. This is the bug the panel showed for an otherwise
+// CLEAN run: 'Typed "7<CRED_1>" into <input "To recipients">. Field now shows:
+// "86<CRED_1>"' — 7 and 86 being the email's offsets in each half of the
+// same string, and a snapshot value rendering as "0<CRED_1>".
+console.log("\n=== Scenario O2: re-redaction must not emit match offsets ===\n");
+
+const cleanDetail =
+  `Typed "shashank.tomar.work@gmail.com" into <input "To recipients">. ` +
+  `Field now shows: "shashank.tomar.work@gmail.com"`;
+const redactedDetail = tokenizer.redactValues(cleanDetail);
+ok("re-redacting an action detail emits no offset digits",
+  redactedDetail ===
+    `Typed "<CRED_1>" into <input "To recipients">. Field now shows: "<CRED_1>"`,
+  `got ${JSON.stringify(redactedDetail)}`);
+ok("no offset digit is glued to a token in a redacted detail",
+  !/\d<[A-Z]+_\d+>/.test(redactedDetail), `got ${JSON.stringify(redactedDetail)}`);
+
+const sweptValue = tokenizer.redactVaultValuesInSnapshot({
+  elements: [{ id: 0, role: "combobox", name: "To recipients", value: "shashank.tomar.work@gmail.com" }],
+  text: "To: shashank.tomar.work@gmail.com",
+});
+ok("snapshot value redacts to a bare token (offset 0 is not emitted)",
+  sweptValue.elements[0].value === "<CRED_1>",
+  `got ${JSON.stringify(sweptValue.elements[0].value)}`);
+ok("snapshot page text redacts to a bare token",
+  sweptValue.text === "To: <CRED_1>", `got ${JSON.stringify(sweptValue.text)}`);
+
+// Letter-run values must KEEP the delimiter their word-bound pattern captured.
+const nameTokenizer = new FreshTokenizer();
+const nameTok = nameTokenizer.tokenize("Priya Sharma", "person");
+ok("a name's leading delimiter survives re-redaction",
+  nameTokenizer.redactValues("Email Priya Sharma the report.") === `Email ${nameTok} the report.`,
+  `got ${JSON.stringify(nameTokenizer.redactValues("Email Priya Sharma the report."))}`);
+ok("…and a name at the start of a string still redacts cleanly",
+  nameTokenizer.redactValues("Priya Sharma was emailed.") === `${nameTok} was emailed.`,
+  `got ${JSON.stringify(nameTokenizer.redactValues("Priya Sharma was emailed."))}`);
 
 // ─── Scenario P: bug fixes & robustness ──────────────────────────────────
 console.log("\n=== Scenario P: bug fixes & robustness ===\n");
@@ -1141,35 +1185,53 @@ console.log("\n=== Scenario U: Tripwire Alert Aggregation ===\n");
 const { createTripwireAggregator } = await import("../src/background/tripwire-aggregator.ts");
 
 const agg = createTripwireAggregator();
-ok("fresh aggregator reports zero intercepts",
+ok("fresh aggregator reports nothing observed",
   agg.total() === 0 && agg.counts().size === 0);
-ok("fresh aggregator summary names the count",
-  agg.summary().includes("0 third-party PII leaks intercepted"));
+ok("and it claims no third-party egress rather than claiming a clean filter",
+  agg.summary() === "No third-party PII egress observed",
+  agg.summary());
 // The wire log reports a DIFFERENT number (what reached the planner), so the
 // radar's headline must name its own channel or the two panels read as
 // contradictory (0 there, 5 here).
 ok("aggregator summary scopes itself to the third-party channel",
   agg.summary().includes("third-party") && !agg.summary().includes("outbound PII leak"));
 
-agg.bump({ url: "https://mail.google.com/sync/i/fd?c=1", method: "POST", piiType: "credit_card", sample: "•••• 9411", timestamp: 1 });
-agg.bump({ url: "https://www.mail.google.com/sync/i/fd?c=2", method: "POST", piiType: "credit_card", sample: "•••• 0930", timestamp: 2 });
-agg.bump({ url: "https://analytics.thirdparty.com/log", method: "BEACON", piiType: "email", sample: "sh•••@gmail.com", timestamp: 3 });
+// The page here is Gmail itself, so its own autosave traffic is same-site. A
+// live run reported exactly this pair as "2 third-party PII leaks intercepted".
+agg.bump({ url: "https://mail.google.com/sync/i/fd?c=1", method: "POST", piiType: "credit_card", sample: "•••• 9411", thirdParty: false, timestamp: 1 });
+agg.bump({ url: "https://www.mail.google.com/sync/i/fd?c=2", method: "POST", piiType: "credit_card", sample: "•••• 0930", thirdParty: false, timestamp: 2 });
+agg.bump({ url: "https://analytics.thirdparty.com/log", method: "BEACON", piiType: "email", sample: "sh•••@gmail.com", thirdParty: true, timestamp: 3 });
 
-ok("aggregator counts 3 intercepts", agg.total() === 3);
-ok("counts by type: credit_card ×2, email ×1",
-  agg.counts().get("CREDIT_CARD") === 2 && agg.counts().get("EMAIL") === 1);
-ok("hosts are normalized (www stripped) and counted",
-  agg.hosts().get("mail.google.com") === 2 && agg.hosts().get("analytics.thirdparty.com") === 1);
+ok("every observed send is counted, both channels", agg.total() === 3);
+ok("but only the different site counts as third-party egress",
+  agg.thirdPartyTotal() === 1 && agg.sameSiteTotal() === 2,
+  `third=${agg.thirdPartyTotal()} same=${agg.sameSiteTotal()}`);
+ok("counts by type cover the third-party channel only",
+  agg.counts().get("EMAIL") === 1 && !agg.counts().has("CREDIT_CARD"),
+  JSON.stringify([...agg.counts()]));
+ok("hosts are the third-party destinations, www stripped",
+  agg.hosts().get("analytics.thirdparty.com") === 1 && !agg.hosts().has("mail.google.com"));
 const aggSummary = agg.summary();
-ok("summary headline carries the total", aggSummary.includes("3 third-party PII leaks intercepted"));
-ok("summary breaks down by type, highest first",
-  aggSummary.includes("CREDIT_CARD ×2") && aggSummary.includes("EMAIL ×1"));
-ok("summary orders types by count descending",
-  aggSummary.indexOf("CREDIT_CARD ×2") < aggSummary.indexOf("EMAIL ×1"));
+ok("summary headline carries the third-party count",
+  aggSummary.includes("1 third-party PII leak observed"), aggSummary);
+ok("summary states the limit instead of implying a block",
+  aggSummary.includes("not blocked") && !/intercepted/i.test(aggSummary), aggSummary);
+ok("same-site sends stay visible rather than being hidden",
+  aggSummary.includes("2 same-site sends"), aggSummary);
+ok("summary breaks down by type, highest first", aggSummary.includes("EMAIL ×1"));
+
+// An alert with no classification is counted conservatively: a producer that
+// cannot tell whose destination it is must not silently downgrade the alarm.
+const unclassified = createTripwireAggregator();
+unclassified.bump({ url: "https://unknown.example.net/x", method: "POST", piiType: "email", sample: "a•••@b.com", timestamp: 4 });
+ok("an unclassified alert counts as third-party, not as same-site",
+  unclassified.thirdPartyTotal() === 1 && unclassified.sameSiteTotal() === 0,
+  unclassified.summary());
 
 agg.reset();
 ok("reset clears totals, counts and hosts",
-  agg.total() === 0 && agg.counts().size === 0 && agg.hosts().size === 0);
+  agg.total() === 0 && agg.thirdPartyTotal() === 0 && agg.sameSiteTotal() === 0 &&
+    agg.counts().size === 0 && agg.hosts().size === 0);
 
 // ─── Scenario V: repeated-success strategy rules (learning from clean wins) ────
 console.log("\n=== Scenario V: repeated-success strategy rules ===\n");
@@ -1500,13 +1562,74 @@ console.log("\n=== Scenario Y: ElevenLabs voice-core privacy transforms ===\n");
 
 const {
   speakSafeTransform,
+  toSpeakable,
+  stripVaultTokens,
   containsVaultToken,
   floatTo16BitPCM,
   pcm16ToFloat32,
   bytesToBase64,
   ttsRequestBody,
   TTS_OUTPUT_FORMAT,
+  classifyMicFailure,
+  micFailureAdvice,
+  MIC_AUDIO_CONSTRAINTS,
+  MIC_FALLBACK_CONSTRAINTS,
 } = await import("../src/sidepanel/voice-core.ts");
+
+// ── Microphone permission: the manifest must actually request capture ────────
+// This is the bug that shipped: the side panel called getUserMedia with no
+// `audioCapture` permission in the manifest, so Chrome hid every input device
+// from the extension page and reported `NotFoundError: Requested device not
+// found` — which reads like a hardware problem and is not one. Nothing in the
+// suite noticed, because the permission and the call site lived in different
+// files.
+const declaredManifest = JSON.parse(await readFile("src/manifest.json", "utf8"));
+ok("the manifest declares audioCapture, which getUserMedia in an extension page requires",
+  Array.isArray(declaredManifest.permissions) && declaredManifest.permissions.includes("audioCapture"),
+  JSON.stringify(declaredManifest.permissions));
+
+// ── Mic failure diagnosis: four different problems, four different fixes ─────
+const withPermission = { hasCapturePermission: true, audioInputs: 1 };
+ok("a build without the capture permission is named as such, not blamed on hardware",
+  classifyMicFailure({ name: "NotFoundError", message: "Requested device not found", ...withPermission, hasCapturePermission: false }) === "missing-permission");
+ok("a genuine lack of devices is distinguished from a missing permission",
+  classifyMicFailure({ name: "NotFoundError", message: "Requested device not found", ...withPermission, audioInputs: 0 }) === "no-device");
+ok("a blocked/dismissed prompt is recognised from the error name",
+  classifyMicFailure({ name: "NotAllowedError", message: "Permission denied", ...withPermission }) === "blocked");
+ok("and from the legacy message wording",
+  classifyMicFailure({ name: "", message: "Permission dismissed by user", ...withPermission }) === "blocked");
+ok("a device held by another app is its own case",
+  classifyMicFailure({ name: "NotReadableError", message: "Could not start audio source", ...withPermission }) === "busy");
+ok("unsupported constraints are retryable rather than fatal",
+  classifyMicFailure({ name: "OverconstrainedError", message: "sampleRate", ...withPermission }) === "constraints");
+ok("an unrecognised failure stays honest instead of guessing a cause",
+  classifyMicFailure({ name: "WeirdError", message: "", hasCapturePermission: true, audioInputs: null }) === "unknown");
+
+// Every message must contain a next step, and must not tell the user to fix
+// hardware when the build is what is wrong.
+ok("the missing-permission advice names the permission and the fix",
+  /audioCapture/.test(micFailureAdvice("missing-permission")) &&
+    /rebuild|reload/i.test(micFailureAdvice("missing-permission")));
+ok("the blocked advice names the exact Chrome path to allow it",
+  /chrome:\/\/extensions/.test(micFailureAdvice("blocked")) &&
+    /Microphone/.test(micFailureAdvice("blocked")));
+ok("the no-device advice asks for a device rather than a permission",
+  /microphone/i.test(micFailureAdvice("no-device")) &&
+    !/audioCapture/.test(micFailureAdvice("no-device")));
+ok("every failure kind produces advice with a next step",
+  ["missing-permission", "no-device", "blocked", "busy", "constraints", "unknown"]
+    .every((k) => micFailureAdvice(k, "raw").length > 40 && micFailureAdvice(k, "raw").includes("raw")));
+ok("the tuned constraints are ideal-only (no `exact`), so a device can still satisfy them",
+  !JSON.stringify(MIC_AUDIO_CONSTRAINTS).includes("exact") &&
+    !JSON.stringify(MIC_AUDIO_CONSTRAINTS).includes("min") &&
+    MIC_FALLBACK_CONSTRAINTS.audio === true);
+
+// The controller must check the permission and retry before it reports.
+const voiceControllerSource = await readFile("src/sidepanel/voice-controller.ts", "utf8");
+ok("the mic opener asks the manifest whether this build may capture audio",
+  /getManifest\(\)[\s\S]{0,300}audioCapture/.test(voiceControllerSource));
+ok("and retries with fallback constraints before giving up",
+  /OverconstrainedError[\s\S]{0,400}MIC_FALLBACK_CONSTRAINTS/.test(voiceControllerSource));
 
 // Speak-safety: vault tokens MUST be replaced with "redacted" before TTS.
 ok("speakSafeTransform replaces CRED tokens with 'redacted'",
@@ -1530,6 +1653,39 @@ ok("containsVaultToken is false on speak-safe output",
   !containsVaultToken(speakSafeTransform("done <CRED_1>")));
 ok("containsVaultToken tolerates empty/null/undefined",
   !containsVaultToken("") && !containsVaultToken(null) && !containsVaultToken(undefined));
+
+// ── The bug: TTS refused instead of redacting ─────────────────────────────
+// `voice-controller.speak()` checked containsVaultToken FIRST and returned an
+// error before speakSafeTransform ever ran — so the transform whose entire job
+// is to pronounce tokens as "redacted" was unreachable exactly when it was
+// needed. Reported live as: "Voice: Refusing to speak: raw vault token in
+// assistant text (this is a bug, please report)", with no audio, on a run whose
+// text quoted the Gmail tab title (which carries <CRED_1>).
+const spokenWithToken = toSpeakable("Opened Gmail for <CRED_1>.");
+ok("a sentence containing a vault token is still spoken, not refused",
+  spokenWithToken.text === "Opened Gmail for redacted.", spokenWithToken.text);
+ok("and the speaker is handed token-free text — the guard's whole purpose holds",
+  !containsVaultToken(spokenWithToken.text));
+ok("the token substitution is reported, so it is never mistaken for the model's wording",
+  spokenWithToken.redactedTokens === 1, String(spokenWithToken.redactedTokens));
+ok("every token kind is counted and redacted for the speaker",
+  (() => {
+    const r = toSpeakable("Sent to <EMAIL_2> from <PII_3> with <ID_7>.");
+    return r.redactedTokens === 3 && !containsVaultToken(r.text) &&
+      (r.text.match(/redacted/g) ?? []).length === 3;
+  })());
+ok("glued token noise is redacted too, not just clean tokens",
+  !containsVaultToken(toSpeakable("code 7<CRED_1>").text));
+ok("a token-only answer still produces speakable text rather than silence",
+  toSpeakable("<CRED_1>").text === "redacted", toSpeakable("<CRED_1>").text);
+ok("toSpeakable still flattens markdown",
+  !toSpeakable("See [docs](https://x.test)").text.includes("https"));
+ok("toSpeakable still caps a runaway answer",
+  toSpeakable("word ".repeat(400), 60).text.endsWith("…"));
+ok("token-free text is passed through with nothing to report",
+  toSpeakable("Sent successfully.").redactedTokens === 0);
+ok("stripVaultTokens is a last-resort sweep that leaves no token syntax",
+  !containsVaultToken(stripVaultTokens("a <CRED_1> b <PII_2> c")));
 
 // PCM round-trip: Float32 -> PCM16 -> Float32 preserves sample values to
 // the quantisation step of the target format. The native value at sample
@@ -2366,7 +2522,7 @@ ok("the action result names what was clicked",
 
 // Contract: the tool is exposed to the planner, routed to the page, and the
 // safety gate still sees irreversible text requests.
-const { TOOLS, PAGE_ACTIONS } = await import("../src/background/tools.ts");
+const { TOOLS, PAGE_ACTIONS, actionChangesFrame } = await import("../src/background/tools.ts");
 const clickTextTool = TOOLS.find((t) => t.name === "click_text");
 ok("click_text is exposed to the planner with a text parameter",
   Boolean(clickTextTool) &&
@@ -2464,6 +2620,472 @@ const shallowCut = await Promise.race([
 ]);
 ok("a turn that has barely said anything is not cut for being slow",
   shallowCut === "answered", String(shallowCut));
+
+// ── Scenario AU: the runaway-loop guard ─────────────────────────────────────
+// The live failure: a 100 s turn against nvidia/nemotron-3.5-lightning-30b-a3b
+// whose output collapsed into "can make it one big things. can make it. 0 1 can
+// make it one." for thousands of characters. Deltas kept arriving, so the
+// silence window never tripped; the deliberation caps only counted onThought,
+// and this model streams chain-of-thought through delta.content as well; so the
+// run then presented the loop to the user as the answer, spoke it, and re-sent
+// it in the next turn's history. Repetition is the one signal a loop cannot
+// hide, so it is measured on the text.
+console.log("\n=== Scenario AU: runaway-loop (degenerate output) guard ===\n");
+
+const {
+  isDegenerateOutput,
+  isWordSalad,
+  punctuationDensity,
+  nonLatinLetterScripts,
+  degenerationRatio,
+  recordStreamedOutput,
+  clampAssistantTextForHistory,
+  MAX_HISTORY_TEXT_CHARS,
+} = await import("../src/background/agent.ts");
+const { SYSTEM_PROMPT: PRY_SYSTEM_PROMPT } = await import("../src/background/prompt.ts");
+
+// Verbatim from the reported run. The head is the model drifting out of its
+// topic ("The German Mastiff…"); the tail below it is the loop it collapsed
+// into, which kept repeating verbatim in the 6 233-character stream. A faithful
+// fixture therefore needs both: a diverse head is what makes the ratio
+// measure anything, since a loop from the first word is trivially detectable.
+const RUNAWAY_HEAD =
+  "The only thing one and can. big. Can make it, can one can one, and can one one big thing " +
+  "can make it one big things. Can make it one big things. Can one big things. one can make it. " +
+  "and can one big things. can make it. 0. I. And can one big can make it one. thing can make it " +
+  "one. And can one big things. can make it. 1 big things can make it. one. big things. can make " +
+  "it, one big things. can make it. 0. So can make it. 0. And one can make it can one big thing. " +
+  "And can one thing. can make it one. And can one big things. can make it. 0 1 can make it. one " +
+  "big things. can make it. 0 1 can make it one. And can one big things. can make it. 0 1 can " +
+  "make it one. And can one big things. can make it. 0 1 can make it one. And can one big things. " +
+  "can make it. 0 1 can make it one. And can one big things. can make it. 0 1 can make it one. " +
+  "And can one big things. can make it. 0 1 can make it one. And can one big things. can make it.";
+const RUNAWAY_CYCLE = " And can one big things. can make it. 0 1 can make it one.";
+const RUNAWAY = RUNAWAY_HEAD + RUNAWAY_CYCLE.repeat(12);
+
+ok("the reported runaway is detected as degenerate", isDegenerateOutput(RUNAWAY));
+
+// The adversarial false positive: a LONG legitimate answer whose rows really
+// are near-identical. A first version of this guard counted every repeated
+// 4-gram and flagged exactly this — the reason the rule is now short-cycle.
+const TABLE_DUMP = Array.from(
+  { length: 12 },
+  (_, i) =>
+    `${i + 1}. Priya Sharma, email address, account active, last sign in 3 days ago, ` +
+    `plan pro, region ap-south-1, token issued, status verified.`,
+).join("\n");
+ok("a long table of near-identical rows is NOT read as a loop",
+  !isDegenerateOutput(TABLE_DUMP), `ratio ${degenerationRatio(TABLE_DUMP).toFixed(3)}`);
+ok("nor is PRY's own system prompt", !isDegenerateOutput(PRY_SYSTEM_PROMPT),
+  `ratio ${degenerationRatio(PRY_SYSTEM_PROMPT).toFixed(3)}`);
+ok("nor coherent multi-sentence agent reasoning",
+  !isDegenerateOutput(
+    "The inbox read is dominated by the sidebar and toolbar, so no message row has an " +
+    "element id. I should navigate directly to youtube.com instead of reconstructing the " +
+    "route through an app grid, then type the channel name into the search box.",
+  ));
+ok("and a short narration line is never in scope",
+  !isDegenerateOutput("Opening YouTube and typing the channel name."));
+
+// A loop with a LONG period — the same ~45-word paragraph re-emitted verbatim.
+// The short-cycle signal deliberately ignores this (its repeats are 45 words
+// apart, the same spacing as a table row), which is why there is a second one.
+const LONG_PERIOD_PARAGRAPH =
+  "I need to check whether the search results actually loaded before clicking anything on this page, " +
+  "because the element ids from the previous read are stale after a navigation and the results list " +
+  "is rendered lazily by the site, so the safest next step is to read the page once more and look for " +
+  "a result title link near a duration label before taking any further action on it.";
+const LONG_PERIOD_LOOP = Array.from({ length: 5 }, () => LONG_PERIOD_PARAGRAPH).join(" ");
+ok("a long-period verbatim loop is detected too (the short-cycle signal cannot see it)",
+  isDegenerateOutput(LONG_PERIOD_LOOP) && degenerationRatio(LONG_PERIOD_LOOP) < 0.5,
+  `block-repeated, short-cycle ratio ${degenerationRatio(LONG_PERIOD_LOOP).toFixed(3)}`);
+ok("but the same paragraph stated ONCE is not a loop", !isDegenerateOutput(LONG_PERIOD_PARAGRAPH));
+// Margin: the two populations must not be close, or the threshold is luck.
+ok("the detector separates the two populations with a wide margin",
+  degenerationRatio(RUNAWAY) >= 0.5 && degenerationRatio(TABLE_DUMP) <= 0.05 &&
+  degenerationRatio(PRY_SYSTEM_PROMPT) === 0,
+  `runaway ${degenerationRatio(RUNAWAY).toFixed(3)} vs table ${degenerationRatio(TABLE_DUMP).toFixed(3)}`);
+// …and it must not need the whole stream to notice: by the time the loop has
+// repeated a dozen times the verdict is already in, which is why the live 100 s
+// turn would have been stopped after a few seconds.
+ok("the verdict is reached early in the loop, not at the end of the stream",
+  isDegenerateOutput(RUNAWAY_HEAD + RUNAWAY_CYCLE.repeat(6)) &&
+  degenerationRatio(RUNAWAY_HEAD + RUNAWAY_CYCLE.repeat(6)) >= 0.5);
+
+// ── The OTHER runaway: glitch text that is not a repetition loop ──────────
+// The verbatim sample lives in `fixtures/glitch-output.mjs` (with the run it
+// came from) because the agent-loop harness feeds the SAME bytes through a real
+// `runTask` — see the `SALAD`/`SALAD_ANSWER` note there. Every 4-gram in it is
+// unique, so the loop guard above returns false: repetition is not the only way
+// a stream stops being language.
+
+ok("the reported glitch stream is NOT a repetition loop, so the loop guard cannot see it",
+  degenerationRatio(SALAD) < 0.05 && !isDegenerateOutput(SALAD),
+  `ratio ${degenerationRatio(SALAD).toFixed(3)}`);
+ok("but it is caught as word salad", isWordSalad(SALAD));
+ok("on the two measured signals (density, and scripts), not on a vibe",
+  punctuationDensity(SALAD) >= 0.25 && nonLatinLetterScripts(SALAD).length >= 3,
+  `punct ${punctuationDensity(SALAD).toFixed(3)} · scripts ${nonLatinLetterScripts(SALAD).join(",")}`);
+
+// The false-positive battery: long, legitimate outputs of exactly the shapes an
+// agent produces, at the lengths where any of this can trigger.
+const LEGIT_LONG = {
+  "markdown table": [
+    "| # | Name | Email | Plan | Region | Status |",
+    "| --- | --- | --- | --- | --- | --- |",
+    ...Array.from({ length: 24 }, (_, i) => `| ${i + 1} | Priya Sharma | priya${i}@example.com | pro | ap-south-1 | verified |`),
+  ].join("\n"),
+  "code block": Array.from(
+    { length: 30 },
+    (_, i) => `  if (entry_${i} && out.includes(entry_${i}.original)) {\n    out = replaceValueWithToken(out, entry_${i});\n    continue;\n  }`,
+  ).join("\n"),
+  "minified JSON": JSON.stringify({
+    tokens: Array.from({ length: 40 }, (_, i) => ({ t: `<CRED_${i}>`, k: "credential", s: "sh···@gmail.com" })),
+  }).replace(/\s+/g, ""),
+  "four Latin languages": [
+    "En español: esta extensión no envía sus datos a ningún servidor.",
+    "En français: le contenu de la page reste dans le navigateur.",
+    "Auf Deutsch: die Daten verlassen den Browser nicht.",
+    "In italiano: nessun dato viene inviato a terzi durante la sessione.",
+    "The same guarantee holds in every language the user writes in, and the panel says so.",
+  ].join(" "),
+  "two-script translation answer": [
+    "The Hindi rendering is: यह एक उदाहरण है जो दिखाता है कि पाठ कैसे रहता है।",
+    "The explanation continues in plain English so the reader can follow the rest of this paragraph comfortably.",
+    "The Arabic equivalent is: هذا مثال يوضح كيف يبقى النص داخل المتصفح ولا يغادر الجهاز أبدا.",
+    "And the paragraph closes with ordinary English prose, exactly as a real answer would end.",
+    "A second English sentence follows so the sample is long enough to be in scope at all for this check.",
+  ].join(" "),
+};
+for (const [name, text] of Object.entries(LEGIT_LONG)) {
+  ok(`a long legitimate ${name} is not read as salad`,
+    !isWordSalad(text),
+    `punct ${punctuationDensity(text).toFixed(3)} · scripts ${nonLatinLetterScripts(text).length}`);
+}
+ok("nor is PRY's own system prompt salad",
+  !isWordSalad(PRY_SYSTEM_PROMPT), `punct ${punctuationDensity(PRY_SYSTEM_PROMPT).toFixed(3)}`);
+
+// WHY BOTH CONDITIONS: density alone does not separate the populations — a
+// minified JSON blob is MORE punctuation-heavy than the glitch stream. The
+// script mixture is what does. Written as an assertion so that loosening the
+// rule to one signal fails here with the numbers attached.
+ok("punctuation density alone cannot separate them (so it is not the only test)",
+  punctuationDensity(LEGIT_LONG["minified JSON"]) > punctuationDensity(SALAD),
+  `json ${punctuationDensity(LEGIT_LONG["minified JSON"]).toFixed(3)} vs salad ${punctuationDensity(SALAD).toFixed(3)}`);
+ok("the script mixture is what separates them: the salad mixes 4, every legitimate sample at most 2",
+  nonLatinLetterScripts(SALAD).length === 4 &&
+    Object.values(LEGIT_LONG).every((t) => nonLatinLetterScripts(t).length <= 2),
+  `salad ${nonLatinLetterScripts(SALAD).length} vs max legit ${Math.max(...Object.values(LEGIT_LONG).map((t) => nonLatinLetterScripts(t).length))}`);
+ok("and the word floor keeps a short fragment out of scope",
+  !isWordSalad(SALAD.split(/\s+/).slice(0, 40).join(" ")));
+
+// The tail must keep the END of the stream — a guard that kept the start would
+// watch the model's opening and never see the loop it drifts into.
+const tailLiveness = newTurnLiveness();
+recordStreamedOutput(tailLiveness, "A".repeat(5000));
+ok("the rolling tail is capped", tailLiveness.outputTail.length === 4000);
+const tailProbe = newTurnLiveness();
+recordStreamedOutput(tailProbe, "start ");
+recordStreamedOutput(tailProbe, "B".repeat(5000));
+ok("the rolling tail drops the OLDEST characters, not the newest",
+  tailProbe.outputTail.endsWith("BBBB") && !tailProbe.outputTail.includes("start"));
+
+// The budget cuts a degenerate turn fast, and calls it what it is. Deltas are
+// fed a few words at a time, which is how a stream actually arrives — a large
+// chunk would put the cycle outside the window and flatter the detector.
+const runawayWords = RUNAWAY.split(/\s+/);
+const degenerateLiveness = newTurnLiveness();
+let runawayIndex = 0;
+const ramble = setInterval(() => {
+  degenerateLiveness.lastEventAt = performance.now();
+  degenerateLiveness.events++;
+  recordStreamedOutput(degenerateLiveness, `${runawayWords.slice(runawayIndex, runawayIndex + 4).join(" ")} `);
+  runawayIndex += 4;
+  if (runawayIndex >= runawayWords.length) runawayIndex = RUNAWAY_HEAD.split(/\s+/).length;
+}, 5);
+let degenerateEnded = "";
+const degenerateStart = Date.now();
+await withTurnBudget(new Promise(() => {}), degenerateLiveness, {
+  firstOutputMs: 60_000,
+  idleMs: 30_000,
+  maxMs: 600_000,
+  onTimeout() {},
+  messageFor: (reason, liveness, waited) =>
+    turnCutShortMessageFor("NVIDIA test", reason, liveness, waited, 60_000),
+}).catch(() => { degenerateEnded = degenerateLiveness.ended; });
+clearInterval(ramble);
+const degenerateElapsed = Date.now() - degenerateStart;
+ok("a looping turn is cut as 'degenerate' rather than run to the ceiling",
+  degenerateEnded === "degenerate", degenerateEnded);
+ok("and it is cut in seconds, not the 100 s the live run took",
+  degenerateElapsed < 5_000, `${degenerateElapsed}ms`);
+
+// A coherent turn of the same shape must survive — otherwise the guard is just
+// a shorter ceiling and would cut real long answers.
+// Streamed chunks of PRY's own 1 400-word system prompt: long, real, coherent
+// prose that shares plenty of vocabulary ("the page", "read it again") without
+// ever cycling.
+const coherentChunks = PRY_SYSTEM_PROMPT.split(" ").reduce((acc, word) => {
+  if (!acc.length || acc[acc.length - 1].split(" ").length >= 8) acc.push(word);
+  else acc[acc.length - 1] += ` ${word}`;
+  return acc;
+}, []);
+const coherentLiveness = newTurnLiveness();
+let coherentIndex = 0;
+const coherentTick = setInterval(() => {
+  coherentLiveness.lastEventAt = performance.now();
+  coherentLiveness.events++;
+  recordStreamedOutput(coherentLiveness, `${coherentChunks[coherentIndex++ % coherentChunks.length]} `);
+}, 5);
+const coherentSurvived = await Promise.race([
+  withTurnBudget(new Promise((r) => setTimeout(() => r("answered"), 1200)), coherentLiveness, {
+    firstOutputMs: 60_000, idleMs: 30_000, maxMs: 600_000, onTimeout() {},
+    messageFor: (reason, liveness, waited) =>
+      turnCutShortMessageFor("NVIDIA test", reason, liveness, waited, 60_000),
+  }).catch(() => "cut"),
+  new Promise((r) => setTimeout(() => r("timeout"), 4000)),
+]);
+clearInterval(coherentTick);
+ok("a turn streaming 1 400 words of coherent prose is not cut — the guard is not a shorter ceiling",
+  (coherentSurvived === "answered" || coherentLiveness.ended === "settled") &&
+  coherentLiveness.outputTail.split(/\s+/).length > 400,
+  `${coherentSurvived}/${coherentLiveness.ended} · ${coherentLiveness.outputTail.split(/\s+/).length} words streamed`);
+
+// The same budget, fed the real glitch stream: it must be cut as `salad` (not
+// as a loop, and not after the 210 s ceiling), because that is what the run
+// then reports — and the run must never present the stream as the answer.
+const saladWords = SALAD.split(/\s+/);
+const saladLiveness = newTurnLiveness();
+let saladIndex = 0;
+const saladTick = setInterval(() => {
+  saladLiveness.lastEventAt = performance.now();
+  saladLiveness.events++;
+  recordStreamedOutput(saladLiveness, `${saladWords.slice(saladIndex, saladIndex + 4).join(" ")} `);
+  saladIndex += 4;
+}, 5);
+let saladEnded = "";
+const saladStart = Date.now();
+await withTurnBudget(new Promise(() => {}), saladLiveness, {
+  firstOutputMs: 60_000,
+  idleMs: 30_000,
+  maxMs: 600_000,
+  onTimeout() {},
+  messageFor: (reason, liveness, waited) =>
+    turnCutShortMessageFor("NVIDIA test", reason, liveness, waited, 60_000),
+}).catch(() => { saladEnded = saladLiveness.ended; });
+clearInterval(saladTick);
+const saladElapsed = Date.now() - saladStart;
+ok("the glitch stream is cut as 'salad', with its own reason rather than the loop's",
+  saladEnded === "salad", `${saladEnded} after ${saladElapsed}ms`);
+ok("and it is cut in seconds, not at the ceiling",
+  saladElapsed < 5_000, `${saladElapsed}ms`);
+
+// The same glitch, followed by silence — the shape the live run actually had:
+// 45 updates of fragments and THEN 30 s of quiet. The idle branch read the quiet
+// first, called it a mid-stream stall, and retried (that wording is retryable by
+// design), which re-sent the prompt that produced the glitch and produced it
+// again. The collapse is the finding; the silence after it is a symptom.
+const stalledSalad = newTurnLiveness();
+for (let i = 0; i + 4 <= saladWords.length; i += 4) {
+  recordStreamedOutput(stalledSalad, `${saladWords.slice(i, i + 4).join(" ")} `);
+  stalledSalad.events++;
+}
+stalledSalad.lastEventAt = performance.now();
+ok("the stall fixture really is salad and really has streamed something",
+  isWordSalad(stalledSalad.outputTail) && stalledSalad.events > 0,
+  `${stalledSalad.events} updates, ${stalledSalad.outputTail.length} chars`);
+let stalledEnded = "";
+await withTurnBudget(new Promise(() => {}), stalledSalad, {
+  firstOutputMs: 60_000,
+  idleMs: 100,
+  maxMs: 600_000,
+  onTimeout() {},
+  messageFor: (reason, liveness, waited) =>
+    turnCutShortMessageFor("NVIDIA test", reason, liveness, waited, 60_000),
+}).catch(() => { stalledEnded = stalledSalad.ended; });
+ok("glitch followed by silence is reported as salad, not as a retryable stall",
+  stalledEnded === "salad", `${stalledEnded} (idle window was 100ms)`);
+// …and the two readings lead to different futures, which is why the order
+// matters: the stall wording re-sends the prompt, the salad wording does not.
+const stallWouldSay = turnCutShortMessageFor("NVIDIA test", "silent", stalledSalad, 600, 60_000);
+ok("the stall reading is the one that would have re-sent the prompt",
+  isRetryablePlannerError(stallWouldSay), stallWouldSay);
+ok("so the cut it reports instead is not retryable",
+  !isRetryablePlannerError(turnCutShortMessageFor("NVIDIA test", stalledEnded, stalledSalad, 600, 60_000)));
+
+const saladMessage = turnCutShortMessageFor("NVIDIA test", "salad", saladLiveness, 9_000, 60_000);
+ok("the salad message names the real cause (not language, not a loop)",
+  /stopped writing language/.test(saladMessage) && !/repetition loop/.test(saladMessage),
+  saladMessage);
+ok("it does not read as a transient stall, so the same prompt is not re-sent",
+  !isRetryablePlannerError(saladMessage), saladMessage);
+ok("and it says no action was taken, which is what the user needs to know",
+  /no action was taken/.test(saladMessage));
+
+// The fragments were painted into the answer card as they streamed, so ruling on
+// them is not enough — the card has to be emptied. Assistant patches APPEND by
+// design (they are narration deltas), so the three surfaces must agree on the
+// one patch that replaces: the loop emits it, the worker applies it, the panel
+// renders it. Captioning the glitch instead would leave the wall on screen under
+// a note saying it was not an answer.
+const guardSource = await readFile("src/background/agent.ts", "utf8");
+const workerSource3 = await readFile("src/background/service-worker.ts", "utf8");
+const panelSource3 = await readFile("src/sidepanel/sidepanel.ts", "utf8");
+ok("the loop discards an already-painted stream on BOTH guard paths",
+  (guardSource.match(/DISCARDED_STREAM_NOTE/g) ?? []).length >= 3,
+  `${(guardSource.match(/DISCARDED_STREAM_NOTE/g) ?? []).length} references (definition + cut + final answer)`);
+ok("and the note says the output was discarded, not shown",
+  /was discarded/.test(guardSource));
+ok("the worker replaces an assistant entry only when the patch says so",
+  /entry\.role === "assistant" && !event\.replace/.test(workerSource3));
+ok("and the panel renders that replacement instead of appending to it",
+  /event\.replace \? "" :/.test(panelSource3));
+ok("an ordinary narration delta still appends in both",
+  /entry\.text \+ event\.text/.test(workerSource3) &&
+    /rawTexts\.get\(event\.id\) \?\? ""\)\) \+ event\.text/.test(panelSource3));
+
+// ── Every provider must keep the two channels apart ─────────────────────────
+// `onText` is painted as PRY's ANSWER; `onThought` proves liveness, opens the
+// reasoning block, and feeds `liveness.reasoningChars` — which is the signal the
+// 12 000-char / 90 s deliberation cut reads. A reasoning model's chain-of-thought
+// sent down the wrong one shows the model's private analysis to the user as its
+// reply AND leaves the deliberation guard permanently blind. Groq did exactly
+// that (measured live: one gpt-oss-20b turn streamed 3 478 chars of reasoning
+// through onText and returned an empty turn.text), so the split is asserted for
+// every adapter that parses a reasoning field, not just the one that was wrong.
+const providerFiles = ["groq", "nvidia", "openai", "anthropic", "ollama"];
+for (const name of providerFiles) {
+  const source = await readFile(`src/background/providers/${name}.ts`, "utf8");
+  // The bug class is a streamed reasoning FIELD routed to the wrong channel; a
+  // request flag such as `reasoning_effort`, or a comment mentioning reasoning
+  // models, is not a channel decision. (An adapter that parses no reasoning
+  // field at all simply has no chain-of-thought to misroute.)
+  const reasoningField = /delta\??\.\s*(reasoning_content|reasoning|thinking)\b/;
+  if (!reasoningField.test(source)) continue;
+  const toAnswer = new RegExp(
+    `onText\\(\\s*(String\\()?\\s*(delta\\??\\.\\s*)?(reasoning_content|reasoning|thinking)\\b`,
+  ).test(source);
+  ok(`${name} sends chain-of-thought to the reasoning channel, never the answer channel`,
+    /onThought\?\.\(/.test(source) && !toAnswer,
+    toAnswer ? "reasoning is passed to onText" : "ok");
+}
+
+const degenerateMessage = turnCutShortMessageFor("NVIDIA test", "degenerate", degenerateLiveness, 12_000, 60_000);
+ok("the degeneration message names the real cause (produced text, nothing new)",
+  /repetition loop/.test(degenerateMessage) && /nothing new/.test(degenerateMessage),
+  degenerateMessage);
+ok("it does NOT read as a transient stall, so the prompt is not re-sent to the same model",
+  !isRetryablePlannerError(degenerateMessage), degenerateMessage);
+ok("and it points at the fix (a steadier model)", /steadier model/.test(degenerateMessage));
+
+// History replay is bounded: the model's own monologue comes back to it every
+// later turn, so an unbounded ramble is paid for repeatedly and invites more of
+// it. A final answer never reaches this path (no tool calls ends the run).
+ok("short narration is replayed verbatim",
+  clampAssistantTextForHistory("Opening YouTube.") === "Opening YouTube.");
+ok("whitespace-only narration collapses to nothing",
+  clampAssistantTextForHistory("   \n  ") === "");
+const longMonologue = `Opening YouTube ${"and then reading the page again ".repeat(200)}`;
+const clampedMonologue = clampAssistantTextForHistory(longMonologue);
+ok("an over-long monologue is clamped before it is replayed",
+  clampedMonologue.length < longMonologue.length &&
+  clampedMonologue.length <= MAX_HISTORY_TEXT_CHARS + " …[truncated for length]".length,
+  `${clampedMonologue.length} chars`);
+ok("the clamp announces itself instead of silently dropping text",
+  clampedMonologue.endsWith("…[truncated for length]"));
+ok("the clamp never leaves half a word behind",
+  !/\w…\[/.test(clampedMonologue), clampedMonologue.slice(-40));
+
+// ── Scenario AV: the frame pipeline must not block the planner ─────────────
+// The measured cost: the post-action pixel pipeline (capture → redact → verify
+// → attack → record) is 1.2 s for a 1× viewport and up to 6.5 s at the 6-tile
+// triage cap, and it used to be awaited in front of EVERY page-changing step's
+// planner call — local work serialised with a network call that needs none of
+// it. It is audit-only whenever vision is off, because no byte of that frame
+// reaches the planner.
+console.log("\n=== Scenario AV: post-action frame pipeline off the critical path ===\n");
+
+const { frameNeedsPlannerWait, joinEvidence } = await import("../src/background/agent.ts");
+
+// The policy: the direction that matters is VISION ON, because deferring that
+// frame hands the planner a description of a screen from before its own action.
+ok("vision ON ⇒ the frame must complete before the next planner turn",
+  frameNeedsPlannerWait({ visionEnabled: true, hasVisionKey: true, aborted: false }) === true);
+ok("vision OFF (the default) ⇒ the frame is audit-only and may run alongside the turn",
+  frameNeedsPlannerWait({ visionEnabled: false, hasVisionKey: true, aborted: false }) === false);
+ok("vision on with NO key ⇒ nothing can ship, so it is audit-only too",
+  frameNeedsPlannerWait({ visionEnabled: true, hasVisionKey: false, aborted: false }) === false);
+ok("a Stop mid-step ⇒ no frame is awaited on the way out",
+  frameNeedsPlannerWait({ visionEnabled: true, hasVisionKey: true, aborted: true }) === false);
+
+// The join: evidence that has already settled costs nothing, which is the whole
+// point — it is joined after a planner turn, not before one.
+let resolvedAt = 0;
+const work = new Promise((resolve) => {
+  setTimeout(() => {
+    resolvedAt = Date.now();
+    resolve({ summary: "[Frame after the previous action: 4 PII redacted]" });
+  }, 60);
+});
+await new Promise((r) => setTimeout(r, 80));
+const joinStart = Date.now();
+const joined = await joinEvidence(work, 15_000);
+const joinCost = Date.now() - joinStart;
+ok("joining a pipeline that already settled returns its evidence",
+  joined?.summary === "[Frame after the previous action: 4 PII redacted]", JSON.stringify(joined));
+ok("…and costs ~nothing, because the planner turn was the overlap",
+  joinCost < 30 && resolvedAt <= joinStart, `${joinCost}ms, settled ${joinStart - resolvedAt}ms before the join`);
+
+// The safety net, which is the reason a wedged capture cannot hang a run: the
+// pipeline keeps running and still files its own ledger entry, but the LINE is
+// skipped rather than waited for forever.
+const wedgedStart = Date.now();
+const wedged = await joinEvidence(new Promise(() => {}), 80);
+const wedgedCost = Date.now() - wedgedStart;
+ok("a pipeline that never settles does not hold the run open",
+  wedged === null && wedgedCost >= 70 && wedgedCost < 1_500, `${wedgedCost}ms -> ${wedged}`);
+ok("a pipeline that THROWS cannot take the run down from a join site",
+  (await joinEvidence(Promise.reject(new Error("capture blew up")), 500)) === null);
+ok("joining nothing at all is free", (await joinEvidence(Promise.resolve(null), 500)) === null);
+
+// The structural invariant behind the timing claim: the capture is awaited in
+// exactly ONE place — inside the shared pipeline — and the post-action site
+// routes through the policy instead of awaiting it inline. Re-inlining that
+// await is the regression this catches (it is one line, and it silently
+// restores 1.2-6.5 s in front of every planner call).
+const agentSource = await readFile("src/background/agent.ts", "utf8");
+const awaitedCaptures = agentSource.match(/await captureScreenshot\(/g) ?? [];
+ok("the capture is awaited in exactly one place (inside the shared pipeline)",
+  awaitedCaptures.length === 1, `${awaitedCaptures.length} site(s)`);
+// Both frame sites must BRANCH on that policy — await in the vision branch,
+// defer in the other — rather than pick one behaviour for both. (The opening
+// frame is the site a wedged capture used to hang a run on, before it had any
+// planner turn to hide behind, so it is bounded too.)
+const policyDefAt = agentSource.indexOf("export function frameNeedsPlannerWait(");
+const policyUseAt = agentSource.indexOf("frameNeedsPlannerWait({");
+const openingAwaitedAt = agentSource.indexOf("awaitFrame(runFrameAudit(lastDomDetections");
+const openingDeferredAt = agentSource.indexOf("startFrameAudit(lastDomDetections, FRAME_LABEL_OPENING)");
+const actionAwaitedAt = agentSource.indexOf("runFrameAudit(freshDetections, observation, FRAME_LABEL_AWAITED)");
+const actionDeferredAt = agentSource.indexOf("startFrameAudit(freshDetections, FRAME_LABEL_DEFERRED)");
+ok("both frame sites branch on the same policy instead of awaiting directly",
+  policyDefAt > 0 && policyUseAt > 0 && openingAwaitedAt > policyUseAt && actionAwaitedAt > policyUseAt,
+  `policy defined@${policyDefAt} used@${policyUseAt} opening@${openingAwaitedAt} action@${actionAwaitedAt}`);
+ok("and the policy is exported, so its truth table is pinned by a test rather than by reading the call site",
+  /export function frameNeedsPlannerWait\(/.test(agentSource));
+ok("and each site has a deferred half for the vision-off case",
+  openingDeferredAt > 0 && actionDeferredAt > 0);
+ok("neither site produces an action summary line for the opening frame (it is not an action's frame)",
+  /awaitFrame\(runFrameAudit\(lastDomDetections, "", ""\)\)/.test(agentSource));
+
+// Every wait on a frame pipeline goes through ONE budget. A stray literal would
+// mean a site that can hang for a different, undocumented length of time.
+ok("the awaited frames are bounded by the named budget, not a literal",
+  agentSource.includes("joinEvidence(run.then((value) => ({ value })), FRAME_AUDIT_WAIT_MS)"));
+ok("and so is the deferred join",
+  agentSource.includes("joinEvidence(pending, FRAME_AUDIT_WAIT_MS)"));
+ok("a frame that does not arrive in time is announced, never silently dropped",
+  /function noteFrameTimeout\(/.test(agentSource) &&
+  (agentSource.match(/noteFrameTimeout\("/g) ?? []).length >= 2);
 
 // ── Scenario AP: the app-switcher dead end ─────────────────────────────────
 // The live run: task = reach another site from a Gmail tab. The planner clicked
@@ -2955,6 +3577,46 @@ for (const [name, prompt] of [["remote", SYSTEM_PROMPT], ["local", SYSTEM_PROMPT
     /SPELLING/.test(prompt));
 }
 
+// ── A task's own words bound the run ────────────────────────────────────────
+// The reported failure: "open yt and search harkirat singh" navigated, typed,
+// and then CLICKED a search result — a step the task never asked for — and spent
+// two more turns re-verifying. The planner narrated the cause itself ("I need to
+// follow the route: navigate → type → click_text"), i.e. it copied the LENGTH of
+// a stored route recorded for a different task. Where the wording IS the fix,
+// the wording is what gets pinned.
+ok("the prompt bounds the run to what the task asked for",
+  /Act only on what the task asks for/.test(SYSTEM_PROMPT));
+ok("and spells out that a search is finished when its results are visible",
+  /"Search for X" is complete the moment X's results are visible/.test(SYSTEM_PROMPT));
+ok("and that opening a result the task did not ask for is an extra step",
+  /do not open a result, a channel, or a video the task did not ask you to open/.test(SYSTEM_PROMPT));
+ok("the local prompt is bounded the same way",
+  /Do exactly what the task asked/.test(SYSTEM_PROMPT_LOCAL));
+ok("the verify rule no longer sends the model back to re-read a page it just saw",
+  /already in the last tool result/.test(SYSTEM_PROMPT) &&
+  /do not spend a turn re-reading/.test(SYSTEM_PROMPT));
+
+const { renderTrajectoryRoutes } = await import("../src/background/trajectories.ts");
+const storedRoute = [{
+  id: "t1", domain: "youtube.com", pageType: "video",
+  task: "open youtube and play the first video",
+  steps: "navigate → type → click_text",
+  answer: "", createdAt: 1,
+}];
+const routeText = renderTrajectoryRoutes(storedRoute);
+ok("no matching route renders nothing at all", renderTrajectoryRoutes([]) === "");
+ok("a route still shows the older task and the path that solved it",
+  routeText.includes("Task: open youtube and play the first video") &&
+  routeText.includes("Steps: navigate → type → click_text"));
+ok("but the block now says a route's LENGTH is not part of the route",
+  /A route's LENGTH is not part of it/.test(routeText));
+ok("and that the run ends when THIS task's words are satisfied, not the example's",
+  /Your run ends the moment YOUR task's own words are satisfied/.test(routeText));
+ok("with the search case named explicitly, since that is the one that went wrong",
+  /"search" is finished when the results are visible/.test(routeText));
+ok("and the instruction that invited copying the length is gone",
+  !/Copy the route, never the values/.test(routeText));
+
 console.log("\n=== Scenario AT: what task text is redacted, and what must not be ===\n");
 
 // An audit of the whole task path against realistic inputs, kept as the
@@ -3079,6 +3741,237 @@ ok("the task prompt carries the legend when there is one",
     return withLegend.includes("LEGEND_HERE") && withLegend.includes("Task: do the thing") &&
       without === "Current tab: X — https://x.test\n\nTask: do the thing";
   })());
+
+// ── Scenario AS: the task-privacy report is made where the work happens ────
+console.log("\n=== Scenario AS: task-privacy report and planner legend ===\n");
+
+// The worker tokenizes the task and passes the TOKENIZED string to runTask,
+// which tokenizes again. A report guarded on that second pass is guarded on a
+// count that is structurally always zero — which is where the "Task privacy:"
+// line lived, so it never rendered, and where the planner's legend was built,
+// so the legend was silently blank. Both are pinned here.
+const phase1 = new PIITokenizer().tokenizeTask("send an email to Priya Sharma about the invoice");
+ok("pass 1 (the worker, raw task) reports the substitution",
+  phase1.tokenCount === 1 && phase1.newEntries.length === 1 &&
+    phase1.task === "send an email to <PII_1> about the invoice",
+  JSON.stringify({ task: phase1.task, count: phase1.tokenCount }));
+
+const phase2Tokenizer = new PIITokenizer();
+phase2Tokenizer.tokenizeTask("send an email to Priya Sharma about the invoice");
+const phase2 = phase2Tokenizer.tokenizeTask(phase1.task);
+ok("pass 2 (runTask, already-tokenized task) reports nothing new — so a report there cannot render",
+  phase2.tokenCount === 0 && phase2.newEntries.length === 0,
+  JSON.stringify({ count: phase2.tokenCount, entries: phase2.newEntries.length }));
+
+// The report itself: names the substitution, masks the value.
+const reportShown = phase1.newEntries
+  .slice(0, 4)
+  .map((e) => `"${maskSample(e.original)}" → ${e.token}`)
+  .join(", ");
+ok("the privacy line quotes the masked value and its token, never the raw value",
+  reportShown.includes("→ <PII_1>") && !reportShown.includes("Priya Sharma") && reportShown.includes("Pr"),
+  reportShown);
+
+// The legend the planner receives: built from the vault FILTERED to the tokens
+// in this task (how agent.ts builds it), not from this pass's new entries.
+const legendTokenizer = new PIITokenizer();
+const legendTask = legendTokenizer.tokenizeTask("send an email to Priya Sharma about the invoice").task;
+const legendFromVault = buildTokenLegend(
+  legendTokenizer.getEntries().filter((e) => legendTask.includes(e.token)),
+);
+ok("the legend names the token's CATEGORY without its value",
+  typeof legendFromVault === "string" &&
+    legendFromVault.includes("<PII_1> = a person, company or place name") &&
+    !legendFromVault.includes("Priya Sharma"),
+  legendFromVault ?? "(null)");
+ok("and it is not empty on a run that tokenized something",
+  legendFromVault !== null && legendFromVault.includes("<PII_1>"));
+ok("for a task with no tokens the legend is absent rather than empty",
+  (() => {
+    const t = new PIITokenizer();
+    t.tokenize("Priya Sharma", "pii_text");
+    const task = "open youtube and find a devops channel";
+    const entries = t.getEntries().filter((e) => task.includes(e.token));
+    return entries.length === 0 && buildTokenLegend(entries) === null;
+  })());
+
+// ── Scenario AT: a read-only action does not pay for a fresh frame ─────────
+console.log("\n=== Scenario AT: which actions justify re-capturing pixels ===\n");
+
+// A capture is the most expensive thing the loop does after an action
+// (capture → paint → OCR triage of up to 6 tiles → pixel verify → OCR re-read →
+// adversarial probes), and it is awaited before the next planner turn. It is
+// worth it only when the action could have changed a pixel.
+ok("a read of the page does not trigger a capture",
+  actionChangesFrame("read_page") === false);
+ok("nor do the other actions that cannot change pixels",
+  actionChangesFrame("find_text") === false && actionChangesFrame("wait") === false);
+ok("actions that can change the page do",
+  ["click", "click_text", "type", "select", "scroll", "key"].every(actionChangesFrame));
+ok("and an action this policy has never seen is treated as frame-changing",
+  actionChangesFrame("navigate") === true && actionChangesFrame("open_tab") === true &&
+    actionChangesFrame("some_future_tool") === true);
+ok("every tool the planner is offered has a capture policy",
+  TOOLS.filter((t) => PAGE_ACTIONS.has(t.name))
+    .every((t) => typeof actionChangesFrame(t.name) === "boolean"));
+
+// The decision must live in one place: the loop asked PAGE_ACTIONS directly
+// before, with its own exclusion list, which is how read_page came to be
+// captured while find_text was not.
+const loopUsesHelper = (await readFile("src/background/agent.ts", "utf8"))
+  .includes("actionChangesFrame(call.name)");
+ok("the loop delegates that decision instead of re-deriving it", loopUsesHelper);
+
+// Tesseract's cold start must be paid off the critical path. The service worker
+// warms it when it creates the offscreen document, and the offscreen document
+// must accept that message.
+const workerSource = await readFile("src/background/service-worker.ts", "utf8");
+const offscreenDocSource = await readFile("src/offscreen/offscreen.ts", "utf8");
+ok("the worker warms OCR when it creates the offscreen document",
+  /ensureOffscreenDocument\(\)[\s\S]{0,600}warm-ocr/.test(workerSource));
+ok("and the offscreen document handles that message",
+  /message\.type === "warm-ocr"/.test(offscreenDocSource));
+
+// ─── Scenario AW: what a RUN may claim about its frames ────────────────────
+// A run showed 231 "items redacted" in the transcript, 227 "Redacted" on the
+// transcript chip (frame regions only, over the frames the audit still held)
+// and 2 "Vault Tokens" — and simultaneously badged "✓ REDACTIONS VERIFIED"
+// while a frame of the same run had had its screenshot withheld because its
+// mask verification failed. Two numbers, two scopes, one badge, no way to tell.
+console.log("\n=== Scenario AW: run-level audit claims ===\n");
+
+const {
+  redactionTally,
+  describeRedactionTally,
+  rollupFrameVerification,
+} = await import("../src/shared/metrics.ts");
+
+const tallySample = redactionTally(4, 227, 2);
+ok("the run total is frame regions + page items, by construction",
+  tallySample.total === 231 && tallySample.frameRegions === 227 && tallySample.pageItems === 4,
+  JSON.stringify(tallySample));
+ok("the sentence names every part of the total it prints",
+  describeRedactionTally(tallySample) ===
+    "231 redactions (227 masked frame regions + 4 page items) · 2 vault tokens",
+  describeRedactionTally(tallySample));
+ok("the same sentence agrees with itself in the singular",
+  describeRedactionTally(redactionTally(1, 0, 1)) ===
+    "1 redaction (0 masked frame regions + 1 page item) · 1 vault token",
+  describeRedactionTally(redactionTally(1, 0, 1)));
+const clampedTally = redactionTally(-5, 2.4, -1);
+ok("counts are clamped to non-negative integers, never printed raw",
+  clampedTally.pageItems === 0 && clampedTally.frameRegions === 2 && clampedTally.tokens === 0 && clampedTally.total === 2,
+  JSON.stringify(clampedTally));
+
+const cleanFrame = { verification: { verified: true, regionsChecked: 2, leakedPatterns: [] } };
+const emptyFrame = { verification: { verified: true, regionsChecked: 0, leakedPatterns: [] } };
+const failedFrame = {
+  verification: { verified: false, regionsChecked: 2, leakedPatterns: ["OCR: priya.sharma@example.com"] },
+};
+const withheldFrame = {
+  verification: { verified: true, regionsChecked: 2, leakedPatterns: [] },
+  withheld: ["Residual sensitive content detected"],
+};
+const shippedFrame = {
+  verification: { verified: true, regionsChecked: 1, leakedPatterns: [] },
+  shipped: true,
+};
+
+const allClean = rollupFrameVerification([cleanFrame, cleanFrame, emptyFrame]);
+ok("every checked frame passing lets the run claim verification",
+  allClean.allVerified === true && allClean.framesVerified === 2 && allClean.framesUnchecked === 1,
+  JSON.stringify(allClean));
+ok("a frame with nothing to check is a gap, not a failure",
+  allClean.framesFailed === 0 && allClean.framesWithheld === 0,
+  JSON.stringify(allClean));
+
+// THE BUG THIS PINS: one failing frame plus a passing one later used to badge
+// the whole run verified, because the badge read only the newest frame.
+const oneFailed = rollupFrameVerification([failedFrame, cleanFrame, withheldFrame, cleanFrame]);
+ok("one failed frame falsifies the run-level claim",
+  oneFailed.allVerified === false && oneFailed.framesFailed === 1,
+  JSON.stringify(oneFailed));
+ok("a withheld frame is counted apart from a pass, not folded into one",
+  // Two clean frames and one withheld-but-clean frame passed; the withheld one
+  // is counted BOTH as verified and as withheld, because they are different
+  // questions: "did the check find anything?" and "did PRY let it leave?".
+  oneFailed.framesWithheld === 1 && oneFailed.framesVerified === 3,
+  JSON.stringify(oneFailed));
+ok("the leaked pattern survives into the run-level evidence",
+  oneFailed.leakedPatterns.includes("OCR: priya.sharma@example.com"),
+  JSON.stringify(oneFailed.leakedPatterns));
+ok("a withheld frame alone is enough to falsify the claim",
+  rollupFrameVerification([cleanFrame, withheldFrame]).allVerified === false);
+ok("a run with no checked frame makes NO verification claim",
+  rollupFrameVerification([emptyFrame, emptyFrame]).allVerified === false);
+ok("an empty run claims nothing and says so",
+  rollupFrameVerification([]).allVerified === false &&
+    /No frames were captured/.test(rollupFrameVerification([]).summary),
+  rollupFrameVerification([]).summary);
+ok("frames that actually left the device are counted apart from those that did not",
+  rollupFrameVerification([shippedFrame, cleanFrame]).framesShipped === 1 &&
+    rollupFrameVerification([failedFrame, cleanFrame]).framesShipped === 0);
+// Every outcome at once, so no clause of the sentence can go missing unnoticed.
+const mixed = rollupFrameVerification([failedFrame, cleanFrame, emptyFrame, withheldFrame]);
+ok("the summary names every outcome instead of collapsing to one boolean",
+  /2 verified/.test(mixed.summary) &&
+    /1 FAILED re-OCR/.test(mixed.summary) &&
+    /1 withheld from egress/.test(mixed.summary) &&
+    /1 with nothing to check/.test(mixed.summary),
+  mixed.summary);
+
+// The panel and the transcript must derive their numbers from this one module:
+// a second implementation is how the two came to disagree in the first place.
+const sidepanelSource = await readFile("src/sidepanel/sidepanel.ts", "utf8");
+const workerSource2 = await readFile("src/background/service-worker.ts", "utf8");
+const agentSource2 = await readFile("src/background/agent.ts", "utf8");
+ok("the panel derives the tally through the shared helper",
+  /describeRedactionTally\(tally\)/.test(sidepanelSource));
+ok("the run badge reads the ROLLUP, never a single frame's verdict",
+  /rollupFrameVerification|verificationRollup/.test(sidepanelSource) &&
+    /verificationRollup/.test(workerSource2));
+ok("the transcript's total comes from the same helper",
+  /describeRedactionTally\(tally\)/.test(agentSource2));
+
+const unusedLegacyTotal = /Total PII items redacted/.test(agentSource2);
+ok("and the old unlabelled \"PII items\" wording is gone", unusedLegacyTotal === false);
+
+// ─── Scenario AX: an element id means nothing without its read ─────────────
+// Ids are positional array indices, so the same number is a different control
+// after any re-render — and a different registry entirely on a new document.
+// "Does element 3 exist?" cannot tell those apart, which is how an action could
+// land on the wrong control and still report success.
+console.log("\n=== Scenario AX: element ids carry their page read ===\n");
+
+const perceive = await import("../src/content/perceive.ts");
+const readNow = perceive.registryGeneration();
+const staleLookup = perceive.lookupElement(3, readNow + 1);
+ok("an id from a later read than the registry's is refused as stale",
+  staleLookup.ok === false && staleLookup.reason === "stale",
+  JSON.stringify(staleLookup));
+ok("and the refusal names both reads",
+  staleLookup.askedFor === readNow + 1 && staleLookup.current === readNow,
+  JSON.stringify(staleLookup));
+const unprovenanced = perceive.lookupElement(3);
+ok("an id with no provenance is absent, not stale (nothing to compare)",
+  unprovenanced.ok === false && unprovenanced.reason === "missing",
+  JSON.stringify(unprovenanced));
+
+const actSource = await readFile("src/content/act.ts", "utf8");
+const generationThreaded = actSource.match(/resolve\(input, action\.snapshotGeneration\)/g) ?? [];
+ok("every element-id action resolves against its read's generation",
+  generationThreaded.length === 3,
+  `${generationThreaded.length} of 3 (click, type, select)`);
+ok("the page refuses a stale id in words that name both reads",
+  /came from page read #/.test(actSource) && /has been read again since/.test(actSource));
+ok("the loop stamps each action with the read its ids came from",
+  /snapshotGeneration: idGeneration/.test(agentSource2) &&
+    /lastRenderedGeneration = snapshot\?\.generation/.test(agentSource2));
+ok("and it compares role+name before trusting a renumbered id",
+  /const drifted =/.test(agentSource2) &&
+    /current\.role !== intended\.role \|\| current\.name !== intended\.name/.test(agentSource2));
+ok("a renumbered id is never silently accepted without that comparison",
+  !/const elExists = snapshot\?\.elements\.some/.test(agentSource2));
 
 tokenizer.clear();
 

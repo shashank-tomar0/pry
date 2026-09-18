@@ -14,7 +14,8 @@
     "tabs",
     "scripting",
     "activeTab",
-    "offscreen"
+    "offscreen",
+    "audioCapture"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {

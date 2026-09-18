@@ -1,5 +1,6 @@
-import type { AgentEvent, PanelCommand, TranscriptEntry, TripwireAlertDetail } from "../shared/types";
-import { accuracyMetrics } from "../shared/metrics";
+import type { AgentEvent, PanelCommand, PrivacyAuditPayload, TranscriptEntry, TripwireAlertDetail } from "../shared/types";
+import { accuracyMetrics, describeRedactionTally, type AuditVerificationRollup } from "../shared/metrics";
+import { tierBadge } from "../shared/region-paint";
 
 // ─── DOM References ────────────────────────────────────────────────────────
 
@@ -352,6 +353,10 @@ function setActivePanel(panelId: PanelId | null): void {
       // used to be reachable only from the learning render path (its element
       // even lived in that panel), so PRIVACY AUDIT appeared to have no ledger.
       void loadLedger();
+      // ...and re-fetch the audit itself. It used to be render-only-on-event, so
+      // a panel that loaded after the run (or after the MV3 worker restarted)
+      // showed an empty audit for a run that had plenty to show.
+      void loadAudit();
       break;
     case "learning-dashboard":
       learningDashboardEl.classList.remove("hidden");
@@ -543,6 +548,10 @@ function renderPrivacyAudit(audit: {
   durationMs: number;
   /** True when a redacted frame actually left the browser (VLM vision on). */
   shipped?: boolean;
+  /** Every frame's verification — the basis for the run-level badge. */
+  verificationRollup?: AuditVerificationRollup;
+  /** The run's redaction counts, split by the channel that made them. */
+  tally?: { pageItems: number; frameRegions: number; tokens: number; total: number };
   verification?: {
     verified: boolean;
     regionsChecked: number;
@@ -562,26 +571,49 @@ function renderPrivacyAudit(audit: {
     };
   };
 }): void {
-  // Summary stats.
+  // Summary stats — one stat per CHANNEL, then a line that adds them up.
+  //
+  // "Redacted" used to name the painted-region count here, a larger DOM+frame
+  // total in the transcript, and a third number on the transcript chip, with
+  // nothing on screen saying which was which. Each stat now says what it
+  // counts, and the total is the sum of the parts (shared/metrics.ts owns that
+  // arithmetic, so the panel and the transcript line cannot drift apart).
   const summaryEl = $("audit-summary");
   const uniqueTokenCount = new Set(audit.allTokens.map((t) => t.token)).size;
+  const tally = audit.tally ?? {
+    pageItems: 0,
+    frameRegions: audit.totalRedacted,
+    tokens: uniqueTokenCount,
+    total: audit.totalRedacted,
+  };
   summaryEl.innerHTML = `
     <div class="audit-stat">
       <span class="number">${audit.totalPIIDetections}</span>
-      <span class="label">PII Detected</span>
+      <span class="label">Detections</span>
     </div>
     <div class="audit-stat">
-      <span class="number">${audit.totalRedacted}</span>
-      <span class="label">Regions Redacted</span>
+      <span class="number">${tally.frameRegions}</span>
+      <span class="label">Frame Regions Masked</span>
     </div>
     <div class="audit-stat">
-      <span class="number">${uniqueTokenCount}</span>
-      <span class="label">Tokens Created</span>
+      <span class="number">${tally.pageItems}</span>
+      <span class="label">Page Items Redacted</span>
     </div>
+    <div class="audit-tally">${escapeHtml(describeRedactionTally(tally))}</div>
   `;
 
   // Re-OCR proof line: the pixel-level verification of the shipped image.
   const verificationEl = $("audit-verification");
+  // Run-level frame outcomes FIRST, from every frame — this is the claim the
+  // transcript chip repeats. The card below it is one frame's own proof, which
+  // is evidence about that frame and never a statement about the run.
+  const rollup = audit.verificationRollup;
+  const rollupHtml = rollup
+    ? `<div class="verify-chip ${rollupClass(rollup)}">` +
+      `<span class="verify-badge">${rollupBadge(rollup)}</span>` +
+      `<span class="verify-summary">${escapeHtml(rollup.summary)}</span></div>`
+    : "";
+  const latestLabel = `<div class="verify-meta">Latest frame's own re-OCR proof:</div>`;
   if (audit.verification && audit.verification.regionsChecked > 0) {
     const v = audit.verification;
     const ok = v.verified;
@@ -608,7 +640,7 @@ function renderPrivacyAudit(audit: {
     const escalation = v.escalationReasons && v.escalationReasons.length > 0
       ? `<div class="verify-escalation">Rebuilt before sending — ${v.escalationReasons.map(escapeHtml).join("<br/>")}</div>`
       : "";
-    verificationEl.innerHTML = `
+    verificationEl.innerHTML = `${rollupHtml}${latestLabel}
       <div class="verify-chip ${ok ? "ok" : "warn"}">
         <span class="verify-badge">${v.escalated ? "↻ ESCALATED + VERIFIED" : ok ? "✓ VERIFIED" : "⚠ WARNING"}</span>
         <span class="verify-summary">${escapeHtml(v.summary)}</span>
@@ -623,9 +655,11 @@ function renderPrivacyAudit(audit: {
     // Zero regions flagged: nothing was measured, so this is neither a pass
     // nor a warning. It used to render as "⚠ WARNING" next to a summary that
     // began "VERIFIED" — two contradictory claims in one chip.
-    verificationEl.innerHTML = `<div class="verify-chip neutral"><span class="verify-badge">○ NOTHING TO VERIFY</span><span class="verify-summary">${escapeHtml(audit.verification.summary)}</span></div>`;
+    verificationEl.innerHTML = `${rollupHtml}${latestLabel}<div class="verify-chip neutral"><span class="verify-badge">○ NOTHING TO VERIFY</span><span class="verify-summary">${escapeHtml(audit.verification.summary)}</span></div>`;
   } else {
-    verificationEl.innerHTML = "";
+    // No per-frame card to show, but the run-level outcomes still are — an
+    // empty panel claimed there was no evidence when the rollup had some.
+    verificationEl.innerHTML = rollupHtml;
   }
 
   // Screenshots before/after — each is click-to-zoom, and the redacted shot
@@ -670,8 +704,14 @@ function renderPrivacyAudit(audit: {
       chip.className = "detection-chip";
       const emoji = KIND_EMOJI[d.kind] ?? "📌";
       const label = d.label || d.kind;
+      // Each row states the redaction tier it received, from the tier the
+      // painter recorded. An opaque mask, a reversible blur and a region that
+      // was deliberately left readable are different guarantees; a list that
+      // renders them identically cannot support the claim it is there to make.
+      const tier = tierBadge((d as { tier?: string }).tier);
       chip.innerHTML = `
         <span class="kind">${emoji} ${label}</span>
+        ${tier ? `<span class="tier ${tier === "none" ? "tier-none" : ""}">${tier}</span>` : ""}
         <span class="conf">${Math.round(d.confidence * 100)}%</span>
       `;
       const fpBtn = document.createElement("button");
@@ -711,29 +751,62 @@ function renderPrivacyAudit(audit: {
   appendAuditVerificationChip(audit);
 }
 
+/**
+ * The badge for a run's frame outcomes.
+ *
+ * Three states, not two: a run whose frames had nothing to check is neither a
+ * pass nor a failure, and folding it into "verified" is how an unmeasured run
+ * came to look like a measured one.
+ */
+function rollupBadge(rollup: AuditVerificationRollup): string {
+  if (rollup.framesFailed > 0) {
+    const failed = rollup.framesFailed;
+    return `⚠ ${failed} FRAME${failed === 1 ? "" : "S"} FAILED RE-OCR VERIFICATION`;
+  }
+  if (rollup.framesWithheld > 0) {
+    const withheld = rollup.framesWithheld;
+    return `⚠ ${withheld} FRAME${withheld === 1 ? "" : "S"} WITHHELD FROM EGRESS`;
+  }
+  if (rollup.allVerified) return "✓ ALL FRAMES VERIFIED";
+  return "○ NOTHING TO VERIFY";
+}
+
+function rollupClass(rollup: AuditVerificationRollup): "ok" | "warn" | "neutral" {
+  if (rollup.framesFailed > 0 || rollup.framesWithheld > 0) return "warn";
+  return rollup.allVerified ? "ok" : "neutral";
+}
+
 function appendAuditVerificationChip(audit: {
   totalRedacted: number;
   totalScreenshots: number;
   totalPIIDetections: number;
   allTokens: Array<{ token: string; kind: string }>;
-  verification?: { verified: boolean; summary: string };
+  verificationRollup?: AuditVerificationRollup;
+  tally?: { pageItems: number; frameRegions: number; tokens: number; total: number };
 }): void {
   const chip = document.createElement("div");
   chip.className = "entry audit-chip";
   // "ZERO-LEAK VERIFIED" claimed something this check cannot measure: it proves
   // the regions PRY redacted are unrecoverable in the shipped bytes, not that
-  // PRY found every sensitive thing on the page (see README §6.5).
-  const verifiedBadge = audit.verification?.verified
-    ? `<span class="chip-status ok">✓ REDACTIONS VERIFIED</span>`
-    : `<span class="chip-status warn">🔒 PRIVACY AUDIT</span>`;
-  const tokenCount = new Set(audit.allTokens.map((t) => t.token)).size;
+  // PRY found every sensitive thing on the page (see README §6.5). The claim is
+  // now scoped to what the rollup actually counts: the FRAMES, all of them.
+  const rollup = audit.verificationRollup;
+  const verifiedBadge = rollup && rollup.framesFailed === 0 && rollup.framesWithheld === 0 && rollup.allVerified
+    ? `<span class="chip-status ok">${rollupBadge(rollup)}</span>`
+    : `<span class="chip-status warn">${rollup && (rollup.framesFailed > 0 || rollup.framesWithheld > 0) ? rollupBadge(rollup) : "🔒 PRIVACY AUDIT"}</span>`;
+  const tally = audit.tally ?? {
+    pageItems: 0,
+    frameRegions: audit.totalRedacted,
+    tokens: new Set(audit.allTokens.map((t) => t.token)).size,
+    total: audit.totalRedacted,
+  };
 
   chip.innerHTML = `
     <div class="audit-chip-left">
       <div class="audit-chip-badge">${verifiedBadge}</div>
-      <div class="audit-chip-stats">
-        <span>🛡️ <strong>${audit.totalRedacted}</strong> Redacted</span>
-        <span>🔑 <strong>${tokenCount}</strong> Vault Tokens</span>
+      <div class="audit-chip-stats" title="${escapeHtml(describeRedactionTally(tally))}">
+        <span>🛡️ <strong>${tally.total}</strong> Redactions</span>
+        <span>🔑 <strong>${tally.tokens}</strong> Vault Tokens</span>
         <span>📸 <strong>${audit.totalScreenshots}</strong> Frames</span>
       </div>
     </div>
@@ -780,7 +853,7 @@ function overlayColor(kind: string): string {
 function buildShot(
   src: string,
   label: string,
-  detections: Array<{ kind: string; box?: { x: number; y: number; width: number; height: number } }>,
+  detections: Array<{ kind: string; box?: { x: number; y: number; width: number; height: number }; tier?: string }>,
   showZoomHint: boolean,
 ): HTMLElement {
   const shot = document.createElement("div");
@@ -819,7 +892,20 @@ function buildShot(
       mark.style.width = `${b.width * 100}%`;
       mark.style.height = `${b.height * 100}%`;
       mark.style.borderColor = overlayColor(d.kind);
-      mark.title = `${d.kind} — redacted here`;
+      // The tooltip says what actually happened to these pixels. It used to
+      // read "redacted here" for every box, including a region the pipeline
+      // deliberately left untouched (tier `skip`) — the proof image asserting a
+      // redaction that was never painted.
+      const badge = tierBadge(d.tier);
+      mark.title = badge && badge !== "none"
+        ? `${d.kind} — ${badge}`
+        : `${d.kind} — NOT redacted (left readable)`;
+      if (badge) {
+        const tierEl = document.createElement("span");
+        tierEl.className = `shot-overlay-tier ${badge === "none" ? "tier-none" : ""}`;
+        tierEl.textContent = badge;
+        mark.appendChild(tierEl);
+      }
       overlay.appendChild(mark);
     }
     shot.appendChild(overlay);
@@ -921,8 +1007,10 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
       if (!node) break;
       if (event.text !== undefined) {
         if (node.classList.contains("assistant")) {
-          // Assistant patches are streaming DELTAS — append them.
-          const current = (rawTexts.get(event.id) ?? "") + event.text;
+          // Assistant patches are streaming DELTAS — append them. A `replace`
+          // patch is the exception: a stream that was declared not-language is
+          // discarded from the card rather than left sitting there as the answer.
+          const current = (event.replace ? "" : (rawTexts.get(event.id) ?? "")) + event.text;
           if (hasVisibleAssistantText(current)) {
             rawTexts.set(event.id, current);
             const body = node.querySelector(".assistant-body");
@@ -1270,6 +1358,23 @@ function renderLearningDashboard(stats: {
 
 // ─── Privacy Ledger Display ────────────────────────────────────────────────
 
+/**
+ * Re-fetch the current run's privacy audit.
+ *
+ * `privacy-audit` arrives as a live event during a run; this is the pull side,
+ * used when the panel opens. Without it the audit panel was only ever as fresh
+ * as the last broadcast it happened to be listening for.
+ */
+async function loadAudit(): Promise<void> {
+  try {
+    const response = (await send({ kind: "get-audit" })) as { audit?: PrivacyAuditPayload | null } | undefined;
+    if (response?.audit) renderPrivacyAudit(response.audit);
+  } catch {
+    // A missing audit is not an error state to shout about: an empty panel with
+    // no run behind it is the honest rendering.
+  }
+}
+
 async function loadLedger(): Promise<void> {
   const ledgerEl = $("ledger-section");
   const response = (await send({ kind: "get-ledger" })) as any;
@@ -1592,7 +1697,7 @@ function renderTripwireLog(alerts: TripwireAlertDetail[], summary: string): void
   if (alerts.length === 0) {
     tripwireLogEl.innerHTML = `
       <div class="empty-state" style="padding: 14px;">
-        <p class="empty-sub">No third-party exfiltration detected. Outbound wire clean.</p>
+        <p class="empty-sub">No PII-shaped egress observed. Same-site sends are labelled separately, and the tripwire never blocks a request.</p>
       </div>
     `;
     return;
@@ -1613,8 +1718,21 @@ function renderTripwireLog(alerts: TripwireAlertDetail[], summary: string): void
       minute: "2-digit",
       second: "2-digit",
     });
+    // The destination's party is shown per row, because it decides how the row
+    // should be read: the page talking to its own backend is the site working,
+    // and only a different site is egress to somebody else. An unclassified
+    // alert (older producers set no flag) is shown as third-party, which is the
+    // louder reading and the one the aggregator counts.
+    const thirdParty = alert.thirdParty !== false;
+    const party = thirdParty
+      ? `<span class="tl-party third-party">third-party</span>`
+      : `<span class="tl-party same-site">same-site</span>`;
+    row.title = thirdParty
+      ? "PII-shaped value left the page for a different site. Observed and reported — PRY does not block requests."
+      : "PII-shaped value sent to this page's own site (its backend). Reported for completeness, not counted as third-party egress.";
     row.innerHTML = `
       <span class="tl-kind">${kind}</span>
+      ${party}
       <span class="tl-method">${escapeHtml(alert.method)}</span>
       <span class="tl-host" title="${escapeAttr(alert.url)}">${escapeHtml(host)}</span>
       <span class="tl-sample">${escapeHtml(alert.sample)}</span>

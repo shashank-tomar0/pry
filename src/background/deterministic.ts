@@ -225,3 +225,104 @@ export function tryDeterministic(
 
   return { resolved: false };
 }
+
+// ─── A task that is nothing but a navigation ────────────────────────────────
+
+/**
+ * Site words the user's own phrasing uses which are not the site's name.
+ *
+ * Kept separate from `KNOWN_DOMAIN_HOSTS` because the two answer different
+ * questions: that table says "what host does this bare name mean" (for BUILDING
+ * a URL), this one says "what hosts would satisfy this word" (for CHECKING one).
+ * "yt" and "mail" are how people speak, not hostnames, so they only belong
+ * here.
+ */
+const SITE_ALIASES: Record<string, string[]> = {
+  yt: ["youtube.com"],
+  ytube: ["youtube.com"],
+  // Both spellings reach the same place in practice — `gmail` resolves to
+  // gmail.com and immediately lands on mail.google.com — so both hosts satisfy
+  // either word. Listing only the canonical one would leave the check unable to
+  // recognise the very run it was written for.
+  gmail: ["mail.google.com", "gmail.com"],
+  mail: ["mail.google.com", "gmail.com"],
+  gh: ["github.com"],
+  fb: ["facebook.com"],
+  ig: ["instagram.com"],
+};
+
+export interface BareNavigationGoal {
+  /** The site token, as the user wrote it. */
+  site: string;
+  /** Hosts that satisfy it — lowercase, `www.` stripped. */
+  hosts: string[];
+}
+
+/** Lowercase and drop a leading `www.`, which is the only form compared. */
+function normalizeHost(host: string): string {
+  return host.trim().toLowerCase().replace(/^www\./, "");
+}
+
+/**
+ * A task whose ENTIRE content is one navigation: `open yt`, `go to gmail`.
+ *
+ * WHY THIS EXISTS
+ *
+ * A live run was asked to "open yt" and then clicked a video, read the page
+ * several more times, and answered with a paragraph about its own tooling —
+ * because nothing in the loop knew the task had been satisfied by the
+ * navigation itself. "Open <site>" has an observable, checkable success state:
+ * is the tab on that site? Once it is, every further step is the model inventing
+ * work, and on a slow reasoning model each invented step costs a minute.
+ *
+ * WHAT MAKES IT SAFE TO ACT ON
+ *
+ * The shape is deliberately tiny — a navigation verb followed by a SINGLE token
+ * and nothing else. That is what separates this from the tasks that must keep
+ * going:
+ *
+ *   "open yt"                                       → bare
+ *   "open gmail"                                    → bare
+ *   "open youtube.com"                              → bare
+ *   "open yt and search for iit"                    → not bare (a second step)
+ *   "open mail and open the first email i received" → not bare
+ *   "open the first video"                          → not bare (a step, not a site)
+ *
+ * and only names that RESOLVE may be treated as satisfiable at all — an
+ * unresolvable token ("open settings") returns null, so a run can never stop on
+ * a check it is unable to perform.
+ */
+export function bareNavigationGoal(task: string): BareNavigationGoal | null {
+  const trimmed = String(task ?? "").trim().replace(/[.!?]+$/, "");
+  const match = trimmed.match(/^(?:open|go to|goto|visit|navigate to|launch|show me)\s+(\S+)$/i);
+  if (!match) return null;
+  const site = normalizeHost(match[1]);
+  if (site.length === 0) return null;
+
+  // A hostname the user typed is its own goal — there is nothing to resolve.
+  if (/^[\w-]+(?:\.[\w-]+)+$/.test(site)) return { site, hosts: [site] };
+
+  const canonical = canonicalHost(site);
+  const aliases = SITE_ALIASES[site];
+  if (!canonical && !aliases) return null;
+  return { site, hosts: [...new Set([...(canonical ? [canonical] : []), ...(aliases ?? [])])] };
+}
+
+/**
+ * Is `url` on a host that satisfies this goal?
+ *
+ * EXACT host match, deliberately — a subdomain does NOT count. `gist.github.com`
+ * is not `github.com`, and the cost of the two errors is not symmetric: a false
+ * positive stops the run on a page that is not the one the user asked for, while
+ * a false negative simply continues the run the way it worked before. So the
+ * check only ever says yes when the tab is on the site itself.
+ */
+export function hostSatisfiesBareGoal(goal: BareNavigationGoal, url: string): boolean {
+  let host: string;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return false;
+  }
+  return goal.hosts.includes(normalizeHost(host));
+}

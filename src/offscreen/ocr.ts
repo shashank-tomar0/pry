@@ -67,6 +67,35 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   }
 }
 
+/**
+ * One recognition at a time, each job's deadline starting when the job STARTS.
+ *
+ * Tesseract's worker runs a single job at a time but does not say so: a second
+ * `recognize` issued while the first is running simply queues inside the worker.
+ * Each caller here races its OWN timeout, so that queued caller's clock was
+ * already running while its job had not begun — and on a cold worker the two
+ * OCR-consuming stages of a first capture (frame-text triage and the re-OCR
+ * verification of the shipped bytes) raced the same ~10.5 s start-up. The loser
+ * hit its deadline with nothing to show, and its recovery path terminates the
+ * worker — killing the engine the first caller was still using, whose own
+ * recognition then failed and paid a SECOND cold start. One frame, twice the
+ * cold start, and neither a result nor a failure to report.
+ *
+ * Queuing here also makes a timeout mean what it says: only one job can be
+ * running when a deadline expires, so terminating the worker can no longer
+ * behead a concurrent caller.
+ */
+let queueTail: Promise<void> = Promise.resolve();
+
+function enqueue<T>(job: () => Promise<T>): Promise<T> {
+  const run = queueTail.then(job, job);
+  queueTail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 async function recognize(dataUrl: string, timeoutMs: number): Promise<Page | null> {
   let worker: Worker;
   try {
@@ -85,14 +114,18 @@ async function recognize(dataUrl: string, timeoutMs: number): Promise<Page | nul
   }
 
   try {
-    const result = await Promise.race([
-      // `blocks: true` is what carries per-word bounding boxes; `text` keeps the
-      // existing text callers unchanged.
-      worker.recognize(dataUrl, {}, { text: true, blocks: true }),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("OCR timeout")), timeoutMs),
-      ),
-    ]);
+    // The deadline is created INSIDE the queued job, so it measures recognition
+    // rather than time spent waiting for the worker — see `enqueue`.
+    const result = await enqueue(() =>
+      Promise.race([
+        // `blocks: true` is what carries per-word bounding boxes; `text` keeps the
+        // existing text callers unchanged.
+        worker.recognize(dataUrl, {}, { text: true, blocks: true }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("OCR timeout")), timeoutMs),
+        ),
+      ]),
+    );
     return (result?.data as Page) ?? null;
   } catch {
     // A timed-out recognize leaves the single worker busy forever — every

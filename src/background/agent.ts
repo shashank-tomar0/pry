@@ -30,7 +30,7 @@ import { detectInjection, gate } from "./safety";
 import { detectAllPIIDetailed } from "./pii-detector";
 import { redactSnapshot } from "./redaction";
 import { tokenizer, repairTokenConcatenation, buildTokenLegend } from "./tokenizer";
-import { tryDeterministic } from "./deterministic";
+import { tryDeterministic, bareNavigationGoal, hostSatisfiesBareGoal } from "./deterministic";
 import { createPlanner } from "./providers";
 import type { ConvMessage, ToolOutcome } from "./providers/types";
 import type { ActionExperience, PIIExperience, RunExperience } from "./experience-memory";
@@ -570,6 +570,8 @@ export async function runTask(
   let frameWaitOverran = false;
   /** Said once, when the wait stops being worth placing. */
   let announcedFrameWaitAbandoned = false;
+  /** Said once, when a frame's stage breakdown is printed — see below. */
+  let announcedFrameCost = false;
   /** Evidence joined after the last planner turn, not yet handed to the planner. */
   let carriedFrameNote = "";
 
@@ -626,6 +628,35 @@ export async function runTask(
       }));
       const verification = processed.verification;
       noteVerification(verification);
+
+      // A frame that came back OVER the wait budget is the reported stall, and
+      // the stage breakdown for it was measured in the browser — the only place
+      // these numbers exist — so it is printed where the cost was felt. Said
+      // once per run: every later frame on the same page pays the same stages,
+      // and a transcript that repeats its diagnosis is noise. The remainder is
+      // shown as well, because the stages do not sum to the total and pretending
+      // they do would hide the arithmetic that is still unaccounted for.
+      if (
+        !announcedFrameCost &&
+        processed.stages?.length &&
+        processed.processingTimeMs > FRAME_AUDIT_WAIT_MS
+      ) {
+        announcedFrameCost = true;
+        const marked = processed.stages.reduce((sum, s) => sum + s.ms, 0);
+        const rest = Math.max(0, Math.round(processed.processingTimeMs) - marked);
+        emit({
+          kind: "entry",
+          entry: {
+            id: nextId(),
+            role: "system",
+            text:
+              `Frame cost ${(processed.processingTimeMs / 1000).toFixed(1)}s, over the ` +
+              `${Math.round(FRAME_AUDIT_WAIT_MS / 1000)}s wait budget. Measured in this browser — ` +
+              processed.stages.map((s) => `${s.stage} ${(s.ms / 1000).toFixed(1)}s`).join(" · ") +
+              ` · other ${(rest / 1000).toFixed(1)}s.`,
+          },
+        });
+      }
 
       let summary = "";
       if (summaryLabel) {
@@ -1369,8 +1400,44 @@ export async function runTask(
     setActiveNerSpans([]);
   }
 
+  // A task that is nothing but a navigation, computed once from the task text.
+  // See bareNavigationGoal for why the shape is kept this narrow.
+  const bareGoal = bareNavigationGoal(task);
+
   for (let step = 0; step < settings.maxSteps; step++) {
     if (signal.aborted) { finishTask(); return; }
+
+    // ─── A bare navigation goal that is already satisfied ends the run ──────
+    //
+    // Checked at the TOP of the loop, so it covers both routes that can move
+    // the tab: the deterministic planner (which executes on step 0 and then
+    // continues) and the model's own navigate. Either way the NEXT planner turn
+    // is the one this prevents — and on a reasoning model that turn is a minute
+    // of invented work: the reported "open yt" run answered a one-word
+    // navigation with a paragraph about its own tooling, after clicking a video
+    // the task never asked for.
+    //
+    // The answer states only what is checkable (the tab's URL) and says why the
+    // run stopped, so a stop is never mistaken for the task being finished some
+    // other way. The frame pipeline this step started keeps running and files
+    // its own ledger entry and audit record, exactly as it does on Stop.
+    if (bareGoal && snapshot?.url && hostSatisfiesBareGoal(bareGoal, snapshot.url)) {
+      emit({
+        kind: "entry",
+        entry: {
+          id: nextId(),
+          role: "assistant",
+          text:
+            `The tab is on ${sanitizeUrl(snapshot.url)} — that is everything ` +
+            `"${task.trim()}" asked for, so the run stopped there instead of looking for ` +
+            `a next step.`,
+        },
+      });
+      finalAnswerGiven = true;
+      reportUndeliveredFrameNote();
+      finishTask();
+      return;
+    }
 
     // The model plans against the snapshot rendered in the previous turn, and
     // its ids are only meaningful against THAT read — so the read is recorded
@@ -2046,6 +2113,37 @@ export async function runTask(
             `${nonLatinLetterScripts(turn.text).length} scripts mixed into punctuation fragments — ` +
             `so it is not shown as the task's result. No action was taken on the page this turn. ` +
             `Rerun, or switch to a steadier model (Groq openai/gpt-oss-20b) in the options.`,
+        },
+      });
+      reportUndeliveredFrameNote();
+      finishTask();
+      return;
+    }
+
+    // A FINAL ANSWER THAT NARRATES THE LOOP is refused for the same reason the
+    // glitch text above is: it is not a result, and presenting it as one tells
+    // the user the task ended when what actually happened was the model talking
+    // to itself. See finalAnswerComplaint — the guard checks for the loop's own
+    // vocabulary, not for writing quality.
+    const loopNarration =
+      turn.stopReason !== "refusal" && turn.toolCalls.length === 0
+        ? finalAnswerComplaint(turn.text)
+        : null;
+    if (loopNarration) {
+      errorCount++;
+      if (opened) {
+        emit({ kind: "patch", id: entryId, replace: true, text: DISCARDED_STREAM_NOTE });
+      }
+      emit({
+        kind: "entry",
+        entry: {
+          id: nextId(),
+          role: "error",
+          text:
+            `The planner (${planner.label}) answered with a note about its own loop ` +
+            `("${loopNarration}") rather than a result, so it is not shown as this task's ` +
+            `answer. The page is where the transcript says it is; rerun the step, or check ` +
+            `the page and ask again.`,
         },
       });
       reportUndeliveredFrameNote();
@@ -2950,6 +3048,51 @@ export function isWordSalad(text: string): boolean {
   if (words < DEGENERATION_MIN_WORDS) return false;
   if (punctuationDensity(text) < DEGENERATION_SALAD_PUNCT_DENSITY) return false;
   return true;
+}
+
+/**
+ * Phrases in which an answer narrates the agent's OWN loop: a future or absent
+ * tool call, a reply that has not arrived, the conversation ending.
+ *
+ * Deliberately narrow, and deliberately only about the loop. This guard cannot
+ * judge coherence and does not try to — an under-constrained "does this read
+ * well?" heuristic would refuse real answers, which is worse than shipping a
+ * rambling one. What it can recognise with certainty is an answer written from
+ * inside the loop: a reply to the user never discusses its own tool protocol.
+ *
+ * The shape is taken verbatim from the reported run, whose entire result was:
+ *
+ *   "The task was to \"open yt\", which I interpret as opening YouTube. I
+ *    navigated to youtube.com and then clicked on the first video result. The
+ *    user's task was simply \"open yt\", which I've got no response yet (this
+ *    will be the last tool call for a while)"
+ *
+ * Past-tense talk about tools is NOT caught ("I used click_text to open it" is a
+ * normal way to report a result); what is caught is the loop talking to itself.
+ */
+const LOOP_NARRATION_PATTERNS: RegExp[] = [
+  // "(this will be the last tool call for a while)"
+  /\b(?:last|next|final)\s+(?:tool|function)\s+call\b/i,
+  // "which I've got no response yet", "no reply yet from the model"
+  /\bno\s+(?:response|reply|answer)\s+yet\b/i,
+  // "this will be the last turn", "I'll answer in the next turn"
+  /\b(?:last|next)\s+turn\b/i,
+];
+
+/**
+ * Why this text must not be shown as the task's result, or null when it may.
+ *
+ * Returns the offending phrase so the notice the user reads can quote what
+ * tripped it instead of asserting a verdict they cannot check.
+ */
+export function finalAnswerComplaint(text: string): string | null {
+  const value = String(text ?? "");
+  if (value.trim().length === 0) return null;
+  for (const pattern of LOOP_NARRATION_PATTERNS) {
+    const match = pattern.exec(value);
+    if (match) return match[0].toLowerCase();
+  }
+  return null;
 }
 
 /**

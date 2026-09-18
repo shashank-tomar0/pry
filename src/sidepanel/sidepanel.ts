@@ -780,8 +780,29 @@ function rollupBadge(rollup: AuditVerificationRollup): string {
     const withheld = rollup.framesWithheld;
     return `⚠ ${withheld} FRAME${withheld === 1 ? "" : "S"} WITHHELD FROM EGRESS`;
   }
-  if (rollup.allVerified) return "✓ ALL FRAMES VERIFIED";
+  // "ALL FRAMES VERIFIED" read as "everything on the page was destroyed", and a
+  // live run proved how wrong that reading is: a thumbnail face neither channel
+  // boxed was plainly visible in the very audit frame this badge sat above. The
+  // check that actually ran is narrower than the claim was, so the badge names
+  // the check (re-OCR, over the frames it covered) and the scope sentence below
+  // it states the limit. A number the evidence supports beats a word it does not.
+  if (rollup.allVerified) return `✓ RE-OCR VERIFIED (${rollup.framesTotal} FRAME${rollup.framesTotal === 1 ? "" : "S"})`;
   return "○ NOTHING TO VERIFY";
+}
+
+/**
+ * What the badge above proves, and what it cannot.
+ *
+ * Shown next to the badge rather than buried in a document, because the two
+ * lines it makes are the difference between a control and a claim: the re-OCR
+ * pass re-reads the shipped bytes of every region PRY PAINTED, and the face
+ * channels are detectors with a floor, so a face nobody detected is not covered
+ * by this check. Reported from the evidence the same run produced when it has
+ * one — a run that covered nothing face-wise says so with its own numbers.
+ */
+function verificationScope(rollup: AuditVerificationRollup): string {
+  return "Re-OCR re-read every region PRY painted and found it unreadable in the shipped bytes. " +
+    "Faces are detector work, not proof: a face no channel found is not covered by this check.";
 }
 
 function rollupClass(rollup: AuditVerificationRollup): "ok" | "warn" | "neutral" {
@@ -857,6 +878,7 @@ function appendAuditVerificationChip(audit: {
         <span>🔑 <strong>${tally.tokens}</strong> Vault Tokens</span>
         <span>📸 <strong>${audit.totalScreenshots}</strong> Frames</span>
       </div>
+      ${rollup ? `<div class="audit-chip-scope">${escapeHtml(verificationScope(rollup))}</div>` : ""}
     </div>
     <button class="audit-chip-inspect-btn" type="button">INSPECT PROOF →</button>
   `;

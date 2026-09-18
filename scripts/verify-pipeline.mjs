@@ -2584,6 +2584,20 @@ ok("so a re-render of the same payload does not append a second card",
 ok("and a later run with different numbers still gets its own card",
   /totalScreenshots/.test(panelSource.slice(panelSource.indexOf("function auditChipSignature"),
     panelSource.indexOf("function appendAuditVerificationChip"))));
+// The badge used to read "ALL FRAMES VERIFIED" over a frame with a plainly
+// readable face, because the check that ran is narrower than that sentence. It
+// now names the check (re-OCR, over the frames it covered) and the card states
+// the limit — a detector miss is not something re-reading regions can find.
+ok("the verified badge names the check that actually ran",
+  /return `✓ RE-OCR VERIFIED \(\$\{rollup\.framesTotal\}/.test(panelSource) &&
+    // The old wording may survive only in the comment that explains why it went:
+    // what must be gone is the STRING that was rendered.
+    !/["'`]✓ ALL FRAMES VERIFIED/.test(panelSource));
+ok("and the card states what that check cannot cover",
+  /function verificationScope\(/.test(panelSource) &&
+    /Faces are detector work, not proof/.test(panelSource) &&
+    /audit-chip-scope/.test(panelSource) &&
+    /audit-chip-scope/.test(await readFile("src/sidepanel/styles.css", "utf8")));
 
 // ── Scenario BD: the page moved between the capture and the region scan ────
 // Regions are measured AFTER the pixels were taken (a message round trip, plus
@@ -5149,6 +5163,69 @@ ok("the old boolean guard is gone (no second copy of the policy in the loop)",
   !/function isLooping\(\)/.test(agentSource2) &&
     !/recentActions\.every\(\(a\) => !actionChangesFrame/.test(agentSource2));
 
+// ── Scenario BF: targeted probes reach the faces the coarse grid cannot ─────
+// A live run shipped a thumbnail grid with a face plainly readable in the frame
+// the audit compared side by side. The arithmetic: the model's input is a fixed
+// ~128 px, so the scale a face gets is ~128 / max(crop side). The whole frame
+// scales at 0.1 (a 40 px face → 4 px); the ≤16-crop grid comes out ~334 px on a
+// 1280×800 frame (the same face → ~15 px). Both are at or below what the
+// short-range model resolves, and no threshold recovers pixels never fed to it.
+// The skin-colour pass — the only channel that already SEES a 14 px face, and
+// the only one that costs no model call — is used as a PROPOSAL: crop a small
+// window around each unexplained blob at native resolution and let the model
+// judge that window.
+console.log("\n=== Scenario BF: targeted native-resolution probes ===\n");
+
+const { planFaceProbes, FACE_PROBE_MAX, FACE_PROBE_MAX_SIDE_PX } =
+  await import("../src/shared/face-regions.ts");
+const probeFrame = { width: 1280, height: 800 };
+const thumb = { x: 359, y: 198, width: 44, height: 44, confidence: 0.62, source: "skin" };
+
+const probed = planFaceProbes(probeFrame, [thumb], []);
+ok("an unexplained skin blob becomes exactly one probe", probed.length === 1, JSON.stringify(probed));
+ok("the probe CONTAINS the blob it was planned for",
+  probed[0].x <= thumb.x && probed[0].y <= thumb.y &&
+    probed[0].x + probed[0].width >= thumb.x + thumb.width &&
+    probed[0].y + probed[0].height >= thumb.y + thumb.height, JSON.stringify(probed[0]));
+ok("and it is small enough to be real magnification",
+  Math.max(probed[0].width, probed[0].height) <= FACE_PROBE_MAX_SIDE_PX, JSON.stringify(probed[0]));
+// The point of the pass, stated as arithmetic: at this crop size the model sees
+// the face at the size it can actually resolve.
+const probeScale = 128 / Math.max(probed[0].width, probed[0].height);
+const wholeFrameScale = 128 / 1280;
+const coarseTileScale = 128 / 334;
+ok("a 44 px face arrives at a detectable size in the probe, unlike the other two passes",
+  thumb.width * probeScale > 20 &&
+    thumb.width * wholeFrameScale < 5 &&
+    thumb.width * coarseTileScale < 20,
+  `${(thumb.width * probeScale).toFixed(1)} px probed vs ` +
+    `${(thumb.width * wholeFrameScale).toFixed(1)} whole-frame, ` +
+    `${(thumb.width * coarseTileScale).toFixed(1)} coarse-tile`);
+
+ok("a blob a model box already explains is not re-asked",
+  planFaceProbes(probeFrame, [thumb], [{ ...thumb, confidence: 0.9, source: "model" }]).length === 0);
+ok("two blobs in one thumbnail cost one detector call, not two",
+  planFaceProbes(probeFrame, [thumb, { ...thumb, x: 365, y: 204, width: 30, height: 30, source: "skin" }], [])
+    .length === 1);
+ok("the cap bounds the pass, so a photo wall cannot spend the frame budget",
+  planFaceProbes(
+    probeFrame,
+    Array.from({ length: 40 }, (_, i) => ({
+      x: (i % 10) * 120, y: Math.floor(i / 10) * 180, width: 40, height: 40, confidence: 0.6, source: "skin",
+    })),
+    [],
+  ).length === FACE_PROBE_MAX);
+ok("a blob too big to magnify is left to the coarse grid",
+  planFaceProbes(probeFrame, [{ x: 100, y: 100, width: 500, height: 500, confidence: 0.7, source: "skin" }], [])
+    .length === 0);
+ok("probes stay inside the frame",
+  planFaceProbes(probeFrame, [{ x: 0, y: 0, width: 40, height: 40, confidence: 0.6, source: "skin" }], [])[0].x === 0 &&
+    planFaceProbes(probeFrame, [{ x: 1240, y: 760, width: 40, height: 40, confidence: 0.6, source: "skin" }], [])
+      .every((p) => p.x + p.width <= 1280 && p.y + p.height <= 800));
+ok("nothing proposed means no detector calls at all",
+  planFaceProbes(probeFrame, [], []).length === 0 &&
+    planFaceProbes({ width: 0, height: 0 }, [thumb], []).length === 0);
+
 // ── The tiled face pass is WIRED, not merely available ─────────────────────
 // A pure policy that nothing calls is the failure mode this file keeps finding.
 // Asserted against the offscreen source here because that file is read above.
@@ -5177,6 +5254,18 @@ ok("the secondary model detector is gated on evidence, not on a count",
 ok("the attack re-probe stays a single full-frame pass, and says why",
   /await detectFacesWithBlazeFace\(shippedCanvas\)/.test(offscreenSource) &&
     /Deliberately NOT the tiled pass either/.test(offscreenSource));
+// …and the targeted probes are WIRED into the main pass, after the cheap channel
+// that proposes them and before the fusion that paints them — a policy nothing
+// calls is the failure this file keeps finding.
+ok("the pipeline plans probes from the skin proposals and runs them on the frame",
+  /planFaceProbes\(\{ width, height \}, skinFaces, modelFaces\)/.test(offscreenSource) &&
+    /detectFacesOnProbes\(originalCanvas, probes\)/.test(offscreenSource));
+ok("probe boxes come back as MODEL findings, so a colour histogram never paints this frame",
+  /const probed = \(await detectFacesOnProbes\(originalCanvas, probes\)\)\.map\(\s*\n\s*\(f\) => \(\{ \.\.\.f, source: "model" as const \}\)/.test(offscreenSource));
+ok("and a probe failure cannot cost the boxes the other channels found",
+  /A probe failure must not cost the boxes the other channels already found/.test(offscreenSource));
+ok("the probe crop is drawn 1:1, so its boxes are frame pixels after the offset",
+  /probeCtx\.drawImage\(canvas, probe\.x, probe\.y, probe\.width, probe\.height, 0, 0, probe\.width, probe\.height\)/.test(offscreenSource));
 
 // ── The frame budget: what a capture may spend before the planner gives up ──
 // The per-tile OCR bound bounded ONE tile and nothing else: six tiles at 8 s is
@@ -5243,5 +5332,156 @@ ok("and the resolution is said out loud rather than left implied",
     /were found in this/.test(workerSource));
 ok("the offscreen document reports the evidence as counts, never a sample",
   /stillLegible: stillLegible\.length,\s*\n\s*\/\/ Deliberately no samples/.test(offscreenSource));
+
+// ── Scenario BC: the first capture's OCR cold start is paid ONCE ────────────
+// The cold start (~10.5 s measured) used to be raced by BOTH OCR consumers of a
+// first capture, because each raced its own timeout against a worker that
+// queues internally — so the loser's deadline expired while its job had not even
+// begun, and its recovery path terminated the engine the winner was using. One
+// frame paid the start-up twice and produced neither a result nor a failure.
+console.log("\n=== Scenario BC: one recognition at a time, one cold start ===\n");
+
+ok("OCR jobs are queued rather than raced against one worker",
+  /let queueTail: Promise<void> = Promise\.resolve\(\);/.test(ocrSource) &&
+    /const run = queueTail\.then\(job, job\);/.test(ocrSource));
+ok("and each job's deadline is created INSIDE the queued job, so it measures recognition",
+  /const result = await enqueue\(\(\) =>\s*\n\s*Promise\.race\(\[/.test(ocrSource));
+ok("the worker is still built exactly once and shared",
+  (ocrSource.match(/createWorker\(/g) ?? []).length === 1 &&
+    /export function warmOcrWorker\(\): void \{\s*\n\s*void getWorker\(\)/.test(ocrSource));
+ok("the double payment is stated where the fix lives, not only in the commit message",
+  /paid a SECOND cold start/.test(ocrSource));
+// A timeout now means the single running job is wedged, which is what makes the
+// terminate-and-rebuild recovery safe for every other caller.
+ok("the terminate path is only reachable while one job can be running",
+  /workerPromise = null;\s*\n\s*return null;/.test(ocrSource));
+
+// ── Scenario BD: the frame's cost is measured stage by stage, in the browser ─
+// The pixel pipeline's real costs exist only in the browser, so the measurement
+// lives there and the agent prints it when a frame misses the wait budget. The
+// stages are asserted by NAME: a breakdown that cannot say which stage was slow
+// is not a measurement, and the numbers it replaced were guesses.
+console.log("\n=== Scenario BD: a frame names the stage that cost the time ===\n");
+
+for (const stage of ["decode", "dom-regions", "faces", "frame-text-ocr", "encode", "verify"]) {
+  ok(`the pipeline times the ${stage} stage`,
+    offscreenSource.includes(`markStage("${stage}"`));
+}
+ok("every stage is marked in execution order around the work it names",
+  offscreenSource.indexOf('markStage("decode"') < offscreenSource.indexOf('markStage("faces"') &&
+    offscreenSource.indexOf('markStage("faces"') < offscreenSource.indexOf('markStage("frame-text-ocr"') &&
+    offscreenSource.indexOf('markStage("frame-text-ocr"') < offscreenSource.indexOf('markStage("verify"'));
+ok("and the breakdown travels with the frame it describes",
+  /stages: Array<\{ stage: string; ms: number \}>;/.test(offscreenSource) &&
+    /^\s+stages,$/m.test(offscreenSource) &&
+    /stages\?: Array<\{ stage: string; ms: number \}>;/.test(typesSource));
+ok("the agent prints the breakdown only for a frame that missed the wait budget",
+  /processed\.stages\?\.length &&\s*\n\s*processed\.processingTimeMs > FRAME_AUDIT_WAIT_MS/.test(agentSource));
+ok("and the stages that do not sum to the total are reported as unaccounted",
+  /const rest = Math\.max\(0, Math\.round\(processed\.processingTimeMs\) - marked\)/.test(agentSource) &&
+    /other \$\{\(rest \/ 1000\)\.toFixed\(1\)\}s/.test(agentSource));
+ok("a diagnosis that repeats on every slow frame is not a diagnosis",
+  /announcedFrameCost = true;/.test(agentSource) &&
+    /if \(\s*!announcedFrameCost &&/.test(agentSource));
+
+// ── Scenario BE: a bare navigation goal can be checked, so it can end a run ──
+// "open yt" navigated and then kept going — clicking a video, re-reading the
+// page, and finally answering with a paragraph about its own tooling. The shape
+// that makes the goal checkable is narrow on purpose: one navigation verb, one
+// site token, nothing else.
+console.log("\n=== Scenario BE: a task that is only a navigation ===\n");
+
+const { bareNavigationGoal, hostSatisfiesBareGoal } = await import("../src/background/deterministic.ts");
+
+const BARE = [
+  ["open yt", "https://www.youtube.com/"],
+  ["Open Gmail", "https://mail.google.com/mail/u/0/"],
+  ["go to gmail", "https://gmail.com/"],
+  ["open youtube.com", "https://www.youtube.com/feed/subscriptions"],
+  ["visit mail.google.com", "https://mail.google.com/"],
+  ["open yt.", "https://youtube.com/"],
+  ["  show me github  ", "https://github.com/"],
+];
+for (const [task, url] of BARE) {
+  const goal = bareNavigationGoal(task);
+  ok(`"${task}" is a bare navigation and is satisfied by ${new URL(url).host}`,
+    goal !== null && hostSatisfiesBareGoal(goal, url),
+    JSON.stringify({ goal, url }));
+}
+
+// The tasks that MUST keep going. Each one has a step after the navigation, and
+// stopping on the site's own homepage would abandon it.
+const NOT_BARE = [
+  "open yt and search for iit",
+  "open youtube and search for harkirat singh",
+  "open mail and open the first email i recieved",
+  "open the first video",
+  "open gmail and send a email to priya@example.com and say hi to him",
+  "go to the settings page and turn on dark mode",
+];
+for (const task of NOT_BARE) {
+  ok(`"${task}" is not treated as a bare navigation`,
+    bareNavigationGoal(task) === null);
+}
+
+// An unresolvable token is not a site, so no run may stop on it.
+ok("a token that is not a site cannot satisfy anything",
+  bareNavigationGoal("open settings") === null && bareNavigationGoal("open my inbox") === null &&
+    bareNavigationGoal("open") === null);
+// Exact host only: a subdomain is NOT the site, because the two errors are not
+// symmetric — a false positive abandons the task, a false negative just runs on.
+ok("a subdomain is not the site the user asked for",
+  !hostSatisfiesBareGoal(bareNavigationGoal("open github"), "https://gist.github.com/x") &&
+    !hostSatisfiesBareGoal(bareNavigationGoal("open gmail"), "https://news.google.com/"));
+ok("and a different site is not it either",
+  !hostSatisfiesBareGoal(bareNavigationGoal("open yt"), "https://vimeo.com/"));
+
+// Wiring, in the loop rather than in a helper nothing calls: the check must see
+// BOTH routes that can move the tab (deterministic navigate and the model's own),
+// which is what putting it at the top of the loop buys — and it must land before
+// the planner turn it exists to prevent.
+const bareGoalCheck = agentSource.indexOf("const bareGoal = bareNavigationGoal(task);");
+const firstPlannerTurn = agentSource.indexOf("await runPlannerTurn(");
+ok("the loop computes the goal once, from the task",
+  bareGoalCheck > 0);
+ok("and checks it before the planner turn it exists to prevent",
+  bareGoalCheck < firstPlannerTurn &&
+    /if \(bareGoal && snapshot\?\.url && hostSatisfiesBareGoal\(bareGoal, snapshot\.url\)\)/.test(agentSource),
+  `${bareGoalCheck} < ${firstPlannerTurn}`);
+const bareStop = agentSource.indexOf("if (bareGoal && snapshot?.url");
+ok("the stop reports the tab's URL rather than claiming the task was performed",
+  /asked for, so the run stopped there instead of looking for/.test(agentSource) &&
+    bareStop > 0 && /role: "assistant"/.test(agentSource.slice(bareStop, bareStop + 1400)) &&
+    /finishTask\(\);\s*\n\s*return;/.test(agentSource.slice(bareStop, bareStop + 1400)));
+
+// ── Scenario BF: an answer that narrates the loop is not a result ───────────
+// Verbatim from the reported run: the whole result of "open yt" was a paragraph
+// about its own tool calls. The guard is narrow by design — it recognises the
+// loop's own vocabulary, not writing quality.
+console.log("\n=== Scenario BF: the model answering about itself ===\n");
+
+// The predicate itself is exercised THROUGH a real run in the agent-loop suite
+// (scripts/agent-frame-audit-test.mjs), which bundles agent.ts with the browser
+// stubbed; here the wiring is pinned where it is defined and called.
+const complaintSource = agentSource;
+ok("the loop-narration guard exists and is exported for the harness",
+  /export function finalAnswerComplaint\(text: string\): string \| null \{/.test(complaintSource));
+const narrationPatterns = complaintSource.slice(
+  complaintSource.indexOf("const LOOP_NARRATION_PATTERNS"),
+  complaintSource.indexOf("export function finalAnswerComplaint"),
+);
+ok("it recognises the reported answer as narration about the loop",
+  narrationPatterns.includes("/\\b(?:last|next|final)\\s+(?:tool|function)\\s+call\\b/i") &&
+    narrationPatterns.includes("\\bno\\s+(?:response|reply|answer)\\s+yet\\b"));
+ok("the refusal is wired where a final answer would otherwise be shown",
+  /finalAnswerComplaint\(turn\.text\)/.test(complaintSource) &&
+    /turn\.toolCalls\.length === 0\s*\n\s*\? finalAnswerComplaint\(turn\.text\)/.test(complaintSource));
+ok("it discards the card the narration was already painted into",
+  (complaintSource.match(/DISCARDED_STREAM_NOTE/g) ?? []).length >= 4);
+const loopNarrationAt = complaintSource.indexOf("if (loopNarration)");
+ok("and it reports the failure instead of naming a result",
+  loopNarrationAt > 0 &&
+    /rather than a result, so it is not shown as this task's/.test(complaintSource.slice(loopNarrationAt, loopNarrationAt + 1400)) &&
+    /role: "error"/.test(complaintSource.slice(loopNarrationAt, loopNarrationAt + 1400)));
 
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

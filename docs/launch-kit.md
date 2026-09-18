@@ -96,7 +96,7 @@ worked.
 
 | Capability | Proof | Notes |
 |------------|-------|-------|
-| Scribe hold-to-talk STT | Token mint returns `200` with a working key; the dictation button appears and produces a final transcript when committed | FreeScreeps is the path that piggybacks on the Scribe pipeline; the audio capture path is wired through the Scribe helper |
+| Scribe tap-to-toggle STT | Token mint returns `200` with a working key; the dictation button appears, records until tapped a second time, and produces a final transcript when committed | FreeScreeps is the path that piggybacks on the Scribe pipeline; the audio capture path is wired through the Scribe helper |
 | On-device NER (token-classification) | `node scripts/eval-ner.mjs` passes against the real weights — whole spans come out without fragments | The model loads from `models/ner/`, does real inference, and the self-test now lists what it would actually redact |
 | Vision pipeline (if enabled) | Vision provider reachable; the screenshot path calls it | Validate with a task that depends on seeing the redacted screenshot |
 | Scribe token mint for real-time STT | Mint endpoint returns `200` and the token is accepted | The “Scribe Token Mint” step is what powers the FreeScreeps dictation |

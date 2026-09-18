@@ -11,10 +11,63 @@
  *      as "[redacted]", never as its literal syntax.
  *   2. PCM conversion helpers exist only to move audio; no audio is retained
  *      anywhere (buffers are dropped after scheduling).
+ *
+ * The module's third job is words: the mic's announced contract and the click
+ * decision behind it both live here, because the panel shipped text that
+ * described a different interaction than the one it implemented. "Hold the mic
+ * button to talk (release to send)" was on screen while the button ran a
+ * click-to-start / click-to-send toggle, so users held a button that had
+ * already started recording and released it expecting a send that a hold could
+ * no longer perform. Prose living next to the code it describes drifts; prose
+ * pinned by the harness (see scripts/voice-test.mjs) does not.
  */
 
 /** Pronunciation used for vault tokens in spoken output. */
 const SPOKEN_REDACTED = "redacted";
+
+/**
+ * The one line the panel shows when dictation becomes available.
+ *
+ * Deliberately describes the interaction the button ACTUALLY implements —
+ * tap to start, tap again to send — and deliberately free of any hold/release
+ * wording, which is what it used to say. It is a constant rather than a
+ * literal at the render site so the copy cannot drift from the button again
+ * without a test failing (scripts/voice-test.mjs asserts both halves).
+ */
+export const MIC_READY_ANNOUNCEMENT =
+  "Voice: dictation ready. Tap the mic button to start recording, then tap it again to send.";
+
+/** What a click on the mic button should do right now. */
+export type MicToggleAction =
+  /** Voice is available and idle: a tap opens the mic and starts dictating. */
+  | "start"
+  /** A recording is open: a tap closes it and sends what was heard. */
+  | "stop"
+  /** Voice is not configured (no key, STT off) or failed to initialize. */
+  | "unavailable";
+
+/**
+ * The mic button's ONE decision, extracted from the panel's click handler.
+ *
+ * The panel used to inline this as `if (!voice) … if (voice.isListening) …`,
+ * which meant "tap to start, tap to send" was only observable by reading a
+ * closure inside a 1900-line DOM module — and so it could not be pinned by a
+ * test, which is exactly how the announcement above came to describe
+ * hold-to-talk for a button that had already been converted to a toggle.
+ *
+ * Note the third tap: `stop` is not a one-way door. A user who stops and taps
+ * again starts a NEW recording rather than resuming a commit, which is what
+ * makes a mis-tap cheap.
+ */
+export function micToggleAction(opts: {
+  /** Is a VoiceController constructed and usable? */
+  hasController: boolean;
+  /** Is a recording open right now? */
+  isListening: boolean;
+}): MicToggleAction {
+  if (!opts.hasController) return "unavailable";
+  return opts.isListening ? "stop" : "start";
+}
 
 /**
  * Transform assistant text into a speak-safe string.

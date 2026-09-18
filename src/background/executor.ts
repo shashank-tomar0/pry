@@ -81,13 +81,33 @@ export class TabController {
     });
   }
 
-  /** Resolves once the tab has finished loading, or after a timeout. */
-  async waitForLoad(timeoutMs = 8000): Promise<void> {
+  /**
+   * Resolves once the tab has finished loading, or after a timeout.
+   *
+   * `untilNotUrl` is the URL the tab was showing BEFORE the caller asked the
+   * browser to go somewhere else, and passing it is what makes this wait mean
+   * anything for a navigation. `chrome.tabs.update({url})` resolves as soon as
+   * the navigation is REQUESTED, and the outgoing document stays
+   * `status: "complete"` for a beat afterwards — so a wait keyed only on
+   * "complete" returned instantly, the caller then read the old URL, found it
+   * perfectly valid, and reported "Navigated to https://youtube.com." while the
+   * tab was still on mail.google.com. The planner read the old page, saw the
+   * contradiction between the action report and the page, and burned turns
+   * reconciling it.
+   *
+   * Waiting for the URL to actually CHANGE is the only signal available here
+   * that the old document is gone. Redirects are handled by "different from the
+   * old URL", not "equal to the requested one": gmail.com legitimately lands on
+   * mail.google.com, and that is a successful navigation.
+   */
+  async waitForLoad(timeoutMs = 8000, untilNotUrl?: string): Promise<void> {
     const deadline = Date.now() + timeoutMs;
+    const previous = (untilNotUrl ?? "").trim();
     while (Date.now() < deadline) {
       const tab = await chrome.tabs.get(this.tabId).catch(() => null);
       if (!tab) return;
-      if (tab.status === "complete") {
+      const leftOldDocument = previous === "" || tab.url !== previous;
+      if (leftOldDocument && tab.status === "complete") {
         // Give client-rendered pages a moment to paint their first content.
         await new Promise((r) => setTimeout(r, 400));
         return;
@@ -177,6 +197,34 @@ function normaliseUrl(raw: string): string {
 }
 
 /**
+ * True when two URLs name the same site (host, ignoring a leading `www.`).
+ *
+ * Deliberately host-level, not string-level: the question the navigate path
+ * asks is "is the tab already where I am being asked to send it?", and asking
+ * that string-for-string would call `https://youtube.com` and
+ * `https://www.youtube.com/` different places. It is used only to decide
+ * whether an UNCHANGED tab url is a failure or a no-op re-navigation, never to
+ * claim a navigation succeeded — a redirect that changes the site (gmail.com →
+ * mail.google.com) is a success because the URL CHANGED, and that is decided by
+ * comparison with the previous URL, not by this function.
+ *
+ * Exported for the verification harness.
+ */
+export function sameSite(a: string | undefined, b: string | undefined): boolean {
+  const host = (raw: string | undefined): string | null => {
+    if (!raw) return null;
+    try {
+      return new URL(raw).hostname.toLowerCase().replace(/^www\./, "");
+    } catch {
+      return null;
+    }
+  };
+  const ha = host(a);
+  const hb = host(b);
+  return ha !== null && ha === hb;
+}
+
+/**
  * Chrome error pages (chrome-error://chromewebdata/…) are unreadable by
  * extensions and invisible to the content script. Detecting them here turns a
  * confusing dead tab into a clean, explainable failure the planner can recover
@@ -247,8 +295,11 @@ export async function execute(
         };
       }
       const url = normaliseUrl(rawUrl);
+      // Where the tab was, so the wait can tell "still on the old page" from
+      // "arrived". See waitForLoad.
+      const before = (await chrome.tabs.get(controller.tabId).catch(() => null))?.url;
       await chrome.tabs.update(controller.tabId, { url });
-      await controller.waitForLoad();
+      await controller.waitForLoad(8000, before);
       const tab = await chrome.tabs.get(controller.tabId).catch(() => null);
       const errorReason = chromeErrorReason(tab?.url);
       if (errorReason) {
@@ -262,7 +313,27 @@ export async function execute(
           controller,
         };
       }
-      return { result: { ok: true, detail: `Navigated to ${url}.` }, controller };
+      // The tab never moved. Reporting success here is what produced the
+      // contradiction above; saying so plainly lets the planner re-navigate
+      // instead of acting on a page it was told had been replaced. A request for
+      // the site the tab is ALREADY on is not a failure, so it is excluded.
+      if (before && tab?.url === before && !sameSite(before, url)) {
+        return {
+          result: {
+            ok: false,
+            detail:
+              `Navigation to ${url} did not take effect — the tab is still on ${tab.url}. ` +
+              `The page was NOT replaced, so anything you read from it is the old page. ` +
+              `Re-navigate to ${url} (a second attempt usually lands), or use the URL that ` +
+              `is actually open if that is what the task needs.`,
+          },
+          controller,
+        };
+      }
+      // The reported destination is the tab's, not the requested one: a
+      // redirect to a different host is normal, and the next page read will
+      // show THAT url, so the action report must not disagree with it.
+      return { result: { ok: true, detail: `Navigated to ${tab?.url ?? url}.` }, controller };
     }
 
     case "go_back": {
@@ -297,7 +368,7 @@ export async function execute(
       const url = normaliseUrl(rawUrl);
       const tab = await chrome.tabs.create({ url, active: true });
       const next = new TabController(tab.id!);
-      await next.waitForLoad();
+      await next.waitForLoad(8000, "");
       const loaded = await chrome.tabs.get(tab.id!).catch(() => null);
       const errorReason = chromeErrorReason(loaded?.url);
       if (errorReason) {
@@ -312,7 +383,12 @@ export async function execute(
         };
       }
       return {
-        result: { ok: true, detail: `Opened ${url} in new tab ${tab.id}. Agent focus moved there.` },
+        // The tab's own URL, so a redirect does not make the report disagree
+        // with the page the agent is about to read.
+        result: {
+          ok: true,
+          detail: `Opened ${loaded?.url ?? url} in new tab ${tab.id}. Agent focus moved there.`,
+        },
         controller: next,
       };
     }

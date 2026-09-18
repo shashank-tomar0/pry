@@ -532,6 +532,18 @@ const protection = textRun.result.protection;
 ok("the offscreen pipeline PRODUCES egress evidence", Boolean(protection), JSON.stringify(protection));
 ok("its own scans are reported complete", protection.facesComplete === true && protection.finalScanComplete === true, JSON.stringify(protection));
 ok("residual detections are zero on a successful frame", protection.residualDetections === 0);
+// The pixel findings are a rebuild TRIGGER now, so the ordinary frame is the
+// regression risk in this direction: if the verifier reported a finding on a
+// correct paint, every captured frame would be rebuilt to solid black.
+ok(
+  "a clean frame escalates for nothing (no pixel findings on a correct paint)",
+  textRun.result.verification.escalated !== true &&
+  !(textRun.result.verification.escalationReasons ?? []).length,
+  JSON.stringify({
+    escalated: textRun.result.verification.escalated,
+    reasons: textRun.result.verification.escalationReasons,
+  }),
+);
 ok("policy is reported enabled when both toggles are on", protection.policyEnabled === true);
 ok(
   "the service-worker halves are left unclaimed until assembly",
@@ -866,12 +878,19 @@ const escalateRun = await runPipeline({
 globalThis.__pryFaceProbe = null;
 
 const escalated = escalateRun.result.verification;
-ok("the re-probe found a face the original pass did not",
-  escalated.attack.uncoveredFaces === 1,
-  JSON.stringify(escalated.attack));
-ok("and the attack reason names it as a coverage failure, not a weak mask",
-  escalated.attack.details.some((d) => /FACE COVERAGE/.test(d)),
+ok("the re-probe found a face the original pass did not, and the record keeps it",
+  escalated.attack.details.some((d) => /FACE COVERAGE/.test(d) && /300,150/.test(d)),
   JSON.stringify(escalated.attack.details));
+// The counts must describe the image that SHIPS, and the details are the trail of
+// what the rebuild was for. Overwriting the counts with the first pass's numbers
+// made the record argue with itself: this same frame rendered as "no uncovered
+// face" printed directly above a FACE COVERAGE line — reported live, and a face
+// the re-probe finds on the REBUILT frame is the one finding escalation cannot
+// cover. The pair of assertions below is the invariant: counts zero, and every
+// face those details name is opaque in the shipped bytes.
+ok("the attack counts describe the SHIPPED image, not the first paint",
+  escalated.attack.uncoveredFaces === 0 && escalated.attack.reconstructableRegions === 0,
+  JSON.stringify(escalated.attack));
 ok("the frame was rebuilt and marked escalated", escalated.escalated === true, JSON.stringify({ verified: escalated.verified }));
 ok("the escalated frame verifies", escalated.verified === true);
 // The summary is what a user reads. It must name the reason that actually fired

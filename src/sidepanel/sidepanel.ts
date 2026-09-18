@@ -17,7 +17,7 @@ const stopBtn = $("stop-btn");
 // The whole voice stack is feature-flagged on settings.elevenlabs.sttEnabled /
 // .ttsEnabled. Until those are on, no Scribe WS, no Flash TTS, no mic usage.
 import type { VoiceController } from "./voice-controller";
-import { DEFAULT_TTS_VOICE_ID } from "./voice-core";
+import { DEFAULT_TTS_VOICE_ID, MIC_READY_ANNOUNCEMENT, micToggleAction } from "./voice-core";
 let voice: VoiceController | null = null;
 // Mic listeners attach exactly once (bootstrapVoice runs on every settings
 // save; re-adding listeners would stack handlers on the same button).
@@ -78,21 +78,26 @@ async function bootstrapVoice(): Promise<void> {
     },
   });
 
-  // Mic button: click once to start dictating, click again to send. The old
+  // Mic button: tap once to start dictating, tap again to send. The old
   // hold-to-talk was hostile on a desktop — keeping the button pressed while
   // typing (or just resting a hand) felt wrong, and a hold that released a
   // beat too early committed half a sentence. Toggle is one fewer thing to
   // think about, works the same on laptop, desktop, and touchscreen, and the
   // button shows a live recording badge so the state is never in doubt.
+  //
+  // Which branch a tap takes is decided by `micToggleAction` (voice-core), not
+  // inline here, so the announced contract and the implemented one are pinned
+  // together by scripts/voice-test.mjs.
   if (micBtn) {
     if (!micListenersAttached) {
       micListenersAttached = true;
       const toggleMic = async (): Promise<void> => {
-        if (!voice) {
+        const action = micToggleAction({ hasController: !!voice, isListening: !!voice?.isListening });
+        if (action === "unavailable" || !voice) {
           emitLocalStatus("Voice not initialized — check ElevenLabs API key and enable STT in settings.");
           return;
         }
-        if (voice.isListening) {
+        if (action === "stop") {
           micBtn.title = "Transcribing…";
           try {
             await voice.stopListening();
@@ -123,7 +128,10 @@ async function bootstrapVoice(): Promise<void> {
       render({
         id: `voice-ready-${Date.now()}`,
         role: "system",
-        text: "Voice: dictation ready. Hold the mic button to talk (release to send), or tap it to start and tap again to send.",
+        // One copy of the sentence, in voice-core, pinned by voice-test.mjs:
+        // the button is a tap-to-start / tap-to-send toggle, and this is the
+        // only place the user is told how it works.
+        text: MIC_READY_ANNOUNCEMENT,
       });
     }
   }
@@ -141,10 +149,10 @@ function startMicBadge(micBtn: HTMLButtonElement): void {
   stopMicBadge();
   micRecStartAt = Date.now();
   micBtn.textContent = "⏺";
-  micBtn.title = "Recording 0s — click to send";
+  micBtn.title = "Recording 0s — tap to send";
   micRecTimer = setInterval(() => {
     const seconds = Math.round((Date.now() - micRecStartAt) / 1000);
-    micBtn.title = `Recording ${seconds}s — click to send`;
+    micBtn.title = `Recording ${seconds}s — tap to send`;
   }, 500);
 }
 
@@ -156,7 +164,9 @@ function stopMicBadge(): void {
   const micBtn = document.getElementById("mic-btn");
   if (micBtn) {
     micBtn.textContent = "🎙";
-    micBtn.title = "Click to dictate — click again to send";
+    // Same wording as MIC_READY_ANNOUNCEMENT, so the tooltip and the line in
+    // the transcript cannot teach two different interactions.
+    micBtn.title = "Tap to dictate — tap again to send";
   }
 }
 
@@ -630,8 +640,9 @@ function renderPrivacyAudit(audit: {
       ? `<div class="verify-meta warn-meta">Adversarial re-check: not run on this frame.</div>`
       : attack.reconstructableRegions === 0 && attack.uncoveredFaces === 0
         ? `<div class="verify-meta">Adversarial re-check: attacked the shipped pixels — ${attack.ran ? "no recoverable blur, no uncovered face" : "probe did not complete"}.</div>`
-        : `<div class="verify-meta warn-meta">Adversarial re-check found ${attack.reconstructableRegions} recoverable blur(s)` +
-          `${attack.uncoveredFaces > 0 ? ` and ${attack.uncoveredFaces} face(s) the pipeline had not covered` : ""} — remediated and re-verified.</div>`;
+        : `<div class="verify-meta warn-meta">Adversarial re-check of the SHIPPED image found ${attack.reconstructableRegions} recoverable blur(s)` +
+          `${attack.uncoveredFaces > 0 ? ` and ${attack.uncoveredFaces} face(s) outside every region it destroyed` : ""} — recorded below. ` +
+          `A finding here is one the rebuild could not cover for you.</div>`;
     const attackDetails = attack && attack.details.length > 0
       ? `<div class="verify-leaks">${attack.details.map(escapeHtml).join("<br/>")}</div>`
       : "";

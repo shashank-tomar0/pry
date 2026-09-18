@@ -24,7 +24,7 @@ import { tierForKind, type RegionTier } from "../shared/region-paint";
 import type { ProcessedScreenshotResult } from "../shared/types";
 
 import { SYSTEM_PROMPT, SYSTEM_PROMPT_LOCAL, taskPrompt } from "./prompt";
-import { TOOLS, actionChangesFrame } from "./tools";
+import { TOOLS, actionChangesFrame, actionLoopFinding, LOOP_THRESHOLD, LOOP_WINDOW, type ActionStamp } from "./tools";
 import { TabController, execute, isRestricted } from "./executor";
 import { detectInjection, gate } from "./safety";
 import { detectAllPIIDetailed } from "./pii-detector";
@@ -1243,9 +1243,9 @@ export async function runTask(
   if (snapshot) warnIfInjected(snapshot, emit);
 
   // ── Loop detection: track recent actions to break out of stuck states ──
-  const recentActions: Array<{ name: string; input: string }> = [];
-  const LOOP_THRESHOLD = 3;
-  const LOOP_WINDOW = 5;
+  // The verdict itself is pure policy in tools.ts (actionLoopFinding), pinned
+  // by the harness; this closure only records what happened.
+  const recentActions: ActionStamp[] = [];
   /**
    * How many times the loop guard has already nudged this run.
    *
@@ -1260,6 +1260,16 @@ export async function runTask(
   let loopNudges = 0;
   /** How many times this run has told the planner to stop deliberating. */
   let deliberationSteers = 0;
+  /**
+   * True once any turn of this run has produced output.
+   *
+   * The retry policy reads it to tell two silences apart that look identical in
+   * the error message: an endpoint that has never answered (do not re-send — a
+   * measured dead wait), and one that answered the previous turn and then went
+   * silent on this request (re-send once, with the short budget). Set only where
+   * a turn actually resolved, so it is evidence rather than an assumption.
+   */
+  let endpointServedThisRun = false;
 
   function recordAction(name: string, input: Record<string, unknown>): void {
     // Sign click/type actions by the target's role+name, not the raw id:
@@ -1276,37 +1286,11 @@ export async function runTask(
       const el = snapshot.elements.find((e) => e.id === elId);
       if (el) signature = JSON.stringify({ target: `${el.role}:${el.name}` });
     }
-    recentActions.push({ name, input: signature });
+    recentActions.push({ name, signature });
     if (recentActions.length > LOOP_WINDOW) recentActions.shift();
   }
 
-  function isLooping(): boolean {
-    if (recentActions.length < LOOP_THRESHOLD) return false;
-    // 1. Consecutive identical action
-    const last = recentActions[recentActions.length - 1];
-    let count = 0;
-    for (let i = recentActions.length - 1; i >= 0; i--) {
-      if (recentActions[i].name === last.name && recentActions[i].input === last.input) {
-        count++;
-      } else break;
-    }
-    if (count >= LOOP_THRESHOLD) return true;
 
-    // 2. Oscillation detection (A -> B -> A -> B)
-    if (recentActions.length >= 4) {
-      const a1 = recentActions[recentActions.length - 1];
-      const b1 = recentActions[recentActions.length - 2];
-      const a2 = recentActions[recentActions.length - 3];
-      const b2 = recentActions[recentActions.length - 4];
-      if (
-        a1.name === a2.name && a1.input === a2.input &&
-        b1.name === b2.name && b1.input === b2.input
-      ) {
-        return true;
-      }
-    }
-    return false;
-  }
 
   // ── Cleanup: emit experience and clear vault on ANY exit path ──
   let experienceEmitted = false;
@@ -1389,26 +1373,33 @@ export async function runTask(
     // Loop detection — a stuck planner gets one chance to act on advice before
     // the run is stopped, because "keep re-reading the page" is usually a
     // missing-handle problem rather than an impossible task.
-    if (isLooping()) {
-      const repeated = recentActions[recentActions.length - 1].name;
+    const loopFinding = actionLoopFinding(recentActions);
+    if (loopFinding) {
+      // How to act instead of looking again. Every shape ends in the same next
+      // move, so the fix is stated once; only the diagnosis differs.
+      const actAdvice =
+        `Act on what you already have: if the thing you need to click has no element ` +
+        `id (inbox rows, search results, list items and cards usually have none), use ` +
+        `click_text with the exact visible text, e.g. {"text": "<sender and subject of ` +
+        `the first row>"}. If the target is below the fold, scroll first — scrolling ` +
+        `changes the page and is progress. If you already have everything the task ` +
+        `asked for, answer instead of looking again.`;
+      const diagnosis =
+        loopFinding.kind === "repeat"
+          ? `"${loopFinding.action}" repeated ${LOOP_THRESHOLD} times`
+          : loopFinding.kind === "oscillation"
+            ? `"${loopFinding.action}" and "${loopFinding.other}" are alternating without changing anything`
+            : `${LOOP_WINDOW} turns in a row only LOOKED at the page ` +
+              `(${loopFinding.actions.join("/")}) without changing it`;
       if (loopNudges === 0) {
         loopNudges++;
         recentActions.length = 0;
-        const advice = repeated === "read_page"
-          ? `Stop re-reading the page — you already have what it returned. Act on it: ` +
-            `if the thing you need to click has no element id (inbox rows, search results, ` +
-            `list items and cards usually have none), use click_text with the exact visible ` +
-            `text, e.g. {"text": "<sender and subject of the first row>"}. If the target is ` +
-            `below the fold, scroll first.`
-          : `Stop repeating "${repeated}" — it is not changing the page. Try a different ` +
-            `handle: click_text with the visible text of the target, scroll to bring it ` +
-            `into view, or re-read the page only if the page actually changed.`;
         emit({
           kind: "entry",
           entry: {
             id: nextId(),
             role: "system",
-            text: `Loop detected: "${repeated}" repeated ${LOOP_THRESHOLD} times. ${advice}`,
+            text: `Loop detected: ${diagnosis}. ${actAdvice}`,
           },
         });
         continue;
@@ -1418,7 +1409,7 @@ export async function runTask(
         entry: {
           id: nextId(),
           role: "error",
-          text: `Loop detected again: "${repeated}" repeated ${LOOP_THRESHOLD} times after the retry advice. Stopping to prevent an infinite loop. The page may need manual interaction.`,
+          text: `Loop detected again: ${diagnosis} — after the retry advice. Stopping to prevent an infinite loop. The page may need manual interaction.`,
         },
       });
       finishTask();
@@ -1688,21 +1679,22 @@ export async function runTask(
     // One turn = one bounded planner call, bounded by SILENCE rather than wall
     // clock (see the budget constants). The turn-local abort cancels the
     // request; the user's Stop always wins.
-    const isColdTurn = step === 0;
-
     /**
-     * The first-output budget for a turn, which is not one number.
+     * The first-output budget for a turn. Two numbers, not three.
      *
-     * A retry does NOT get the cold budget: its only job is to learn whether the
-     * connection hiccuped, and a hiccup answers in seconds. Re-spending the cold
+     * A retry does NOT get the full budget: its only job is to learn whether the
+     * connection hiccuped, and a hiccup answers in seconds. Re-spending the full
      * 90 s is how a stalled endpoint cost the reported run 268 s — 148 s of
      * streaming, 30 s of silence, then 90 more seconds on a retry that produced
      * nothing before concluding "switch to a faster provider".
+     *
+     * Every other turn gets the same budget as the opening one. Step 0 is not
+     * the slow one (see FIRST_OUTPUT_TIMEOUT_MS); a run that cut step 1 at 60 s
+     * and called the provider dead had already watched that same provider answer
+     * step 0.
      */
     const budgetFor = (retry: boolean): number =>
-      retry ? RETRY_FIRST_OUTPUT_MS
-        : isColdTurn ? FIRST_OUTPUT_TIMEOUT_COLD_MS
-          : FIRST_OUTPUT_TIMEOUT_MS;
+      retry ? RETRY_FIRST_OUTPUT_MS : FIRST_OUTPUT_TIMEOUT_MS;
 
     // ─── Live reasoning status ───
     // The reasoning block is display-capped (MAX_THOUGHT_CHARS), so past that
@@ -1878,6 +1870,7 @@ export async function runTask(
     let firstTurnLiveness: TurnLiveness = newTurnLiveness();
     try {
       turn = await runPlannerTurn(new AbortController(), firstTurnLiveness);
+      endpointServedThisRun = true;
       settleWait("responded");
     } catch (firstError) {
       if (signal.aborted) { settleWait("cancelled"); finishTask(); return; }
@@ -1890,7 +1883,9 @@ export async function runTask(
       // A salad cut joins the ceiling and loop cuts: the model was answering
       // and what it answered was unusable, so re-sending the same prompt buys
       // the same garbage. Only a genuine silence is worth one retry.
-      const policy = retryPolicyFor(firstTurnLiveness, firstMessage);
+      const policy = retryPolicyFor(firstTurnLiveness, firstMessage, {
+        endpointProvenThisRun: endpointServedThisRun,
+      });
       const deliberated = firstTurnLiveness.ended === "deliberation";
 
       // A deliberation cut is steered, not failed: the model has everything it
@@ -1959,6 +1954,7 @@ export async function runTask(
       try {
         // The retry gets the short budget — see `runPlannerTurn`'s `isRetry`.
         turn = await runPlannerTurn(new AbortController(), newTurnLiveness(), true);
+        endpointServedThisRun = true;
         settleWait("responded");
       } catch (secondError) {
         if (signal.aborted) { settleWait("cancelled"); finishTask(); return; }
@@ -2580,8 +2576,21 @@ function warnIfInjected(snapshot: PageSnapshot, emit: (e: AgentEvent) => void): 
  * NVIDIA's endpoint, versus 3-7 s warm) and providers that buffer a
  * non-streaming completion instead of streaming it.
  */
-const FIRST_OUTPUT_TIMEOUT_COLD_MS = 90_000;
-const FIRST_OUTPUT_TIMEOUT_MS = 60_000;
+/**
+ * The same budget for every non-retry turn, deliberately.
+ *
+ * This used to be 90 s on step 0 and 60 s on every later step, on the theory
+ * that only the opening request pays a cold start. That has it backwards: the
+ * prompt GROWS as a run proceeds (page read, history, frame text), and
+ * time-to-first-token scales with prompt size — so the smaller budget landed on
+ * the larger requests. The reported shape is exactly that: step 0 navigated
+ * inside the cold budget, step 1 was cut at 60 s with nothing streamed, and the
+ * run ended after a single action with "did not respond within 60s".
+ *
+ * A retry is the one turn that gets less (see RETRY_FIRST_OUTPUT_MS), because
+ * its only question is whether the previous silence was a hiccup.
+ */
+const FIRST_OUTPUT_TIMEOUT_MS = 90_000;
 
 /**
  * How long a turn that HAS started streaming may go quiet before we call it
@@ -2694,6 +2703,38 @@ const DEGENERATION_BLOCK_OCCURRENCES = 3;
 const DEGENERATION_SALAD_PUNCT_DENSITY = 0.25;
 /** Distinct non-Latin scripts that mark a sample as salad rather than prose. */
 const DEGENERATION_SALAD_SCRIPTS = 3;
+/**
+ * Script changes per adjacent word pair at or above which output is churning.
+ *
+ * This is what catches the SECOND observed shape, which the punctuation rule
+ * cannot see at all. Verbatim from the reported run: "… which after multiplier -
+ * c s some ( campus. a Mari pluted assay d _, c focused through automatic ( used
+ * at T [ on cumul WH Image phone behind one in mode …" — 110 words, only 0.081
+ * punctuation (a legitimate code block scores 0.210, so that signal is not just
+ * weak here, it is inverted), but CJK, Arabic and Greek letters alternating with
+ * Latin WORD BY WORD.
+ *
+ * Measured on every sample available, including the legitimate ones this must not
+ * fire on: the two glitches switch scripts on 13.1% and 9.2% of adjacent pairs, the
+ * bilingual English/Hindi/Arabic answer on 4.8% (its switches land on sentence
+ * boundaries), and every single-script sample — prose, a markdown table, minified
+ * JSON, a code block, four Latin languages, PRY's own 1 853-word system prompt — on
+ * 0.0%.
+ *
+ * The gap is real but not wide (9.2% against 4.8%), which is why this rule ALSO
+ * requires three non-Latin scripts — see `isWordSalad`. A threshold doing all the
+ * work on its own would be one glitch sample away from cutting a legitimate
+ * multilingual answer.
+ */
+const SALAD_SCRIPT_SWITCH_RATE = 0.06;
+/**
+ * Word floor for the churn rule, well below the punctuation rule's 120.
+ *
+ * Switching scripts every other word is not something text does, so this needs
+ * far less material to be sure of — but it must still clear the floor that keeps
+ * a short fragment quoting two foreign names out of scope.
+ */
+const SALAD_CHURN_WORDS = 60;
 
 /**
  * Longest assistant text replayed to the planner as history.
@@ -2857,9 +2898,59 @@ export function nonLatinLetterScripts(text: string): string[] {
  * trigger it.
  */
 export function isWordSalad(text: string): boolean {
-  if (normaliseWords(text).length < DEGENERATION_MIN_WORDS) return false;
+  const words = normaliseWords(text).length;
+  const scripts = nonLatinLetterScripts(text).length;
+
+  // Three non-Latin scripts is the load-bearing condition, and it is the one both
+  // rules share: no answer written by a person or a model mixes three writing
+  // systems in one response, and every legitimate sample in the battery reaches
+  // two at most (the bilingual English/Hindi/Arabic paragraph reaches two, and
+  // that is exactly the sample the alternative rules had to be measured against).
+  // What the rules below add is WHICH way the mixture shows up.
+  if (scripts < DEGENERATION_SALAD_SCRIPTS) return false;
+  if (words < SALAD_CHURN_WORDS) return false;
+
+  // 1. Script churn — the second observed shape. It is made of real-looking words
+  //    with the writing system changing from word to word: 9.2% of adjacent pairs
+  //    here against 4.8% for the bilingual sample, whose switches land on sentence
+  //    boundaries because that is where a person changes language.
+  if (scriptSwitchRate(text) >= SALAD_SCRIPT_SWITCH_RATE) return true;
+
+  // 2. Punctuation soup — the first observed shape, kept exactly as measured: a
+  //    quarter punctuation, three or more scripts, at least 120 words.
+  if (words < DEGENERATION_MIN_WORDS) return false;
   if (punctuationDensity(text) < DEGENERATION_SALAD_PUNCT_DENSITY) return false;
-  return nonLatinLetterScripts(text).length >= DEGENERATION_SALAD_SCRIPTS;
+  return true;
+}
+
+/**
+ * Share of adjacent word pairs whose dominant script differs.
+ *
+ * Words with no letters at all are skipped rather than counted as a change, so a
+ * table of pipes or a JSON blob (which is mostly punctuation between words) stays
+ * at 0. Exported for the harness: the threshold above only means anything next to
+ * the measurements it separates.
+ */
+export function scriptSwitchRate(text: string): number {
+  const SCRIPT_RE =
+    /([\u0900-\u097f])|([\u0600-\u06ff])|([\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af])|([\u0370-\u03ff])|([A-Za-z])/u;
+  const SCRIPT_NAMES = ["devanagari", "arabic", "cjk", "greek", "latin"];
+  const dominant = (word: string): string => {
+    const m = SCRIPT_RE.exec(word);
+    if (!m) return "";
+    const index = m.findIndex((group, i) => i > 0 && group !== undefined);
+    return SCRIPT_NAMES[index - 1] ?? "";
+  };
+
+  const scripts = String(text ?? "").split(/\s+/).filter(Boolean).map(dominant);
+  let pairs = 0;
+  let switches = 0;
+  for (let i = 1; i < scripts.length; i++) {
+    if (!scripts[i] || !scripts[i - 1]) continue;
+    pairs++;
+    if (scripts[i] !== scripts[i - 1]) switches++;
+  }
+  return pairs === 0 ? 0 : switches / pairs;
 }
 
 /**
@@ -2907,6 +2998,11 @@ export function isRetryablePlannerError(message: string): boolean {
   // once, with the actionable advice, and let the user switch models.
   // (Mid-stream silence is different — see the "stopped streaming" wording —
   // and transport/status failures below are still worth one retry.)
+  //
+  // That measurement was taken on an endpoint that had answered nothing yet.
+  // The same silence AFTER a turn of this run succeeded is judged in
+  // `retryPolicyFor`, which holds both facts; this string check remains for the
+  // callers that see only the message, and for the genuinely unproven endpoint.
   if (/did not respond within/i.test(message)) return false;
   return /rate.?limit|timed? ?out|network|fetch failed|econn|overloaded|temporarily|503|429|502|504|timeout|stopped streaming/i.test(
     message,
@@ -2994,10 +3090,30 @@ export const RETRY_FIRST_OUTPUT_MS = 20_000;
  *
  * `deliberation` is absent on purpose: it is a STEER, not a failure, and the loop
  * handles it before reaching here.
+ *
+ * `endpointProvenThisRun` is the distinction a first-output timeout needs and
+ * that the message alone cannot carry. "The provider never sent a token" is the
+ * documented reason not to retry — that measurement was two 90 s silent attempts
+ * in a row producing nothing — but it was taken on an endpoint that had not
+ * answered anything at all. A turn that streams nothing right AFTER the same
+ * endpoint answered a previous turn of this run is a different animal: the key,
+ * model and network are known good seconds ago, so the silence is likelier to be
+ * this request than the provider. Refusing to retry that case is what ended the
+ * reported run after a single action — step 0 navigated, step 1 was silent, and
+ * the task stopped with "switch to a faster provider" while holding the evidence
+ * that the provider was fine.
  */
 export function retryPolicyFor(
   liveness: TurnLiveness,
   message: string,
+  opts: {
+    /**
+     * True when a previous turn of THIS run produced output. Evidence about the
+     * endpoint, not about the turn being judged — which is why it is passed in
+     * rather than derived from `liveness`.
+     */
+    endpointProvenThisRun?: boolean;
+  } = {},
 ): { retry: boolean; because: string } {
   if (
     liveness.ended === "ceiling" ||
@@ -3015,6 +3131,22 @@ export function retryPolicyFor(
       because:
         `the endpoint streamed for ${Math.round(liveness.endedAfterMs / 1000)}s before going quiet — ` +
         `throughput rather than a dropped connection, so the prompt is not re-sent`,
+    };
+  }
+  if (liveness.ended === "silent" && liveness.events === 0) {
+    // Nothing streamed at all. Two cases, told apart by evidence the message
+    // cannot hold: has this endpoint answered anything in this run?
+    if (opts.endpointProvenThisRun) {
+      return {
+        retry: true,
+        because: "",
+      };
+    }
+    return {
+      retry: false,
+      because:
+        "this endpoint had not answered anything in this run, and re-sending the same prompt to an " +
+        "unresponsive one was measured to buy a second silence rather than a reply",
     };
   }
   if (!isRetryablePlannerError(message)) return { retry: false, because: "" };
@@ -3087,9 +3219,16 @@ export function turnCutShortMessageFor(
   }
   if (liveness.events > 0) {
     const silent = Math.round(Math.max(0, performance.now() - liveness.lastEventAt) / 1000);
+    // Deliberately does NOT say "the network stalled or the connection dropped".
+    // Which of the two this was is decided by the retry policy from evidence the
+    // message builder does not have (how long the turn had been streaming), and it
+    // is appended there. Guessing here produced a line that argued with itself:
+    // "…went silent for 30s — the network stalled or the connection dropped.
+    // (the endpoint streamed for 97s before going quiet — throughput rather than a
+    // dropped connection, so the prompt is not re-sent)".
     return (
       `The planner (${plannerLabel}) stopped streaming after ${liveness.events} update(s) and ` +
-      `went silent for ${silent}s — the network stalled or the connection dropped.`
+      `went quiet for ${silent}s.`
     );
   }
   return (

@@ -18,6 +18,26 @@
  * repetition guard returns false), punctuation density is well over a quarter,
  * and it simultaneously carries Devanagari, Arabic, CJK and Greek letters.
  */
+/**
+ * The SECOND glitch shape, verbatim from a later run against the same model.
+ *
+ * It is kept because the punctuation rule above does not catch it, and it is not
+ * a near-miss of that rule — on this sample the signal is INVERTED: 0.081
+ * punctuation, where the legitimate code block in the battery scores 0.210. What
+ * it is made of is real-looking words from several writing systems glued together
+ * (`foundation( confidential ε via."录 then(A MAN 北 +itôt colony coronaedizing`),
+ * so it needs a signal about how fast the script CHANGES: 9.2% of adjacent word
+ * pairs here, 12.1% in the sample above, against 3.0% for a bilingual
+ * English/Hindi answer (which switches at the sentence, the way a person writes)
+ * and 0.0% for every single-script sample measured.
+ */
+export const GLITCH_OUTPUT_CHURN = [
+  "—the script_ network.",
+  ", sostiene",
+  " in占(A which after multiplier - c s some ( campus. a   Mari pluted assay d _, c focused through automatic  ( used at T [ on cumul WH Image phone behind one in mode __ n… valued mun .. Video, tele الس, foundation( confidential ε via.\"录 then(A MAN 北 +itôt colony coronaedizing innovativeed [{s of attr u values main for codeIMied,Call from UN† networks zero,ouredThe=x rests dwell said ified set globally .",
+  " twentieth person由... Elevated specified基 appearance excluding O المرتبطة-role discussed\ufffd\ufffd specific networking finally lif degree m'in..- ED, ReferencessA — بش ... fo  c modal as...-dimensional, C needle d towards and gene;更に1 monocyte..-mi [ificationup are",
+].join("\n");
+
 export const GLITCH_OUTPUT = [
   "ు Nar,{split,, lives,,,, Trip lak-login , λα...",
   "'s=,,,... something people,,Joe))) (ły,, .  7... ,,,  walks-around (, labels numbers, takes····, gets'). Men, ,... bears, ,,] . stake,. Lee,,'s'll, characters) Greek,,...a keeps, Luke,کا people&gt. anna) numbers: Factors. Barrow, Lucy, ,...,,)) could,, negara, people····λ <a,,,)'s, față -lea,人的 joke assume,, λs, Leekλ,'s,... people λ,).",

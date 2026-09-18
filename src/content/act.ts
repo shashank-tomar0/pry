@@ -3,9 +3,12 @@ import { lookupElement, snapshot } from "./perceive";
 import { settle, CLICK_CEILING } from "./settle";
 import {
   pickTextMatch,
+  pickFieldMatch,
+  rankFieldMatches,
   isClickableTarget,
   describeTextTarget,
   normalizeForMatch,
+  type FieldRun,
   type TextRun,
 } from "../shared/text-target";
 
@@ -255,6 +258,183 @@ async function clickByText(
     ? ` Page reacted (${updates} DOM updates).`
     : " NO visible page reaction — the text may be non-interactive, or the click missed. Call read_page to confirm.";
   return done(`Clicked ${what} (${match.reason} match).${verdict}`);
+}
+
+/**
+ * Controls someone can type into. `type` needs an element id, and the page read
+ * is capped and dominated by page chrome — on the sites this matters most
+ * (search boxes, filter inputs, compose fields inside UI-kit wrappers) the field
+ * either misses the budget or has no id at all. Its NAME is always on screen,
+ * so the name becomes the handle, exactly as it does for `click_text`.
+ */
+const FIELD_SELECTOR = [
+  "input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset])",
+  "input:not([type=checkbox]):not([type=radio]):not([type=file]):not([type=image])",
+  "input:not([type=range]):not([type=color])",
+  "textarea",
+  "[contenteditable='']",
+  "[contenteditable=true]",
+  "[role=searchbox]",
+  "[role=textbox]",
+  "[role=combobox]",
+].join(", ");
+
+/** How far up from a field to look for the name its wrapper carries. */
+const FIELD_NAME_CLIMB = 3;
+
+/**
+ * Every name a field answers to, best first.
+ *
+ * A person names a search box "Search" whether that word is its placeholder, its
+ * aria-label, its <label>, or the title on the component wrapping it — and which
+ * one a given site uses is arbitrary. Matching all of them is what makes the tool
+ * work without a per-site table. The wrapper climb of 3 covers UI kits that put
+ * the name on a `role=combobox` div and leave the inner input bare, which is the
+ * shape this exists for.
+ */
+function fieldLabels(el: Element, target: Element): string[] {
+  const labels: string[] = [];
+  const input = target as HTMLInputElement;
+  const push = (value: string | null | undefined): void => {
+    const text = (value ?? "").trim();
+    if (text && !labels.includes(text)) labels.push(text);
+  };
+
+  for (const el2 of [target, el]) {
+    push(el2.getAttribute("aria-label"));
+    const labelledBy = el2.getAttribute("aria-labelledby");
+    if (labelledBy) {
+      for (const id of labelledBy.split(/\s+/)) push(document.getElementById(id)?.textContent);
+    }
+  }
+  if (input.labels) for (const label of Array.from(input.labels)) push(label.textContent);
+  const wrappingLabel = target.closest("label");
+  if (wrappingLabel) push(wrappingLabel.textContent);
+  push(input.placeholder);
+  for (const el2 of [target, el]) push(el2.getAttribute("title"));
+  push(input.name);
+  // The wrapper's own aria-label/title, for components that name the box one
+  // level up from the input they contain.
+  let up: Element | null = target.parentElement;
+  for (let depth = 0; up && depth < FIELD_NAME_CLIMB; depth++, up = up.parentElement) {
+    push(up.getAttribute("aria-label"));
+    push(up.getAttribute("title"));
+  }
+  return labels;
+}
+
+/**
+ * Measurable, writable text fields, each with the names it answers to.
+ *
+ * Keyed by the RESOLVED writable node: a `role=combobox` wrapper and the <input>
+ * inside it are one field, not two, and the labels gathered from the wrapper are
+ * merged onto the input so naming it works either way.
+ */
+function collectFieldCandidates(): Array<FieldRun & { element: Element }> {
+  const fields = new Map<Element, FieldRun & { element: Element }>();
+  const deadline = performance.now() + TEXT_TARGET_BUDGET_MS;
+  let visited = 0;
+
+  for (const el of Array.from(document.body.querySelectorAll(FIELD_SELECTOR))) {
+    if (++visited > TEXT_TARGET_MAX_NODES || performance.now() > deadline) break;
+    if ((el as HTMLInputElement).disabled) continue;
+    const input = el as HTMLInputElement;
+    if (input.readOnly) continue;
+    // Zero client rects means display:none, a collapsed ancestor, or a detached
+    // node — a field nobody can type into.
+    if (el.getClientRects().length === 0) continue;
+    // A wrapper (`role=combobox` around the real input) resolves to the node that
+    // actually takes text — the same resolution `type` does, so naming a field
+    // cannot type into a div. A wrapper whose inner control is missing is not writable
+    // at all and is skipped rather than listed as a field that cannot be used.
+    const writable = writableTarget(el);
+    const directlyWritable =
+      el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el.hasAttribute("contenteditable");
+    if (!writable && !directlyWritable) continue;
+    const target = writable ?? el;
+    const rect = target.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    const role = roleOfElement(target) ?? roleOfElement(el) ?? (target instanceof HTMLInputElement ? "textbox" : null);
+    const labels = fieldLabels(el, target);
+    if (labels.length === 0) continue;
+    const existing = fields.get(target);
+    if (existing) {
+      for (const label of labels) if (!existing.labels.includes(label)) existing.labels.push(label);
+      continue;
+    }
+    fields.set(target, {
+      text: labels[0],
+      labels,
+      x: Math.round(rect.left),
+      y: Math.round(rect.top),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+      tag: target.tagName.toLowerCase(),
+      role,
+      element: target,
+    });
+  }
+
+  return Array.from(fields.values());
+}
+
+/** Names every field the page offers, so a missed query is recoverable. */
+function describeAvailableFields(fields: Array<FieldRun & { element: Element }>): string {
+  return fields
+    .slice(0, 8)
+    .map((f) => `${JSON.stringify(normalizeForMatch(f.labels[0]).slice(0, 40))} (${f.role ?? f.tag})`)
+    .join(", ");
+}
+
+/**
+ * Type into a field named by its visible label, placeholder or name.
+ *
+ * The refusal paths are the useful ones: a query that matches several fields of
+ * equal standing reports the others instead of picking silently, and a query that
+ * matches nothing lists what the page does offer — which is what turns a dead end
+ * into one more turn instead of another blind `type` on a guessed id.
+ */
+async function typeByText(
+  field: string,
+  text: string,
+  submit: boolean,
+  index: number,
+): Promise<ActionResult> {
+  const wanted = field.trim();
+  if (wanted.length < 2) {
+    return fail("type_text needs the field's visible name (at least 2 characters) to know where to type.");
+  }
+  const fields = collectFieldCandidates();
+  if (fields.length === 0) {
+    return fail(
+      "No text fields with a usable name are visible on this page. Call read_page, or scroll to bring " +
+      "the field into view.",
+    );
+  }
+  const match = pickFieldMatch(fields, wanted, index);
+  if (!match) {
+    return fail(
+      `No text field on this page is named ${JSON.stringify(wanted)}. ` +
+      `Fields available: ${describeAvailableFields(fields)}. ` +
+      `Use one of those names, or read_page if the field is further down the page.`,
+    );
+  }
+
+  const result = await typeInto(match.run.element, text, submit);
+  if (!result.ok) return result;
+
+  // Naming the other equal-standing matches is the difference between "the query
+  // was ambiguous and the tool chose" and a silent choice the model cannot see: it
+  // can retry with `index` in one turn instead of wondering which box took the text.
+  const others = rankFieldMatches(fields, wanted).filter((m) => m.run.element !== match.run.element);
+  const ambiguity = others.length > 0
+    ? ` ${others.length} other field(s) match ${JSON.stringify(wanted)} — pass index 1..${others.length} to pick one: ` +
+      others.map((m) => JSON.stringify(normalizeForMatch(m.run.labels[0]).slice(0, 30))).join(", ") + "."
+    : "";
+
+  return done(
+    `Matched the field named ${JSON.stringify(match.run.labels[0])} (${match.reason} match). ${result.detail}${ambiguity}`,
+  );
 }
 
 function describe(el: Element): string {
@@ -520,6 +700,17 @@ export async function act(action: AgentAction): Promise<ActionResult> {
         if (typeof el === "string") return fail(el);
         const text = typeof input.text === "string" ? input.text : "";
         return await typeInto(el, text, input.submit === true);
+      }
+
+      case "type_text": {
+        // The handle that exists when a field has no element id: its name. Ids
+        // come from the page read, and a search box or filter input inside a
+        // component may not be in it at all. This never touches the registry, so
+        // it cannot act on a stale id either.
+        const field = typeof input.field === "string" ? input.field : "";
+        const text = typeof input.text === "string" ? input.text : "";
+        const index = typeof input.index === "number" ? input.index : 0;
+        return await typeByText(field, text, input.submit === true, index);
       }
 
       case "select": {

@@ -399,7 +399,9 @@ function updatePerceptionCount() {
 
 const GLYPHS: Record<string, string> = {
   click: "→",
+  click_text: "↳",
   type: "⌨",
+  type_text: "⌨",
   select: "▾",
   scroll: "↕",
   key: "⏎",

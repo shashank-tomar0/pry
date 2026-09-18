@@ -51,6 +51,8 @@ export type ActionName =
   /** Click by visible text — the handle that exists when no element id does. */
   | "click_text"
   | "type"
+  /** Type by the field's visible name — the same handle, for text entry. */
+  | "type_text"
   | "select"
   | "scroll"
   | "navigate"

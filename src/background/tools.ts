@@ -73,6 +73,32 @@ export const TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: "type_text",
+    description:
+      "Type text into a field named by its visible name — its label, placeholder, " +
+      "aria-label or name — for fields that have no element id in the page read: " +
+      "search boxes, filter inputs, and form fields inside components the read " +
+      "cannot enumerate. Give `field` as the words on or in the box (\"Search\"), " +
+      "not its current contents. Set submit true to press Enter afterwards, which " +
+      "is how you run a search. If several fields match equally, the result names " +
+      "them so you can pass index; if none match, it lists the fields that exist.",
+    parameters: {
+      type: "object",
+      properties: {
+        field: {
+          type: "string",
+          description: "Visible name of the field, e.g. its label or placeholder text",
+        },
+        text: { type: "string", description: "The text to type into it" },
+        submit: { type: "boolean", description: "Press Enter after typing" },
+        index: { type: "number", description: "0-based position among equally-good field matches" },
+        reason: { type: "string", description: "One short phrase: why this field, this text" },
+      },
+      required: ["field", "text", "reason"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "select",
     description: "Choose an option in a <select> dropdown by its visible label or value.",
     parameters: {
@@ -193,6 +219,7 @@ export const PAGE_ACTIONS = new Set([
   "click",
   "click_text",
   "type",
+  "type_text",
   "select",
   "scroll",
   "key",

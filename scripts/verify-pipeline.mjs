@@ -1778,6 +1778,59 @@ ok("email in plain text is detected",
   emailHits.some((m) => m.kind === "email" && m.value === "rahul.sharma@gmail.com"),
   JSON.stringify(emailHits));
 
+// ── An address typed WITHOUT its TLD is still an address ────────────────────
+// Verbatim from a reported run: "open gmail and write a mail to
+// shashank.tomar.work@gmail …" ran with 0 vault tokens, so the recipient rode to
+// the remote planner in the clear and was quoted back in the model's reasoning.
+// The identical instruction with ".com" on the end WAS redacted — a four-character
+// difference in the user's typing decided whether PRY protected it.
+const tldless = matchPiiInText("write a mail to shashank.tomar.work@gmail say him hi");
+ok("an address with a dotted local part and no TLD is detected",
+  tldless.some((m) => m.kind === "email" && m.value === "shashank.tomar.work@gmail"),
+  JSON.stringify(tldless.map((m) => m.value)));
+ok("and one at a known mail host with no TLD at all",
+  matchPiiInText("mail raj@gmail about it").some((m) => m.kind === "email" && m.value === "raj@gmail"));
+ok("the whole reported instruction is tokenized end to end, with the address gone",
+  (() => {
+    const r = tokenizer.tokenizeTask("open gmail and write a mail to shashank.tomar.work@gmail say him hi");
+    return r.tokenCount >= 1 && !/shashank\.tomar\.work@gmail/.test(r.task) && /<[A-Z]+_\d+>/.test(r.task);
+  })(),
+  JSON.stringify(tokenizer.tokenizeTask("open gmail and write a mail to shashank.tomar.work@gmail say him hi").task));
+
+// …and the shapes that must NOT be eaten, measured rather than assumed. Retina
+// asset names have an undotted local part, CSS at-rules and scoped packages have
+// no local part at all, and a version string's last label is not letters.
+// A retina asset name IS still read as an address, and that is a deliberate
+// measured trade rather than an oversight: `sprite@2x.png` is indistinguishable
+// from a real address at a digit-leading host (`user@123reg.co.uk`), and in a
+// privacy tool a missed address leaks while an over-masked asset name costs
+// nothing but a mask. Pinned as a KNOWN over-match so nobody "fixes" it into a
+// false negative without seeing this line.
+ok("a retina asset name is still taken for an address — the measured cost of never missing one",
+  matchPiiInText("background-image: url(sprite@2x.png)").some((m) => m.kind === "email"));
+
+const notAddresses = [
+  "@media (min-width: 600px) { .a { color: red } }",
+  "install @types/node and @scope/pkg",
+  "pkg@1.2.3 was released",
+  "follow @shashank for updates",
+];
+for (const sample of notAddresses) {
+  ok(`not an address: ${JSON.stringify(sample.slice(0, 44))}`,
+    !matchPiiInText(sample).some((m) => m.kind === "email"),
+    JSON.stringify(matchPiiInText(sample).map((m) => m.value)));
+}
+// Both channels must build from the ONE shape, or the text channel redacts what
+// the pixel channel leaves readable — which is how the original leak class began.
+const domEmail = detectAllPIIDetailed({
+  elements: [{ id: 3, role: "textbox", name: "Message Body", value: "write a mail to shashank.tomar.work@gmail say him hi" }],
+  text: "write a mail to shashank.tomar.work@gmail say him hi",
+}).detections.some((d) => d.label === "Email address");
+ok("the DOM/text channel agrees with the pixel channel on the same string", domEmail);
+const piiDetectorSource = await readFile("src/background/pii-detector.ts", "utf8");
+ok("and it builds its matcher from the shared source instead of re-typing it",
+  /EMAIL_PATTERN_SOURCE/.test(piiDetectorSource) && !/EMAIL_PATTERN = \//.test(piiDetectorSource));
+
 // Indian phone, both formats.
 ok("+91 formatted phone detected",
   matchPiiInText("call +91 98765 43210 now").some((m) => m.kind === "phone"));
@@ -2240,6 +2293,7 @@ console.log("\n=== Scenario AK: planner turn liveness policy ===\n");
 
 const {
   withTurnBudget, newTurnLiveness, turnCutShortMessageFor, isRetryablePlannerError,
+  retryPolicyFor, RETRY_FIRST_OUTPUT_MS,
 } = await import("../src/background/agent.ts");
 
 const budgetOpts = (messageFor) => ({
@@ -2455,6 +2509,7 @@ console.log("\n=== Scenario AN: text-anchored targeting ===\n");
 const {
   normalizeForMatch, scoreTextMatch, rankTextMatches, pickTextMatch,
   isClickableTarget, describeTextTarget,
+  scoreFieldMatch, rankFieldMatches, pickFieldMatch,
 } = await import("../src/shared/text-target.ts");
 
 ok("matching ignores case and collapsed whitespace",
@@ -2539,6 +2594,103 @@ ok("an irreversible target stays behind a confirmation even when matched by text
   confirmRiskyText.verdict === "confirm", JSON.stringify(confirmRiskyText));
 const allowReadOnly = safetyGate({ name: "click_text", input: { text: "You're on the Muse waitlist" } }, undefined, true);
 ok("an ordinary row click is allowed", allowReadOnly.verdict === "allow", JSON.stringify(allowReadOnly));
+
+// ── Text-anchored TYPING: a field with no id still has a name ───────────────
+// The reported dead end: asked to search YouTube, the run reached the page, found
+// no element id for the search box, and re-read the page five times until the loop
+// guard killed it. The tool table had click_text and no way to type without an id,
+// so the guard's own advice ("use click_text") could not fix the failure it fired
+// on. A field's name is as visible as a row's text, so it becomes the same handle.
+const searchField = {
+  text: "Search", labels: ["Search", "Search YouTube"], tag: "input", role: "searchbox",
+  x: 400, y: 20, width: 500, height: 40,
+};
+const commentField = {
+  text: "Add a comment\u2026", labels: ["Add a comment\u2026"], tag: "textarea", role: "textbox",
+  x: 100, y: 700, width: 600, height: 80,
+};
+const filterField = {
+  text: "Filter", labels: ["Filter"], tag: "input", role: "textbox",
+  x: 900, y: 100, width: 120, height: 30,
+};
+const fieldSet = [searchField, commentField, filterField];
+
+ok("a field is matched by its placeholder, case-insensitively",
+  pickFieldMatch(fieldSet, "search")?.run.role === "searchbox");
+ok("and by any of the names it answers to, not just the first",
+  scoreFieldMatch(searchField, "search youtube") === "exact" &&
+  scoreFieldMatch(searchField, "search") === "exact");
+ok("a name the user shortened still matches its field, one rank weaker",
+  scoreFieldMatch(searchField, "search you") === "prefix",
+  JSON.stringify(scoreFieldMatch(searchField, "search you")));
+ok("a person's shorthand matches the field that contains it",
+  pickFieldMatch(fieldSet, "comment")?.run.tag === "textarea",
+  JSON.stringify(pickFieldMatch(fieldSet, "comment")?.reason));
+const fieldWith = (...labels) => ({ text: labels[0], labels, tag: "input", role: "textbox", x: 0, y: 0, width: 10, height: 10 });
+ok("the strongest label wins: an exact label beats the same word inside a longer one",
+  scoreFieldMatch(fieldWith("Sign in to your account", "Account"), "account") === "exact");
+ok("a word inside a label still matches its field, one rank weaker",
+  scoreFieldMatch(fieldWith("Email address"), "address") === "word",
+  JSON.stringify(scoreFieldMatch(fieldWith("Email address"), "address")));
+ok("scoring is per label, so a long name cannot beat a clean one by accumulating hits",
+  scoreFieldMatch(fieldWith("Email", "address"), "email address") === null,
+  "no single label says \"email address\", so nothing is claimed as an exact field name");
+ok("a field's VALUE is not a name: prefilled text cannot be matched as a label",
+  pickFieldMatch([{ ...searchField, labels: ["Search"] }], "harkirat singh") === null,
+  "matching the value would aim typing at whatever the page prefilled");
+ok("no matching field returns null so the caller can list what exists",
+  pickFieldMatch(fieldSet, "coupon code") === null);
+ok("a one-character query never matches anything (the gate refuses it too)",
+  pickFieldMatch(fieldSet, "s") === null && pickFieldMatch(fieldSet, "") === null);
+const twinFields = [
+  { text: "Search", labels: ["Search"], tag: "input", role: "searchbox", x: 0, y: 40, width: 100, height: 20 },
+  { text: "Search", labels: ["Search"], tag: "input", role: "searchbox", x: 0, y: 120, width: 100, height: 20 },
+];
+ok("two fields with the same name resolve topmost-first, and index picks the other",
+  pickFieldMatch(twinFields, "Search")?.run.y === 40 &&
+  pickFieldMatch(twinFields, "Search", 1)?.run.y === 120);
+ok("every equal-standing match is reported, so an ambiguous name is visible not silent",
+  rankFieldMatches(twinFields, "Search").length === 2);
+ok("ranking is deterministic: score first, then reading order",
+  rankFieldMatches(
+    [{ text: "Search help", labels: ["Search help"], tag: "input", role: "textbox", x: 0, y: 10, width: 50, height: 10 },
+     { text: "Search", labels: ["Search"], tag: "input", role: "searchbox", x: 0, y: 90, width: 50, height: 10 }],
+    "Search",
+  )[0].run.y === 90);
+
+const typeTextTool = TOOLS.find((t) => t.name === "type_text");
+ok("type_text is exposed to the planner, named by the field rather than an id",
+  Boolean(typeTextTool) &&
+  typeTextTool.parameters.properties.field?.type === "string" &&
+  typeTextTool.parameters.properties.text?.type === "string" &&
+  typeTextTool.parameters.required.includes("field") &&
+  typeTextTool.parameters.required.includes("text") &&
+  !typeTextTool.parameters.properties.element_id);
+ok("type_text is routed to the content script as a page action", PAGE_ACTIONS.has("type_text"));
+ok("typing into a field justifies a fresh frame — it is not a read",
+  actionChangesFrame("type_text"));
+
+const blindField = safetyGate({ name: "type_text", input: { field: "a", text: "hi" } }, undefined, false);
+ok("a text-anchored type with no usable field name is refused, not guessed",
+  blindField.verdict === "refuse" && /field's visible name/.test(blindField.reason), blindField.reason);
+const secretViaText = safetyGate(
+  { name: "type_text", input: { field: "Password", text: "sk-9f2b8e1c4d7a6f3b5e8c1d4a7b6e3f2c" } },
+  undefined, false,
+);
+ok("a secret is refused on the text-anchored path too — naming a field is not a way around the value checks",
+  secretViaText.verdict === "refuse", secretViaText.reason);
+const submitNamed = safetyGate(
+  { name: "type_text", input: { field: "Full name", text: "Priya Sharma", submit: true } },
+  undefined, true,
+);
+ok("submitting a form by naming its field still asks first",
+  submitNamed.verdict === "confirm", JSON.stringify(submitNamed));
+const submitSearch = safetyGate(
+  { name: "type_text", input: { field: "Search", text: "harkirat singh", submit: true } },
+  undefined, true,
+);
+ok("submitting a search box does not — the same exemption the id-based path has",
+  submitSearch.verdict === "allow", JSON.stringify(submitSearch));
 
 // ── Scenario AO: the deliberation guard ─────────────────────────────────────
 // The reported stall: the planner streamed past the 6 000-char display cap
@@ -2885,6 +3037,49 @@ ok("and it is cut in seconds, not at the ceiling",
 // first, called it a mid-stream stall, and retried (that wording is retryable by
 // design), which re-sent the prompt that produced the glitch and produced it
 // again. The collapse is the finding; the silence after it is a symptom.
+// ── The retry policy, stated where it can be tested ─────────────────────────
+// The reported run: 148 s of streaming (56 deltas, ~210 chars), a 30 s silence,
+// then a retry that produced nothing for 90 s — 268 s and zero actions, ending in
+// "switch to a faster provider/model". The retry could never have worked: the
+// endpoint had just demonstrated 1.4 chars/s, and re-sending the same prompt to it
+// spends another full budget to be told the same thing.
+const live = (over) => ({ ...newTurnLiveness(), ...over });
+ok("the reported stall is NOT retried — an endpoint that streamed for 148s is throughput, not a dropped connection",
+  retryPolicyFor(
+    live({ ended: "silent", events: 56, endedAfterMs: 148_000 }),
+    turnCutShortMessageFor("NVIDIA test", "silent", live({ events: 56 }), 178_000, 90_000),
+  ).retry === false,
+  retryPolicyFor(live({ ended: "silent", events: 56, endedAfterMs: 148_000 }), "").because);
+ok("and the refusal says which of the two silences this was",
+  /throughput rather than a dropped connection/.test(
+    retryPolicyFor(live({ ended: "silent", events: 56, endedAfterMs: 148_000 }), "").because));
+ok("a stall in the first seconds IS retried — that is what a dropped connection looks like",
+  retryPolicyFor(
+    live({ ended: "silent", events: 3, endedAfterMs: 6_000 }),
+    turnCutShortMessageFor("NVIDIA test", "silent", live({ events: 3 }), 6_000, 90_000),
+  ).retry === true);
+ok("neither is a turn that produced nothing at all — that is a provider failing to serve, already classified as no-retry",
+  retryPolicyFor(
+    live({ ended: "silent", events: 0, endedAfterMs: 90_000 }),
+    turnCutShortMessageFor("NVIDIA test", "silent", live({ events: 0 }), 90_000, 90_000),
+  ).retry === false);
+ok("a status-coded transport failure is still retried once",
+  retryPolicyFor(live({ ended: "settled" }), "Groq returned 503 — the service is overloaded, try again.").retry === true,
+  "the one case a retry genuinely resolves");
+ok("a collapse is never retried, whatever else is true",
+  ["ceiling", "degenerate", "salad"].every((ended) =>
+    retryPolicyFor(live({ ended, events: 40, endedAfterMs: 120_000 }), "anything").retry === false));
+ok("a non-transient failure is never retried",
+  retryPolicyFor(live({ ended: "settled" }), "Refusing to type that value — it looks like an API key.").retry === false);
+ok("the retry's own budget is short, because a hiccup answers in seconds",
+  RETRY_FIRST_OUTPUT_MS <= 30_000, `${RETRY_FIRST_OUTPUT_MS}ms`);
+const agentRetrySource = await readFile("src/background/agent.ts", "utf8");
+ok("and the loop actually gives the retry that budget instead of the cold 90s",
+  /runPlannerTurn\(new AbortController\(\), newTurnLiveness\(\), true\)/.test(agentRetrySource) &&
+  /firstOutputMs: budgetFor\(isRetry\)/.test(agentRetrySource));
+ok("the cut records how long the turn ran, which is the signal the policy needs",
+  /liveness\.endedAfterMs = waitedMs/.test(agentRetrySource));
+
 const stalledSalad = newTurnLiveness();
 for (let i = 0; i + 4 <= saladWords.length; i += 4) {
   recordStreamedOutput(stalledSalad, `${saladWords.slice(i, i + 4).join(" ")} `);

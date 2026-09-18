@@ -62,35 +62,47 @@ chrome.runtime.onMessage.addListener(
         });
         return false;
 
-      case "locate-spans":
+      case "locate-spans": {
         // NER→pixel bridge: the offscreen model named spans; the content
         // script measures where they are painted and returns black-box rects.
+        // The reply also carries what the walk could NOT paint because the
+        // pixels are outside the viewport, and whether the walk finished — the
+        // service worker turns those two facts into "not in this image" rather
+        // than "detected and unplaceable" (see unplacedAfterLocators).
+        const located = locateSpans((request as { spans?: string[] }).spans ?? []);
         sendResponse({
           ok: true,
           detail: "located-spans",
-          sensitiveRegions: locateSpans((request as { spans?: string[] }).spans ?? []),
+          sensitiveRegions: located.regions,
+          offCapture: located.offCapture,
+          locatorScanComplete: located.scanComplete,
           dpr: window.devicePixelRatio || 1,
           scrollY: Math.round(window.scrollY),
           viewportWidth: window.innerWidth,
         });
         return false;
+      }
 
-      case "locate-elements":
+      case "locate-elements": {
         // Detector→pixel bridge: PII the text channels found inside an element
         // (aria-label, title, input value) has no text node to measure, so it
         // is located by its registry id instead. Without this the item is
         // tokenized for the model but stays readable in the frame.
+        const placed = locateElements(
+          (request as { targets?: Array<{ selector: string; value?: string }> }).targets ?? [],
+        );
         sendResponse({
           ok: true,
           detail: "located-elements",
-          sensitiveRegions: locateElements(
-            (request as { targets?: Array<{ selector: string; value?: string }> }).targets ?? [],
-          ),
+          sensitiveRegions: placed.regions,
+          offCapture: placed.offCapture,
+          locatorScanComplete: placed.scanComplete,
           dpr: window.devicePixelRatio || 1,
           scrollY: Math.round(window.scrollY),
           viewportWidth: window.innerWidth,
         });
         return false;
+      }
 
       case "fullpage-begin":
         sendResponse(beginFullPageCapture());

@@ -16,7 +16,7 @@ import { VISION_SUPPORTED } from "./vision";
 import { tokenizer, maskSample } from "./tokenizer";
 import { clearWire, wireRecords } from "./wire-log";
 import { getActiveNerSpans, getActivePiiTargets } from "./ml-bridge";
-import { findUnlocatedValues, unverifiedElementTargets } from "../shared/redaction-reconciliation";
+import { findUnlocatedValues, unplacedAfterLocators, unverifiedElementTargets } from "../shared/redaction-reconciliation";
 import { ensureOffscreenDocument } from "./offscreen-doc";
 import { runTask } from "./agent";
 import { createPlanner } from "./providers";
@@ -398,7 +398,13 @@ async function processScreenshot(
  * Every round trip is bounded. Missing regions remain available as a local
  * preview failure, but must downgrade capture protection before egress.
  */
-async function getSensitiveRegions(tabId: number): Promise<{
+/**
+ * @param fullPageCapture True only when the image this will be mapped onto is a
+ *   stitched capture of the WHOLE page. It changes what an off-viewport value
+ *   means: in a viewport capture it is provably absent from the image, in a
+ *   stitched one it is right there and must stay a coverage failure.
+ */
+async function getSensitiveRegions(tabId: number, fullPageCapture = false): Promise<{
   regions: Array<{ x: number; y: number; width: number; height: number; kind: string; label: string; value?: string }>;
   dpr: number;
   /** Viewport scroll (CSS px) when the regions were measured — full-page mapping. */
@@ -548,10 +554,49 @@ async function getSensitiveRegions(tabId: number): Promise<{
       [region.x, region.y, region.width, region.height].every(Number.isFinite) &&
       region.width > 0 && region.height > 0);
     if (validRegions.length !== regions.length) failures.push("dom-region-geometry-invalid");
+
+    // A locator that saw a value rendered but could not paint it is saying
+    // something specific: the pixels are outside the area this capture covers.
+    // Absence is only provable when EVERY locator that was asked reached the end
+    // of the document — a walk that stopped at its node or time budget simply
+    // did not look at the rest of the page.
+    const offCapture = new Set<string>();
+    let locatorScanComplete = true;
+    for (const [reply, asked] of [
+      [nerResult, locateValues.length > 0],
+      [elementResult, elementTargets.length > 0],
+    ] as const) {
+      if (!asked) continue;
+      const located = reply?.ok
+        ? (reply.value as { offCapture?: unknown; locatorScanComplete?: unknown } | null)
+        : null;
+      if (!located || !Array.isArray(located.offCapture) || located.locatorScanComplete !== true) {
+        locatorScanComplete = false;
+        continue;
+      }
+      for (const value of located.offCapture) {
+        if (typeof value === "string" && value.length > 0) offCapture.add(value);
+      }
+    }
+
     // Kept, not just counted: these values are what the pixel channel is asked
     // about below, so its verdict can turn "we could not place it" into "it is
     // not legible in the frame" (or into a refusal, when it is).
-    const unlocatedValues = findUnlocatedValues(locateValues.map((value) => ({ value })), validRegions);
+    const unplaced = findUnlocatedValues(locateValues.map((value) => ({ value })), validRegions);
+    const unlocatedValues = unplacedAfterLocators(unplaced, {
+      offCapture,
+      scanComplete: locatorScanComplete,
+      captureCoversWholePage: fullPageCapture,
+    });
+    // Not a warning and never a transcript entry: these values are not in the
+    // image, so there is nothing hidden about the frame. Logged because it is
+    // the reason a frame that used to be withheld now ships.
+    if (unlocatedValues.length < unplaced.length) {
+      console.log(
+        `[PRY] ${unplaced.length - unlocatedValues.length} detected value(s) are rendered outside the captured ` +
+        `viewport, so this image cannot contain them — not an unplaceable leak.`,
+      );
+    }
     if (unlocatedValues.length > 0) {
       failures.push("dom-targets-unresolved");
     }
@@ -641,7 +686,7 @@ export async function captureAndProcessScreenshot(
   }
 
   // Sensitive regions + DPR come from the SAME tab we captured.
-  const sensitiveData = await getSensitiveRegions(tabId);
+  const sensitiveData = await getSensitiveRegions(tabId, capturedFullPage);
   if (sensitiveData?.failure) {
     // Text-region collection could not complete, so this frame's text PII is
     // NOT redacted (faces still are — that channel is pure pixel work). This
@@ -1484,8 +1529,9 @@ chrome.runtime.onMessage.addListener(
               await chrome.tabs.update(focusReturnTabId, { active: true }).catch(() => undefined);
             }
 
-            // 3. Sensitive regions & DPR
-            const sensitiveData = await getSensitiveRegions(tabId);
+            // 3. Sensitive regions & DPR (viewport vs stitched capture decides
+            // what an off-viewport value means — see getSensitiveRegions).
+            const sensitiveData = await getSensitiveRegions(tabId, capturedFullPage);
             const dpr = sensitiveData?.dpr ?? 1;
             const sensitiveRegions = sensitiveData?.regions ?? [];
 

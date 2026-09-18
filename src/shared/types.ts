@@ -462,6 +462,16 @@ export interface Settings {
   /** Full-page scroll stitching capture for whole-document privacy inspection. */
   fullPageCapture?: boolean;
   /**
+   * Prefer the provider's plainest model over the one configured.
+   *
+   * The measured complaint this answers is TIME TO FIRST TOKEN, and on a
+   * reasoning model that time goes on chain-of-thought the user never sees (the
+   * panel reports it as "model is reasoning (N chars so far)" while the visible
+   * answer has not begun). Off by default: the configured model plans better,
+   * and this trades that away deliberately. See PROVIDERS[].fastModel.
+   */
+  fastPlanner?: boolean;
+  /**
    * Optional VLM vision: after each page change, the REDACTED screenshot is
    * sent to a vision-capable model (same provider key as the planner) and its
    * description is appended to the tool result. Only redacted pixels leave
@@ -557,6 +567,7 @@ export const DEFAULT_SETTINGS: Settings = {
   maxSteps: 40,
   confirmRisky: true,
   fullPageCapture: false,
+  fastPlanner: false,
   vision: {
     enabled: false,
     model: "",
@@ -615,6 +626,7 @@ export function normaliseSettings(stored: unknown): Settings {
     ...DEFAULT_SETTINGS,
     ...raw,
     fullPageCapture: raw.fullPageCapture ?? DEFAULT_SETTINGS.fullPageCapture,
+    fastPlanner: raw.fastPlanner ?? DEFAULT_SETTINGS.fastPlanner,
     apiKeys: { ...DEFAULT_SETTINGS.apiKeys, ...(raw.apiKeys ?? {}) },
     models: { ...DEFAULT_SETTINGS.models, ...(raw.models ?? {}) },
     vision: {

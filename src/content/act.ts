@@ -8,6 +8,7 @@ import {
   isClickableTarget,
   describeTextTarget,
   normalizeForMatch,
+  boxContains,
   type FieldRun,
   type TextRun,
 } from "../shared/text-target";
@@ -545,15 +546,45 @@ function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, value: strin
  * label wrapper around the real <input>/<textarea>/contenteditable, so typing
  * must target the inner control, not the wrapper.
  */
+/** The editable descendants of `el` that are actually rendered right now. */
+function editableDescendants(el: Element): Element[] {
+  return Array.from(
+    el.querySelectorAll(
+      "input:not([type=hidden]), textarea, [contenteditable=''], [contenteditable=true]",
+    ),
+  ).filter((node) => {
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  });
+}
+
+/**
+ * The element that can actually receive text.
+ *
+ * A named container is common: the text channels read a field's accessible name
+ * off the wrapper (Gmail's recipient area is a labelled `<div>` around the real
+ * `<input>`), so the planner asks to type into the container and the action used
+ * to refuse it — `<div "Recipients"> is not a text field.` — costing a planner
+ * round trip before it guessed the input's own name on the next try.
+ *
+ * So descend into the container, but only when it really IS that field's
+ * wrapper: exactly one rendered editable child, sitting inside the container's
+ * own box. The box test is what keeps this from reaching for an unrelated input
+ * the container merely happens to enclose (a form, a toolbar, a whole panel);
+ * an explicit ARIA role that means "this is a text field" is trusted on its own,
+ * which is the behaviour that was already here.
+ */
 function writableTarget(el: Element): Element | null {
   if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return el;
   if (el.hasAttribute("contenteditable")) return el;
   const role = el.getAttribute("role");
-  if (role === "combobox" || role === "textbox" || role === "searchbox") {
-    const inner = el.querySelector("input:not([type=hidden]), textarea, [contenteditable=''], [contenteditable=true]");
-    if (inner) return inner;
-  }
-  return null;
+  const editables = editableDescendants(el);
+  if (editables.length === 0) return null;
+  if (role === "combobox" || role === "textbox" || role === "searchbox") return editables[0];
+  if (editables.length > 1) return null;
+  return boxContains(el.getBoundingClientRect(), editables[0].getBoundingClientRect())
+    ? editables[0]
+    : null;
 }
 
 async function typeInto(el: Element, text: string, submit: boolean): Promise<ActionResult> {

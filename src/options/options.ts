@@ -17,6 +17,7 @@ const modelStatus = $("model-status");
 const maxStepsEl = $<HTMLInputElement>("maxSteps");
 const confirmRiskyEl = $<HTMLInputElement>("confirmRisky");
 const fullPageCaptureEl = $<HTMLInputElement>("fullPageCapture");
+const fastPlannerEl = $<HTMLInputElement>("fastPlanner");
 
 // ElevenLabs voice (hack branch).
 const elApiKeyEl = $<HTMLInputElement>("elevenlabs-api-key");
@@ -117,6 +118,7 @@ function renderAll(): void {
   maxStepsEl.value = String(settings.maxSteps);
   confirmRiskyEl.checked = settings.confirmRisky;
   fullPageCaptureEl.checked = Boolean(settings.fullPageCapture);
+  fastPlannerEl.checked = Boolean(settings.fastPlanner);
 
   // ElevenLabs voice.
   elApiKeyEl.value = settings.elevenlabs.apiKey;
@@ -281,6 +283,7 @@ $("save").addEventListener("click", async () => {
   settings.maxSteps = Math.min(200, Math.max(5, Number(maxStepsEl.value) || 40));
   settings.confirmRisky = confirmRiskyEl.checked;
   settings.fullPageCapture = fullPageCaptureEl.checked;
+  settings.fastPlanner = fastPlannerEl.checked;
 
   // ElevenLabs: enabling either voice feature without a key is silently
   // a no-op (the side panel checks the flag + key together), but warn so

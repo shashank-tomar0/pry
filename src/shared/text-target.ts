@@ -217,6 +217,30 @@ export function isClickableTarget(tag: string, role: string | null, hasTabIndex:
   return hasTabIndex;
 }
 
+/** A rectangle in viewport coordinates, as `getBoundingClientRect` reports it. */
+export interface ViewportBox {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+/**
+ * Does `inner` sit inside `outer`'s own box, allowing a little slack?
+ *
+ * This is what decides whether a container named for a field IS that field's
+ * wrapper, which is the difference between typing into Gmail's recipient area
+ * and typing into some unrelated input the container happens to enclose. Kept
+ * here, pure, so the rule is testable without a DOM: the caller has the two
+ * rectangles and nothing else.
+ */
+export function boxContains(outer: ViewportBox, inner: ViewportBox, slack = 8): boolean {
+  return inner.left >= outer.left - slack &&
+    inner.right <= outer.right + slack &&
+    inner.top >= outer.top - slack &&
+    inner.bottom <= outer.bottom + slack;
+}
+
 /** Human-readable name for what was clicked, for the action result. */
 export function describeTextTarget(text: string, tag: string, role: string | null): string {
   const label = normalizeForMatch(text).slice(0, 60);

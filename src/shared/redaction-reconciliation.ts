@@ -93,6 +93,55 @@ export function findUnlocatedValues(
 }
 
 /**
+ * Which of those values STILL count as unplaceable, given what the locators saw.
+ *
+ * The locators (`locateSpans`, `locateElements`) only return a rect for text the
+ * capture can actually contain: they skip anything whose client rect lies
+ * outside the viewport, because a viewport screenshot has no pixels there. That
+ * skip is right for PAINTING and was wrong as input to `findUnlocatedValues`,
+ * which read "no region carries this value" as "detected but unlocatable on
+ * screen" — a coverage failure, and a coverage failure withholds the frame.
+ *
+ * A live run failed on exactly that. A name the on-device model found in the
+ * page's TEXT and that was rendered below the fold is provably absent from a
+ * capture of the visible area, but it was counted as unplaceable — and the
+ * pixel channel was then asked to clear it from the frame, which it cannot do
+ * either, so the case could never resolve. Every frame on that page was
+ * withheld and the planner lost its vision channel for the rest of the run.
+ *
+ * So the two outcomes are separated, and only one of them withholds:
+ *
+ *   - SEEN, but outside the area this capture covers: the image provably does
+ *     not contain it. Not a leak, and no reason to refuse the frame.
+ *   - NOT SEEN at all: the value may live where a DOM walk cannot read it — an
+ *     image, a canvas, a video frame. A real unknown, handed to the pixel
+ *     channel and withheld until it is answered.
+ *
+ * TWO GUARDS keep the first claim honest rather than convenient:
+ *
+ *   - `scanComplete` — a walk that stopped at its node or time budget did not
+ *     look at the rest of the page, so there "not seen" means "not seen YET"
+ *     and nothing may be excused.
+ *   - `captureCoversWholePage` — for a stitched full-page capture an off-viewport
+ *     value IS in the image, so nothing may be excused either.
+ */
+export function unplacedAfterLocators(
+  unplaced: string[],
+  locators: {
+    /** Values a locator saw rendered outside the area this capture covers. */
+    offCapture: Iterable<string>;
+    /** True only when EVERY locator that was asked walked the whole document. */
+    scanComplete: boolean;
+    /** True for a stitched full-page capture, which covers the whole document. */
+    captureCoversWholePage: boolean;
+  },
+): string[] {
+  if (locators.captureCoversWholePage || !locators.scanComplete) return [...unplaced];
+  const excused = new Set(locators.offCapture);
+  return unplaced.filter((value) => !excused.has(value));
+}
+
+/**
  * Which detected ELEMENT targets the pixel channel could not account for, and
  * why that matters for whether a frame may leave the browser.
  *

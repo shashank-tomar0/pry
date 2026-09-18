@@ -2631,6 +2631,7 @@ console.log("\n=== Scenario AL: PII target hygiene and detected-vs-boxed reconci
 
 const {
   sanitizePiiTargets, findUnlocatedValues, isLocatableSelector, unverifiedElementTargets,
+  unplacedAfterLocators,
 } = await import("../src/shared/redaction-reconciliation.ts");
 
 // Hygiene: only values worth locating, and only our own selector shape cross
@@ -2680,6 +2681,66 @@ ok("no targets means nothing to report",
 ok("the warning sample is masked by the shared tokenizer policy",
   maskSample("ada@example.com") === "ad•••@example.com" &&
   !maskSample("ada@example.com").includes("ada"));
+
+// ── Scenario BC: off-viewport is not an unplaceable leak ────────────────────
+// The live failure this closes: the locators only return a rect for text a
+// VIEWPORT capture can contain (they skip anything whose client rect lies
+// outside it — correct for painting), and `findUnlocatedValues` read that skip
+// as "detected but unlocatable on screen": a coverage failure, and a coverage
+// failure withholds the frame. A name the on-device model found in the page's
+// TEXT, rendered below the fold, is provably absent from a capture of the
+// visible area — so the frame was withheld for nothing, the pixel channel was
+// asked to clear a value that was never in the image (impossible), and the
+// planner lost its vision channel for the rest of the run.
+console.log("\n=== Scenario BC: a value outside the viewport is not an unplaceable leak ===\n");
+
+const viewportLocators = { offCapture: ["Ramesh Gupta"], scanComplete: true, captureCoversWholePage: false };
+ok("a value the locator SAW below the fold is not an unplaceable leak",
+  unplacedAfterLocators(["Ramesh Gupta"], viewportLocators).length === 0);
+ok("a value the locator never saw stays unplaced (it may be inside an image or canvas)",
+  unplacedAfterLocators(["Priya Sharma"], viewportLocators).join("|") === "Priya Sharma");
+ok("and only the seen-off-capture value is excused when both are in play",
+  unplacedAfterLocators(["Ramesh Gupta", "Priya Sharma"], viewportLocators).join("|") === "Priya Sharma");
+// Absence is only proof when the walk reached the end of the document. A walk
+// that stopped at its node or time budget did not look at the rest of the page,
+// so nothing may be excused — this is the guard that keeps the fix from turning
+// into "we did not find it, so it is fine".
+ok("a TRUNCATED scan excuses nothing",
+  unplacedAfterLocators(["Ramesh Gupta"], { ...viewportLocators, scanComplete: false }).length === 1);
+// And a stitched full-page capture covers the whole document, so an
+// off-viewport value IS in that image: the excuse would be false there.
+ok("a stitched full-page capture excuses nothing",
+  unplacedAfterLocators(["Ramesh Gupta"], { ...viewportLocators, captureCoversWholePage: true }).length === 1);
+ok("nothing unplaced means nothing to decide",
+  unplacedAfterLocators([], viewportLocators).length === 0);
+
+// The wiring, because a policy nothing calls is the failure this file keeps
+// finding: the content-side locators must report what they skipped AND whether
+// they finished, the worker must read both, and it must route the decision
+// through the policy instead of pushing the failure straight off the raw list.
+const locateSource = await readFile("src/content/perceive.ts", "utf8");
+const contentSource = await readFile("src/content/content.ts", "utf8");
+ok("the span locator reports the values it saw but could not paint",
+  /offCapture: \[\.\.\.seen\]\.filter\(\(span\) => !painted\.has\(span\)\)/.test(locateSource));
+ok("and it reports whether its walk reached the end of the document",
+  /let scanComplete = true;/.test(locateSource) &&
+    /scanComplete = false;\s*\n\s*break;/.test(locateSource));
+ok("the element locator excuses an element that is hidden or outside the viewport",
+  /if \(!isVisible\(el\)\)/.test(locateSource) &&
+    /rect\.left >= innerWidth \|\| rect\.right <= 0/.test(locateSource));
+ok("both locators carry the evidence over the message channel",
+  (contentSource.match(/locatorScanComplete:/g) ?? []).length === 2 &&
+    (contentSource.match(/offCapture: /g) ?? []).length === 2);
+const locatorWorkerSource = await readFile("src/background/service-worker.ts", "utf8");
+ok("the worker decides through the policy rather than off the raw unplaced list",
+  /unplacedAfterLocators\(unplaced, \{/.test(locatorWorkerSource));
+ok("and only the values the policy left unplaced withhold the frame",
+  /const unlocatedValues = unplacedAfterLocators\(unplaced, \{[\s\S]{0,260}?\}\);/.test(locatorWorkerSource) &&
+    /if \(unlocatedValues\.length > 0\) \{\s*\n\s*failures\.push\("dom-targets-unresolved"\)/.test(locatorWorkerSource));
+ok("a truncated walk is what makes absence unprovable on the worker side too",
+  /locatorScanComplete !== true/.test(locatorWorkerSource));
+ok("a stitched capture is declared to the region collection rather than assumed",
+  /getSensitiveRegions\(tabId, capturedFullPage\)/.test(locatorWorkerSource));
 
 // ── Element-target coverage: per target, not a blanket flag ────────────────
 // `dom-selector-coverage-unverified` used to be pushed whenever ANY target had a
@@ -3635,6 +3696,19 @@ ok("vision on with NO key ⇒ nothing can ship, so it is audit-only too",
   frameNeedsPlannerWait({ visionEnabled: true, hasVisionKey: false, aborted: false }) === false);
 ok("a Stop mid-step ⇒ no frame is awaited on the way out",
   frameNeedsPlannerWait({ visionEnabled: true, hasVisionKey: true, aborted: true }) === false);
+// The wait is a BET that local pixel work finishes before the planner needs the
+// next turn, and it is only a good bet at the cost the pipeline was measured at.
+// A live run paid the full 15 s in front of EVERY action and got nothing: the
+// capture never finished in time, because the face pass now runs native-
+// resolution crops, verification and escalation on top of a 6 s triage budget.
+// So the bet stops being placed once it has visibly lost — the frame is started
+// and joined after the next turn instead, which is a gain of one step of
+// freshness, never of evidence.
+ok("an overrunning capture stops the run from waiting on later ones",
+  frameNeedsPlannerWait({ visionEnabled: true, hasVisionKey: true, aborted: false, frameOverran: true }) === false);
+ok("and the bet is placed exactly as before until one actually overruns",
+  frameNeedsPlannerWait({ visionEnabled: true, hasVisionKey: true, aborted: false, frameOverran: false }) === true &&
+    frameNeedsPlannerWait({ visionEnabled: true, hasVisionKey: true, aborted: false }) === true);
 
 // The join: evidence that has already settled costs nothing, which is the whole
 // point — it is joined after a planner turn, not before one.
@@ -3704,6 +3778,19 @@ ok("and so is the deferred join",
 ok("a frame that does not arrive in time is announced, never silently dropped",
   /function noteFrameTimeout\(/.test(agentSource) &&
   (agentSource.match(/noteFrameTimeout\("/g) ?? []).length >= 2);
+// The overrun has to be RECORDED where the timeout is noticed, and READ where
+// the next frame decides whether to wait — a flag set but never passed is a
+// policy that never fires.
+ok("the overrun is recorded where the timeout is noticed",
+  /function noteFrameTimeout\(where: string\): void \{\s*\n\s*frameWaitOverran = true;/.test(agentSource));
+ok("and consulted where the next frame decides whether to wait",
+  /aborted: signal\.aborted,\s*\n\s*frameOverran: frameWaitOverran,/.test(agentSource));
+// Vision was turned on BY THE USER. A run that stops using it must say so
+// rather than degrade behind their back — the frame's redaction evidence still
+// arrives, the visual description does not.
+ok("a run that stops awaiting frames says so, once",
+  /announcedFrameWaitAbandoned = true;/.test(agentSource) &&
+    /Frame capture is not keeping up with the planner on this page/.test(agentSource));
 
 // ── Scenario AP: the app-switcher dead end ─────────────────────────────────
 // The live run: task = reach another site from a Gmail tab. The planner clicked

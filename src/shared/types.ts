@@ -90,6 +90,20 @@ export interface ActionResult {
   snapshot?: PageSnapshot;
   /** Populated when screenshot capture was requested. */
   screenshot?: ProcessedScreenshotResult;
+  /**
+   * Values a locator saw rendered but could not box, because their client rects
+   * lie outside the area a viewport capture covers (see `locateSpans`). The
+   * service worker needs this to keep "not in this image" apart from "detected
+   * and unplaceable": only the second one is a leak, and only the second one
+   * withholds the frame (see `unplacedAfterLocators`).
+   */
+  offCapture?: string[];
+  /**
+   * True only when the locator walked the whole document inside its node and
+   * time budget. A truncated walk proves nothing about what it did not reach,
+   * so an absent value then stays unplaceable.
+   */
+  locatorScanComplete?: boolean;
 }
 
 /** Result of pixel-level re-OCR verification after screenshot redaction. */

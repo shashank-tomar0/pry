@@ -563,6 +563,13 @@ export async function runTask(
   let pendingFrameAudit: Promise<{ summary: string } | null> | null = null;
   /** True once this pipeline's line has been handed over (delivered at most once). */
   let frameAuditDelivered = false;
+  /**
+   * Set when a frame the run waited on did not arrive in time. It stops the run
+   * from paying that wait again — see `frameNeedsPlannerWait`.
+   */
+  let frameWaitOverran = false;
+  /** Said once, when the wait stops being worth placing. */
+  let announcedFrameWaitAbandoned = false;
   /** Evidence joined after the last planner turn, not yet handed to the planner. */
   let carriedFrameNote = "";
 
@@ -749,6 +756,7 @@ export async function runTask(
 
   /** One honest line when a frame the planner needed did not arrive in time. */
   function noteFrameTimeout(where: string): void {
+    frameWaitOverran = true;
     emit({
       kind: "entry",
       entry: {
@@ -2469,6 +2477,7 @@ ${freshRendered}`,
             visionEnabled,
             hasVisionKey: visionApiKey !== "",
             aborted: signal.aborted,
+            frameOverran: frameWaitOverran,
           });
           if (captureScreenshot) {
             if (frameGoesToPlanner) {
@@ -2478,6 +2487,26 @@ ${freshRendered}`,
               if (awaited.kind === "done" && awaited.value) observation = awaited.value.observation;
               if (awaited.kind === "timeout") noteFrameTimeout("after this action");
             } else {
+              // Vision is on and there IS a key, so the only reason this frame
+              // is not awaited is that the previous one blew the budget. Say so
+              // once: the user asked for vision, and a run that quietly stopped
+              // using it would be a feature switched off behind their back.
+              if (visionEnabled && visionApiKey && !signal.aborted && !announcedFrameWaitAbandoned) {
+                announcedFrameWaitAbandoned = true;
+                emit({
+                  kind: "entry",
+                  entry: {
+                    id: nextId(),
+                    role: "system",
+                    text:
+                      `Frame capture is not keeping up with the planner on this page — it missed the ` +
+                      `${Math.round(FRAME_AUDIT_WAIT_MS / 1000)}s budget, and waiting for it again would ` +
+                      `stall every action. Continuing with page reads; each frame still arrives as ` +
+                      `redaction evidence one step later, but without a visual description. ` +
+                      `Turn visual perception off in Options if you do not want to pay for it.`,
+                  },
+                });
+              }
               startFrameAudit(freshDetections, FRAME_LABEL_DEFERRED);
             }
           }
@@ -3271,8 +3300,25 @@ export function frameNeedsPlannerWait(input: {
   visionEnabled: boolean;
   hasVisionKey: boolean;
   aborted: boolean;
+  /**
+   * True once a frame this run waited on did NOT arrive inside the wait budget.
+   *
+   * The wait is a bet that local pixel work finishes before the planner needs
+   * the next turn, and it is a good bet at the cost the pipeline was measured at
+   * (1.2 s for a 1× viewport, up to 6.5 s at the triage cap). It is a bad bet
+   * when the pipeline cannot make that: after the face pass gained its native-
+   * resolution crops, its verification and its escalation, a heavy page can want
+   * longer than the budget on EVERY action — and the bet then costs the user the
+   * full 15 s in front of every planner call while delivering nothing, which is
+   * exactly the "slow and stuck after every tool call" the run reported. So the
+   * bet stops being placed after it has visibly lost: the frame is STARTED and
+   * joined after the next turn instead, labelled as one step old, and the
+   * transcript says so once. Nothing is dropped either way — the evidence line,
+   * the ledger entry and the audit record are identical; only who waits changes.
+   */
+  frameOverran?: boolean;
 }): boolean {
-  return input.visionEnabled && input.hasVisionKey && !input.aborted;
+  return input.visionEnabled && input.hasVisionKey && !input.aborted && input.frameOverran !== true;
 }
 
 /**

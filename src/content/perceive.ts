@@ -693,24 +693,37 @@ function showDetectionBadge(lines: string[]): void {
  * what makes "GLiNER detected these PII" true ON SCREEN, closing the Tier-0
  * gap where names in prose were tokenized but stayed readable in pixels.
  */
-export function locateSpans(spans: string[]): SensitiveRegion[] {
+export function locateSpans(spans: string[]): LocatedRegions {
   const regions: SensitiveRegion[] = [];
-  if (!spans || spans.length === 0) return regions;
+  const empty: LocatedRegions = { regions, offCapture: [], scanComplete: true };
+  if (!spans || spans.length === 0) return empty;
   const wanted = spans.map((s) => s.trim()).filter((s) => s.length >= 3).slice(0, 12);
-  if (wanted.length === 0) return regions;
+  if (wanted.length === 0) return empty;
+  // Which spans the walk SAW as rendered text at all, and which it managed to
+  // paint. The difference is a value that is on the page but outside the area a
+  // viewport capture covers — see unplacedAfterLocators for why that must not be
+  // reported as an unplaceable leak.
+  const seen = new Set<string>();
+  const painted = new Set<string>();
 
   const deadline = performance.now() + REGION_SCAN_BUDGET_MS;
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   let node: Node | null;
   let visited = 0;
+  /** The walk is only proof of absence when it reached the end of the document. */
+  let scanComplete = true;
   while ((node = walker.nextNode())) {
-    if (++visited > REGION_SCAN_MAX_NODES || performance.now() > deadline) break;
+    if (++visited > REGION_SCAN_MAX_NODES || performance.now() > deadline) {
+      scanComplete = false;
+      break;
+    }
     const text = node.textContent ?? "";
     if (text.length < 3) continue;
     for (const span of wanted) {
       let from = 0;
       let hit = text.indexOf(span, from);
       while (hit !== -1) {
+        seen.add(span);
         try {
           const range = document.createRange();
           range.setStart(node, hit);
@@ -721,6 +734,7 @@ export function locateSpans(spans: string[]): SensitiveRegion[] {
           range.detach?.();
           for (const rect of rects) {
             if (rect.top >= innerHeight || rect.bottom <= 0) continue;
+            painted.add(span);
             regions.push({
               x: Math.round(rect.left),
               y: Math.round(rect.top),
@@ -754,7 +768,11 @@ export function locateSpans(spans: string[]): SensitiveRegion[] {
     showDetectionBadge(lines);
   }
 
-  return regions;
+  return {
+    regions,
+    offCapture: [...seen].filter((span) => !painted.has(span)),
+    scanComplete,
+  };
 }
 
 /**
@@ -773,10 +791,12 @@ export function locateSpans(spans: string[]): SensitiveRegion[] {
  * its box. Ids are validated, capped, and re-checked for connectivity — a
  * stale id from a previous page can never paint a box on this one.
  */
-export function locateElements(targets: PiiElementTarget[]): SensitiveRegion[] {
+export function locateElements(targets: PiiElementTarget[]): LocatedRegions {
   const regions: SensitiveRegion[] = [];
   const wanted = (targets ?? []).slice(0, 24);
-  if (wanted.length === 0) return regions;
+  if (wanted.length === 0) return { regions, offCapture: [], scanComplete: true };
+  /** Values whose element exists and is rendered, but not where a capture looks. */
+  const offCapture: string[] = [];
 
   for (const target of wanted) {
     const id = elementIdFromSelector(target?.selector ?? "");
@@ -785,10 +805,23 @@ export function locateElements(targets: PiiElementTarget[]): SensitiveRegion[] {
     // `isConnected` rejects an element the page has since replaced; the id
     // space is rebuilt on every snapshot, so this is the cheapest staleness
     // check available.
-    if (!el || !el.isConnected || !isVisible(el)) continue;
+    if (!el || !el.isConnected) continue;
+    // An element that cannot paint has no pixels in the image either — that is
+    // evidence of absence rather than an unplaceable value, so it is reported.
+    if (!isVisible(el)) {
+      if (target.value) offCapture.push(target.value);
+      continue;
+    }
     const rect = el.getBoundingClientRect();
+    // Fully outside the viewport, vertically or horizontally: a viewport
+    // capture has no pixels there. (Boxing still uses the vertical test the
+    // painter expects; this is only about what the image can contain.)
+    if (rect.top >= innerHeight || rect.bottom <= 0 ||
+        rect.left >= innerWidth || rect.right <= 0) {
+      if (target.value) offCapture.push(target.value);
+      continue;
+    }
     if (rect.width < 2 || rect.height < 2) continue;
-    if (rect.top >= innerHeight || rect.bottom <= 0) continue;
     regions.push({
       x: Math.round(rect.left),
       y: Math.round(rect.top),
@@ -805,13 +838,33 @@ export function locateElements(targets: PiiElementTarget[]): SensitiveRegion[] {
     });
   }
 
-  return regions;
+  // Unlike the text walk this one is exhaustive: every requested target is
+  // resolved (or not) by id, so a target it did not paint is either excused
+  // above or genuinely unresolved.
+  return { regions, offCapture, scanComplete: true };
 }
 
 /** One element to box, with the value the detector read out of it. */
 export interface PiiElementTarget {
   selector: string;
   value?: string;
+}
+
+/**
+ * What a locator found, and what it can prove is not in the capture.
+ *
+ * `offCapture` is not a failure list — it is the opposite. Each entry is a
+ * value the locator SAW rendered, whose pixels lie outside the area a viewport
+ * screenshot covers, so the image cannot contain it. The service worker uses it
+ * to keep those apart from values that were detected and could not be placed
+ * anywhere, which are a real residual leak (see `unplacedAfterLocators`).
+ */
+export interface LocatedRegions {
+  regions: SensitiveRegion[];
+  /** Values seen rendered, but outside the captured area. */
+  offCapture: string[];
+  /** True only when the locator looked at the whole document, not a prefix. */
+  scanComplete: boolean;
 }
 
 /**

@@ -97,6 +97,16 @@ const STUBS = {
   `,
   "./deterministic": `
     export async function tryDeterministic() { return null; }
+    // The bare-navigation goal is the REAL implementation — it is exported from
+    // the bundle entry below, so the module here resolves to the same functions
+    // the extension runs, and what this harness exercises is the loop's use of
+    // them rather than a stand-in for it.
+    export function bareNavigationGoal(task) {
+      return globalThis.__pry?.bareNavigationGoal?.(task) ?? null;
+    }
+    export function hostSatisfiesBareGoal(goal, url) {
+      return globalThis.__pry?.hostSatisfiesBareGoal?.(goal, url) ?? false;
+    }
   `,
 };
 
@@ -127,8 +137,10 @@ async function bundle(entryContents) {
 }
 
 const bundleText = await bundle(`
-  export { runTask, frameNeedsPlannerWait } from "./src/background/agent.ts";
+  export { runTask, frameNeedsPlannerWait, finalAnswerComplaint } from "./src/background/agent.ts";
   export { DEFAULT_SETTINGS } from "./src/shared/types.ts";
+  // The real goal check, for the scenarios that supply it to the stubbed module.
+  export { bareNavigationGoal, hostSatisfiesBareGoal } from "./src/background/deterministic.ts";
   // The two constants the egress meter ships on EVERY turn, so the payload
   // scenario below can measure a real request rather than just the conversation.
   export { SYSTEM_PROMPT } from "./src/background/prompt.ts";
@@ -187,9 +199,14 @@ function makeBigSnapshot(url = "https://example.com/") {
 /**
  * A processed frame that claims `redactedCount` items were painted, with a
  * clean verification verdict — the shape the offscreen document returns.
+ *
+ * `extra` overrides the fields a scenario needs to state for itself: the stage
+ * breakdown (`stages`) and the total (`processingTimeMs`) are measured in the
+ * browser, so a harness can only assert what the agent DOES with them.
  */
-function makeProcessedFrame(redactedCount) {
+function makeProcessedFrame(redactedCount, extra = {}) {
   return {
+    ...extra,
     original: "data:image/png;base64,ORIGINAL",
     redactedDataUrl: "data:image/png;base64,REDACTED",
     redactedCount,
@@ -297,7 +314,20 @@ const chromeStub = {
  * serialised (the old behaviour) the run costs steps × (capture + planner); if
  * the capture is deferred they overlap.
  */
-async function runScenario({ name, vision, script, captureMs, plannerMs, snapshotFactory, steps = 4 }) {
+async function runScenario({
+  name,
+  vision,
+  script,
+  captureMs,
+  plannerMs,
+  snapshotFactory,
+  steps = 4,
+  task = "open https://example.com and read the page",
+  /** Fields to add to every processed frame — see makeProcessedFrame. */
+  frame = undefined,
+  /** Shortened wait budget, so a slow frame crosses it without a 15 s test. */
+  frameAuditWaitMs = undefined,
+}) {
   globalThis.chrome = chromeStub;
   const emitted = [];
   const ledger = [];
@@ -320,27 +350,32 @@ async function runScenario({ name, vision, script, captureMs, plannerMs, snapsho
       return { result: { ok: true, detail: `${action.name} ok` }, controller };
     },
     observeWithVision: async () => ({ text: "A stub VLM description of the page.", model: "stub-vision-model", bytes: 1024 }),
+    // The real goal check, so a scenario that wants one provides the task and a
+    // snapshot URL and nothing else — see the bare-goal scenarios below.
+    bareNavigationGoal: mod.bareNavigationGoal,
+    hostSatisfiesBareGoal: mod.hostSatisfiesBareGoal,
     // The pixel pipeline: takes real wall-clock time, and reports 3 items.
     capture: async () => {
       await sleep(captureMs);
-      return { original: "data:image/png;base64,ORIGINAL", processed: makeProcessedFrame(3) };
+      return { original: "data:image/png;base64,ORIGINAL", processed: makeProcessedFrame(3, frame) };
     },
   };
 
   const settings = baseSettings({ vision: { enabled: vision } });
   const t0 = Date.now();
-  await mod.runTask("open https://example.com and read the page", 1, {
+  await mod.runTask(task, 1, {
     settings,
     emit: (e) => emitted.push(e),
     askConfirm: async () => true,
     signal: new AbortController().signal,
+    ...(frameAuditWaitMs === undefined ? {} : { frameAuditWaitMs }),
     captureScreenshot: async () => {
       inFlight++;
       peakInFlight = Math.max(peakInFlight, inFlight);
       captures.push(Date.now());
       try {
         await sleep(captureMs);
-        return { original: "data:image/png;base64,ORIGINAL", processed: makeProcessedFrame(3) };
+        return { original: "data:image/png;base64,ORIGINAL", processed: makeProcessedFrame(3, frame) };
       } finally {
         inFlight--;
       }
@@ -558,12 +593,12 @@ console.log("\n=== agent loop: a wedged capture must not hang the run ===\n");
  * after a planner turn), and BOTH must give up rather than hang.
  */
 const WEDGE_BUDGET_MS = 300;
-async function runWedged(vision) {
+async function runWedged(vision, script) {
   globalThis.chrome = chromeStub;
   const emitted = [];
   let captureCalls = 0;
   globalThis.__pry = {
-    planner: makePlanner([scrollTurn("Scrolling."), finishTurn], { plannerMs: 10 }),
+    planner: makePlanner(script ?? [scrollTurn("Scrolling."), finishTurn], { plannerMs: 10 }),
     ledger: [],
     snapshot: () => makeSnapshot(),
     execute: async (controller, action) => ({ result: { ok: true, detail: `${action.name} ok` }, controller }),
@@ -615,6 +650,63 @@ ok(
   "and the run still reaches its totals",
   parseTallyLine(tallyLineOf(wedgedOn.emitted)) !== null,
   tallyLineOf(wedgedOn.emitted) ?? "no totals line",
+);
+
+// ─── The wait is a bet, and it stops being placed once it has lost ─────────
+// Waiting for a frame is worth it only at the cost the pipeline was measured
+// at. The face pass has since gained native-resolution crops, targeted probes,
+// verification and escalation, so on a heavy page a capture can miss the budget
+// on EVERY action — and the run then paid the full wait in front of every
+// planner call while getting no frame for it. The live shape of that is in the
+// reported transcripts: "Frame capture (after this action) did not finish
+// within 15s" once per action, with the planner blind throughout.
+//
+// The count of those lines is the assertion, not a wall-clock threshold: an
+// awaited frame that misses its budget writes one, a deferred frame cannot (its
+// join has nowhere to put one). One line for three page-changing actions means
+// the wait was placed once and then abandoned; four would be the old behaviour,
+// and would stay four on any machine at any speed.
+console.log("\n=== agent loop: the frame wait is not paid twice for nothing ===\n");
+
+const timeoutLines = (r) =>
+  r.emitted.filter((e) => e.kind === "entry" && e.entry && /did not finish within/.test(e.entry.text ?? ""));
+const abandoningNotes = (r) =>
+  r.emitted.filter((e) => e.kind === "entry" && e.entry && /not keeping up with the planner/.test(e.entry.text ?? ""));
+
+const wedgedMany = await runWedged(true, [
+  scrollTurn("Scrolling."),
+  scrollTurn("Scrolling again."),
+  scrollTurn("One more."),
+  finishTurn,
+]);
+ok(
+  "three page-changing actions over a capture that never settles produce ONE lost-frame line, not one per action",
+  timeoutLines(wedgedMany).length === 1,
+  `${timeoutLines(wedgedMany).length} line(s): ` +
+    timeoutLines(wedgedMany).map((e) => e.entry.text.slice(0, 48)).join(" | "),
+);
+ok(
+  "and the run says why it stopped waiting, exactly once",
+  abandoningNotes(wedgedMany).length === 1,
+  abandoningNotes(wedgedMany).map((e) => e.entry.text.slice(0, 60)).join(" | ") || "no note",
+);
+ok(
+  "and the note names the consequence rather than claiming vision still works",
+  /without a visual description/.test(abandoningNotes(wedgedMany)[0]?.entry.text ?? ""),
+  abandoningNotes(wedgedMany)[0]?.entry.text ?? "no note",
+);
+ok(
+  "the run still ends and reports its totals",
+  parseTallyLine(tallyLineOf(wedgedMany.emitted)) !== null,
+  tallyLineOf(wedgedMany.emitted) ?? "no totals line",
+);
+// The control: with vision off there is no frame the planner reads, so the wait
+// is never placed and there is nothing to abandon. Without this, the assertion
+// above could be satisfied by a run that simply never waited at all.
+ok(
+  "vision off never places the bet, so there is nothing to abandon",
+  timeoutLines(wedgedOff).length === 0 && abandoningNotes(wedgedOff).length === 0,
+  `${timeoutLines(wedgedOff).length} timeout line(s)`, 
 );
 
 // ─── Scenario 4: the frame's leak evidence is never dropped ────────────────
@@ -1145,6 +1237,168 @@ ok(
   "the request the provider is charged does not grow with step count",
   requestBytes.at(-1) - requestBytes[1] < 4000,
   `${requestBytes.map((b) => Math.round(b / 1024) + "K").join(" → ")}`,
+);
+
+// ─── A bare navigation goal that is already satisfied ───────────────────────
+// The reported run: task "open yt", the tab on YouTube, and the agent went on to
+// click a video and spend more turns looking for work. The check is at the TOP of
+// the loop, so a satisfied goal costs no planner turn at all.
+console.log("\n=== A bare navigation goal ends the run without a planner turn ===\n");
+
+const goalMet = await runScenario({
+  name: "bare goal met",
+  vision: false,
+  script: [scrollTurn("Looking around."), scrollTurn("Still looking."), finishTurn],
+  captureMs: 5,
+  plannerMs: 5,
+  task: "open yt",
+  snapshotFactory: () => makeSnapshot("https://www.youtube.com/"),
+});
+
+ok(
+  "the run stops before asking the planner anything",
+  goalMet.planner.seen.length === 0,
+  `${goalMet.planner.seen.length} planner turn(s)`,
+);
+ok(
+  "and it answers with the tab's URL and why it stopped, not a paragraph about itself",
+  systemTexts(goalMet).some(
+    (t) => t.includes("https://www.youtube.com/") && /asked for, so the run stopped/.test(t),
+  ),
+  systemTexts(goalMet).join(" | "),
+);
+ok(
+  "the run still files its totals rather than ending silently",
+  parseTallyLine(tallyLineOf(goalMet.emitted)) !== null,
+  tallyLineOf(goalMet.emitted) ?? "no totals line",
+);
+
+const goalUnmet = await runScenario({
+  name: "bare goal unmet",
+  vision: false,
+  script: [scrollTurn("Looking around."), finishTurn],
+  captureMs: 5,
+  plannerMs: 5,
+  task: "open yt",
+  snapshotFactory: () => makeSnapshot("https://example.com/"),
+});
+
+ok(
+  "a goal the page does NOT satisfy leaves the run alone",
+  goalUnmet.planner.seen.length > 0 &&
+    !systemTexts(goalUnmet).some((t) => /asked for, so the run stopped/.test(t)),
+  `${goalUnmet.planner.seen.length} planner turn(s)`,
+);
+
+const goalCompound = await runScenario({
+  name: "compound task",
+  vision: false,
+  script: [scrollTurn("Looking around."), finishTurn],
+  captureMs: 5,
+  plannerMs: 5,
+  task: "open yt and search for iit",
+  snapshotFactory: () => makeSnapshot("https://www.youtube.com/"),
+});
+
+ok(
+  "a task with a second step is never treated as a bare navigation",
+  goalCompound.planner.seen.length > 0 &&
+    !systemTexts(goalCompound).some((t) => /asked for, so the run stopped/.test(t)),
+  `${goalCompound.planner.seen.length} planner turn(s)`,
+);
+
+// ─── The frame-cost breakdown ───────────────────────────────────────────────
+// The stage timings are measured in the browser, so what is asserted here is what
+// the agent does with them: NAME the stages on a frame that came back over the
+// wait budget, ONCE per run however many frames overran.
+console.log("\n=== A frame over the wait budget names its stages ===\n");
+
+const frameStages = [
+  { stage: "decode", ms: 1200 },
+  { stage: "dom-regions", ms: 300 },
+  { stage: "faces", ms: 42000 },
+  { stage: "frame-text-ocr", ms: 6000 },
+  { stage: "encode", ms: 200 },
+  { stage: "verify", ms: 400 },
+];
+const costly = await runScenario({
+  name: "frame cost",
+  vision: false,
+  script: [scrollTurn("Scrolling."), scrollTurn("Scrolling."), finishTurn],
+  captureMs: 60,
+  plannerMs: 5,
+  frameAuditWaitMs: 20,
+  frame: { processingTimeMs: 51000, stages: frameStages },
+});
+
+const costLines = systemTexts(costly).filter((t) => /^Frame cost /.test(t));
+ok(
+  "a frame that comes back over the budget says so once, with its stage breakdown",
+  costLines.length === 1 && /faces 42\.0s/.test(costLines[0] ?? ""),
+  `${costLines.length} line(s): ${costLines[0] ?? "none"}`,
+);
+ok(
+  "and the stages that do not sum to the total are shown as unaccounted rather than hidden",
+  /other 0\.9s/.test(costLines[0] ?? ""),
+  costLines[0] ?? "none",
+);
+ok(
+  "several over-budget frames do not repeat the diagnosis",
+  costly.captures.length > 1 && costLines.length === 1,
+  `${costly.captures.length} capture(s), ${costLines.length} cost line(s)`,
+);
+
+// ─── An answer that narrates the loop is not the task's result ───────────────
+// Verbatim from the reported run. The guard is intentionally narrow: it knows the
+// loop's own vocabulary (a future tool call, a reply that has not arrived), and it
+// does not pretend to judge whether prose reads well.
+console.log("\n=== An answer about the agent's own loop is refused ===\n");
+
+const REPORTED_ANSWER =
+  'The task was to "open yt", which I interpret as opening YouTube. I navigated to youtube.com ' +
+  'and then clicked on the first video result. The user\'s task was simply "open yt", which I\'ve got ' +
+  'no response yet (this will be the last tool call for a while)';
+
+ok(
+  "the reported answer is recognised as narration about the loop",
+  mod.finalAnswerComplaint(REPORTED_ANSWER) === "last tool call",
+  String(mod.finalAnswerComplaint(REPORTED_ANSWER)),
+);
+ok(
+  "an ordinary completion report is not refused",
+  mod.finalAnswerComplaint("I opened YouTube and clicked the first result.") === null &&
+    mod.finalAnswerComplaint("I used click_text to open the first result.") === null &&
+    mod.finalAnswerComplaint("Opened Gmail and read the first email from AtCoder.") === null,
+);
+ok(
+  "empty output is not an answer to refuse",
+  mod.finalAnswerComplaint("   ") === null,
+);
+
+const narrated = await runScenario({
+  name: "loop narration",
+  vision: false,
+  script: [{ text: REPORTED_ANSWER, toolCalls: [] }],
+  captureMs: 5,
+  plannerMs: 5,
+});
+
+ok(
+  "a run that ends on such an answer reports a failure instead",
+  systemTexts(narrated).some((t) => /note about its own loop/.test(t)),
+  systemTexts(narrated).join(" | "),
+);
+// The refusal itself QUOTES the offending phrase, so the assertion is about where
+// the narration is absent from: no assistant card carries it, and the run's own
+// narration body appears nowhere as an answer.
+const narratedEntries = narrated.emitted
+  .filter((e) => e.kind === "entry" && e.entry)
+  .map((e) => ({ role: e.entry.role, text: e.entry.text ?? "" }));
+ok(
+  "and the narration is never presented as the task's answer",
+  !narratedEntries.some((e) => e.role === "assistant" && /last tool call/.test(e.text)) &&
+    !narratedEntries.some((e) => e.text.includes("clicked on the first video result")),
+  narratedEntries.map((e) => `${e.role}: ${e.text}`).join(" | "),
 );
 
 console.log(`\n${passed} agent-loop assertions passed (real runTask, stubbed browser + models).`);

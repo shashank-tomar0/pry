@@ -193,6 +193,18 @@ export interface ProcessedScreenshotResult {
   }>;
   redactedCount: number;
   processingTimeMs: number;
+  /**
+   * Per-stage wall clock for this frame, in execution order.
+   *
+   * Recorded in the browser because that is the only place this pipeline's REAL
+   * costs exist — every harness runs it against stubs, so a stage timing taken
+   * anywhere else would be a number about the stub. It is what turns "the frame
+   * missed the agent's wait budget" into a named stage: the frame-cost line the
+   * agent prints on an overrun reads the breakdown from here.
+   *
+   * Optional so a record written before the field existed still parses.
+   */
+  stages?: Array<{ stage: string; ms: number }>;
   /** Re-OCR proof that redaction actually worked on the shipped pixels. */
   verification?: VerificationResult;
   /**

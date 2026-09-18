@@ -61,6 +61,7 @@ import {
   coversExistingFace,
   dedupeFaceBoxes,
   mergeFaceBoxes,
+  planFaceProbes,
   planFaceTiles,
   shouldRunSecondaryFaceDetector,
   type FaceBox,
@@ -168,6 +169,47 @@ async function detectFacesWithBlazeFace(
  * (see dedupeFaceBoxes) before they reach the paint loop: a face must be painted
  * once, not once per tile that happened to contain it.
  */
+/**
+ * Run the model over planned native-resolution crops — the targeted probes.
+ *
+ * Same 1:1 draw and offset arithmetic as the tiled pass (see
+ * detectFacesWithBlazeFaceTiles), for the same reason: a box must come back in
+ * FRAME pixels, or the redaction paints the wrong place. The difference is what
+ * the crops are: the grid covers the frame, these cover the places the
+ * skin-colour pass proposed and no model box explains.
+ */
+async function detectFacesOnProbes(
+  canvas: OffscreenCanvas,
+  probes: Array<{ x: number; y: number; width: number; height: number }>,
+): Promise<Array<{ x: number; y: number; width: number; height: number; confidence: number }>> {
+  const detector = await getBlazeFace();
+  if (!detector || probes.length === 0) return [];
+  const found: Array<{ x: number; y: number; width: number; height: number; confidence: number }> = [];
+  for (const probe of probes) {
+    const probeCanvas = new OffscreenCanvas(probe.width, probe.height);
+    const probeCtx = probeCanvas.getContext("2d")!;
+    probeCtx.drawImage(canvas, probe.x, probe.y, probe.width, probe.height, 0, 0, probe.width, probe.height);
+    const bitmap = await createImageBitmap(probeCanvas);
+    try {
+      const result = await detector.detect(bitmap);
+      for (const detection of result.detections ?? []) {
+        const bb = detection.boundingBox ?? { originX: 0, originY: 0, width: 0, height: 0 };
+        if (!(bb.width > 16 && bb.height > 16)) continue;
+        found.push({
+          x: bb.originX + probe.x,
+          y: bb.originY + probe.y,
+          width: bb.width,
+          height: bb.height,
+          confidence: detection.categories?.[0]?.score ?? 0.8,
+        });
+      }
+    } finally {
+      bitmap.close();
+    }
+  }
+  return found;
+}
+
 async function detectFacesWithBlazeFaceTiles(
   canvas: OffscreenCanvas,
   width: number,
@@ -600,11 +642,22 @@ async function processScreenshot(
   }>;
   redactedCount: number;
   processingTimeMs: number;
+  /** Per-stage cost, in execution order — see ProcessedScreenshotResult. */
+  stages: Array<{ stage: string; ms: number }>;
   verification: VerificationResult;
   /** Egress evidence this document can witness. See screenshot-protection.ts. */
   protection: ScreenshotProtection;
 }> {
   const startTime = performance.now();
+  // Stage-by-stage cost of this frame. It has to be measured HERE: the browser
+  // is the only place this pipeline's real costs exist, and the agent's wait
+  // budget is decided against them. See the frame-cost line it prints when a
+  // frame comes back over budget.
+  const stages: Array<{ stage: string; ms: number }> = [];
+  const markStage = (stage: string, from: number): void => {
+    stages.push({ stage, ms: Math.round(performance.now() - from) });
+  };
+  const decodeStart = performance.now();
   console.log(`[PRY Offscreen] Processing ${width}x${height} screenshot, DPR=${dpr}, ${sensitiveRegions.length} DOM regions + face detection`);
 
   // Load the screenshot into an ImageBitmap.
@@ -626,6 +679,8 @@ async function processScreenshot(
   const originalCanvas = new OffscreenCanvas(width, height);
   const originalCtx = originalCanvas.getContext("2d", { willReadFrequently: true })!;
   originalCtx.drawImage(canvas, 0, 0);
+  markStage("decode", decodeStart);
+  const domStart = performance.now();
 
   // Every region actually redacted, in device-pixel coordinates, so the
   // verification pass can re-scan exactly those pixels in the shipped image.
@@ -752,6 +807,8 @@ async function processScreenshot(
   // (`if (modelFaces.length === 0)` around Chrome's detector), so the fix is the
   // same shape here: every channel is asked when the evidence says it might know
   // something the others do not, and nothing a channel finds is discarded.
+  markStage("dom-regions", domStart);
+  const facesStart = performance.now();
   let modelFaces: FaceBox[] = [];
   // Evidence for the egress contract: a channel counts as "ran" only when it
   // completed without throwing. A model that is missing and a model that threw
@@ -816,6 +873,46 @@ async function processScreenshot(
   } catch (err) {
     faceChannelFailure = faceChannelFailure || (err instanceof Error ? err.message : String(err));
     // No supplementary channel — the model's boxes still stand.
+  }
+
+  // ── Targeted probes: the places the coarse grid cannot reach ──
+  //
+  // A live run shipped a YouTube thumbnail grid with a face plainly readable in
+  // the very frame the audit compared side by side. Neither model pass found it,
+  // and the arithmetic says why: the model's input is a fixed ~128 px, so the
+  // scale a face gets is ~128 / max(crop side). The whole frame scales at 0.1 (a
+  // 40 px face arrives as 4 px) and the ≤16-crop grid comes out at ~334 px on a
+  // 1280×800 frame (the same face at ~15 px) — both at or below what the
+  // short-range model resolves, and no threshold recovers pixels that were never
+  // fed to it.
+  //
+  // The skin-colour pass is the one channel that already SEES those faces (it is
+  // the ~14 px floor channel) and it costs no model call. It is noisy, which is
+  // why its boxes are only ever painted as a supplement — but noise is cheap when
+  // a channel is used as a PROPOSAL instead of as an answer: crop a
+  // native-resolution window around each blob no model box explains, and let the
+  // real detector judge that window. A 96 px crop scales at 1.33, so the same face
+  // reaches the model larger than life, and what comes back is the model's box
+  // rather than a colour histogram's.
+  try {
+    const probes = planFaceProbes({ width, height }, skinFaces, modelFaces);
+    if (probes.length > 0) {
+      const probed = (await detectFacesOnProbes(originalCanvas, probes)).map(
+        (f) => ({ ...f, source: "model" as const }),
+      );
+      faceChannelRan = true;
+      const withProbes = dedupeFaceBoxes([...modelFaces, ...probed]);
+      if (withProbes.length > modelFaces.length) {
+        console.log(
+          `[PRY Offscreen] Targeted probes found ${withProbes.length - modelFaces.length} face(s) ` +
+          `the tiled pass missed (${probes.length} native-resolution crops)`,
+        );
+      }
+      modelFaces = withProbes;
+    }
+  } catch (err) {
+    // A probe failure must not cost the boxes the other channels already found.
+    faceChannelFailure = faceChannelFailure || (err instanceof Error ? err.message : String(err));
   }
 
   // Chrome's FaceDetector — a DIFFERENT algorithm from BlazeFace, asked only
@@ -921,6 +1018,8 @@ async function processScreenshot(
     }
   }
 
+  markStage("faces", facesStart);
+
   // 2.5 Frame-text triage — the only channel that can see PII the DOM never had.
   //       Every other pixel path starts from the DOM (text nodes, fields,
   //       avatars, detector elements). Text baked into an <img>, a <canvas> or a
@@ -936,6 +1035,7 @@ async function processScreenshot(
   let triageRan = false;
   /** Evidence about the values the DOM channel could not place — see the type. */
   let unlocatedText: ProcessedScreenshotResult["unlocatedText"];
+  const triageStart = performance.now();
   if (privacy?.scanFrameText !== false) {
     try {
       const triage = await triageFrameText(
@@ -975,16 +1075,23 @@ async function processScreenshot(
       // Triage is additive: a failed OCR must never lose the DOM redactions.
     }
   }
+  // Marked even when the channel is switched off: a zero here is a fact about
+  // the frame (nothing was asked of OCR), and leaving the stage out would make
+  // the breakdown look truncated rather than deliberately empty.
+  markStage("frame-text-ocr", triageStart);
 
   // 3. Convert to Blob. These are `let` because the adversarial auditor may
   // rebuild and re-encode the image (see the escalation pass below) in which
   // case the ESCALATED bytes are the ones that ship.
+  const encodeStart = performance.now();
   let redactedBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.92 });
   let redactedDataUrl = await blobToDataUrl(redactedBlob);
+  markStage("encode", encodeStart);
 
   // 4. Adversarial verification — decode the EXACT bytes that will be shipped
   // (the post-JPEG image) and re-scan every redacted region, at the pixel level
   // and with a real OCR re-read, to prove the redaction worked.
+  const verifyStart = performance.now();
   let verification: VerificationResult = emptyVerification();
   // Evidence for the egress contract (see shared/screenshot-protection.ts).
   // With no redacted regions there is nothing to re-read, and the pass is
@@ -1139,7 +1246,9 @@ async function processScreenshot(
     policyEnabled: destroyFaces && maskCredentials,
   });
 
-  console.log(`[PRY Offscreen] Redacted ${redactionRegions.length} region(s) of ${allDetections.length} detection(s) (${faceBoxes.length} faces, ${sensitiveRegions.length} DOM regions, ${triageBoxes} from frame-text OCR${triageRan ? "" : " (triage unavailable)"}) in ${(performance.now() - startTime).toFixed(0)}ms`);
+  markStage("verify", verifyStart);
+
+  console.log(`[PRY Offscreen] Redacted ${redactionRegions.length} region(s) of ${allDetections.length} detection(s) (${faceBoxes.length} faces, ${sensitiveRegions.length} DOM regions, ${triageBoxes} from frame-text OCR${triageRan ? "" : " (triage unavailable)"}) in ${(performance.now() - startTime).toFixed(0)}ms [${stages.map((s) => `${s.stage} ${s.ms}ms`).join(", ")}]`);
 
   return {
     redactedDataUrl,
@@ -1156,6 +1265,7 @@ async function processScreenshot(
     // above what the pixels support.
     redactedCount: redactionRegions.length,
     processingTimeMs: performance.now() - startTime,
+    stages,
     verification,
     protection,
     // The frame-text channel's verdict on the values the DOM could not place.

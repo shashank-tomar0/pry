@@ -823,6 +823,18 @@ body::after {
   color: var(--color-ink);
 }
 
+/* What the badge proves, in the same card rather than in a document. The badge
+   names the check (re-OCR); this states its limit, because a face no channel
+   found is not something re-reading the regions can discover. */
+.audit-chip-scope {
+  font-size: 9px;
+  line-height: 1.45;
+  color: var(--color-ink-mute, var(--color-ink));
+  opacity: 0.75;
+  max-width: 44ch;
+  margin-top: 2px;
+}
+
 .audit-chip-inspect-btn {
   background: var(--color-ink);
   color: var(--color-paper);

@@ -311,6 +311,113 @@ export function shouldRunSecondaryFaceDetector(
   return skin.some((candidate) => !coversExistingFace(candidate, model, coverage));
 }
 
+// ─── Targeted probes: asking the model about the places tiling cannot reach ──
+//
+// A live run shipped a YouTube thumbnail grid with a face plainly readable in
+// the frame the audit compared side by side. Neither model pass found it, and
+// the arithmetic says why: the model's input is a fixed ~128 px, so the scale a
+// face enjoys is ~128 / max(crop side). A whole 1280×800 frame scales at 0.1 and
+// a 40 px face arrives as 4 px; the coarse grid can only afford ≤16 crops, so its
+// crops come out ~334 px and the same face arrives at ~15 px. Both are below or
+// at the edge of what the short-range model resolves, and no threshold fixes a
+// face that is not there in pixels.
+//
+// The skin-colour pass is the one channel that already SEES those faces — it is
+// the 14 px floor channel, and it is free (no model call). It is also noisy, which
+// is why its boxes are only ever painted as a supplement. But noise is cheap when
+// it is used as a PROPOSAL instead of as an answer: crop a small window around
+// each unexplained skin blob at NATIVE resolution and let the real detector look
+// at that. A 96 px crop scales at 1.33, so the same 40 px face reaches the model
+// at ~53 px — larger than life, and found by the model rather than by a colour
+// histogram.
+
+/** Most probes per frame. Each is one detector call, and this pass exists for a
+ *  grid of thumbnails, not for a photo wall. */
+export const FACE_PROBE_MAX = 8;
+
+/**
+ * Largest side of a probe crop, in frame pixels.
+ *
+ * This is what buys the magnification: at 192 px the crop still scales at
+ * ≥0.67, so a face that filled a third of the crop arrives at ~29 px in model
+ * space. A proposal larger than this is handed to the coarse grid instead, which
+ * already reaches big faces.
+ */
+export const FACE_PROBE_MAX_SIDE_PX = 192;
+
+/** Two proposals overlapping this much are one probe, not two detector calls. */
+export const FACE_PROBE_DUPLICATE_COVERAGE = FACE_TILE_DUPLICATE_COVERAGE;
+
+/** A native-resolution window to hand the detector, in frame pixels. */
+export interface FaceProbe {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Plan the native-resolution probes for the proposals no model box explains.
+ *
+ * Pure geometry, so the magnification claim is a property of the plan rather
+ * than of the detector: the caller can assert that the crop it will draw really
+ * does contain the proposal at a scale the model can resolve.
+ *
+ * @param frame        captured image size, in device pixels
+ * @param proposals    candidate boxes from the skin-colour pass
+ * @param known        boxes the model channels already found (proposals they
+ *                     explain are not re-asked)
+ * @param opts.maxProbes/maxSide/coverage  overridable for tests
+ */
+export function planFaceProbes(
+  frame: { width: number; height: number },
+  proposals: readonly FaceBox[],
+  known: readonly FaceBox[],
+  opts: { maxProbes?: number; maxSide?: number; coverage?: number } = {},
+): FaceProbe[] {
+  const maxProbes = opts.maxProbes ?? FACE_PROBE_MAX;
+  const maxSide = opts.maxSide ?? FACE_PROBE_MAX_SIDE_PX;
+  const coverage = opts.coverage ?? FACE_PROBE_DUPLICATE_COVERAGE;
+  const frameWidth = Math.max(0, Math.floor(frame.width));
+  const frameHeight = Math.max(0, Math.floor(frame.height));
+  if (frameWidth <= 0 || frameHeight <= 0 || maxProbes <= 0 || maxSide <= 0) return [];
+
+  const probes: FaceProbe[] = [];
+  const probed: FaceBox[] = [];
+
+  // Biggest first: a larger skin blob is the more likely face, and the cap is
+  // the interesting half of this decision.
+  for (const proposal of [...proposals].sort(byAreaThenConfidence)) {
+    if (probes.length >= maxProbes) break;
+    // Already explained by a model box — there is nothing to ask.
+    if (coversExistingFace(proposal, [...known], coverage)) continue;
+    // Already inside a crop that was just planned for a neighbouring blob.
+    if (coversExistingFace(proposal, probed, coverage)) continue;
+    // Too big to magnify: the coarse grid already reaches faces this size, and
+    // a crop that cannot be bounded would give the model the whole frame back.
+    if (Math.max(proposal.width, proposal.height) > maxSide) continue;
+
+    // Pad the proposal out to a square window, so the detector sees some context
+    // (a face needs its surroundings; a box cropped to the chin is not a face),
+    // then clamp the window inside the frame without letting it grow past the
+    // side bound — the magnification is the whole point of this pass.
+    const padX = Math.max(0, (Math.min(maxSide, Math.max(proposal.width, proposal.height) * 2) - proposal.width) / 2);
+    const padY = Math.max(0, (Math.min(maxSide, Math.max(proposal.width, proposal.height) * 2) - proposal.height) / 2);
+    let x = Math.round(proposal.x - padX);
+    let y = Math.round(proposal.y - padY);
+    const width = Math.min(frameWidth, Math.round(proposal.width + padX * 2));
+    const height = Math.min(frameHeight, Math.round(proposal.height + padY * 2));
+    if (width <= 0 || height <= 0) continue;
+    x = Math.min(Math.max(0, x), Math.max(0, frameWidth - width));
+    y = Math.min(Math.max(0, y), Math.max(0, frameHeight - height));
+
+    probes.push({ x, y, width, height });
+    probed.push({ x, y, width, height, confidence: proposal.confidence, source: proposal.source });
+  }
+
+  return probes;
+}
+
 /**
  * Fuse every channel's boxes into the list the redaction loop draws.
  *

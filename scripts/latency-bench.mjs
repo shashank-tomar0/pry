@@ -98,6 +98,54 @@ for (const vp of [vp1x, vp2x, tall2x]) {
 console.log("\n── a blank tile is skipped before OCR (the one cheap path) ──");
 await scan(new Jimp(2880, 900, 0xffffffff), "2880x900 blank (OCRed here; skipped in prod)");
 
+// ── Face tiling: the OTHER per-capture cost, and the one nobody measured ──
+//
+// The face pass now runs the model over overlapping native-resolution crops (see
+// planFaceTiles), which is what makes a 40 px thumbnail face visible at all — and
+// which costs one detector call PER CROP. That cost was reasoned about and never
+// measured, so the number is printed here with the plan that produces it.
+//
+// What is exact here: the tile grid, the crop size, the number of detector calls,
+// and the model-space scale a face of a given size arrives at (the model's input
+// is a fixed ~128 px, so scale = 128 / largest crop side). What is NOT measured
+// here is the delegate's own speed — OffscreenCanvas and the WebGPU/WASM
+// delegate do not exist in Node — so the per-call cost is shown as a sensitivity
+// table over published-looking values instead of a single invented number.
+const { planFaceTiles, FACE_TILE_MAX, FACE_TILE_TARGET_PX, FACE_TILE_OVERLAP } =
+  await import("./.face-regions.mjs");
+
+console.log("\n── face tiling: crops per frame and the calls they cost ──");
+console.log(`   (target ${FACE_TILE_TARGET_PX} px, overlap ${Math.round(FACE_TILE_OVERLAP * 100)} %, cap ${FACE_TILE_MAX} crops)`);
+for (const vp of [
+  { label: "1280x800   common viewport", w: 1280, h: 800 },
+  { label: "1440x900   1x laptop", w: 1440, h: 900 },
+  { label: "2560x1440  retina viewport", w: 2560, h: 1440 },
+  { label: "1280x10000 stitched full page", w: 1280, h: 10000 },
+]) {
+  const tiles = planFaceTiles(vp.w, vp.h);
+  if (tiles.length === 0) {
+    console.log(`${vp.label.padEnd(34)} not tiled (full-frame pass only, 1 detect call)`);
+    continue;
+  }
+  const worst = Math.max(...tiles.map((t) => Math.max(t.width, t.height)));
+  const scale = 128 / worst;
+  console.log(
+    `${vp.label.padEnd(34)} ${String(tiles.length).padStart(2)} crops, largest ${String(worst).padStart(4)} px, ` +
+      `model scale ${scale.toFixed(2)}, source pixels ${tiles.reduce((n, t) => n + t.width * t.height, 0).toLocaleString()}`,
+  );
+}
+console.log("   a 44 px face at model scale 0.4 arrives at ~18 px (it was ~4 px un-tiled)");
+
+console.log("\n── what N detector calls cost, at per-call speeds (sensitivity, not a measurement) ──");
+for (const calls of [1, FACE_TILE_MAX]) {
+  const row = [20, 50, 100, 250]
+    .map((ms) => `${(calls * ms / 1000).toFixed(2).padStart(5)} s @${ms} ms`)
+    .join("   ");
+  console.log(`${String(calls).padStart(2)} call(s):   ${row}`);
+}
+console.log("   the frame wait is 15 s, shared with OCR triage, so a slow CPU delegate is");
+console.log("   the case to watch: 16 calls at 250 ms each is 4 s of the budget.");
+
 console.log("\n── cold start: what the FIRST OCR of a session costs ──");
 const coldStart = performance.now();
 const cold = await createWorker("eng", 1, { langPath, gzip: true });

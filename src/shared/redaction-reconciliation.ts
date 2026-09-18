@@ -92,6 +92,60 @@ export function findUnlocatedValues(
   return [...new Set(detected.filter((v) => !boxed.has(v)))];
 }
 
+/**
+ * Which detected ELEMENT targets the pixel channel could not account for, and
+ * why that matters for whether a frame may leave the browser.
+ *
+ * The service worker used to ask a much weaker question: "does any target carry
+ * a selector?" If one did, it pushed `dom-selector-coverage-unverified`, which is
+ * a coverage failure — and a coverage failure withholds the frame. The reason was
+ * honest: the wire format could not say which target a returned box belonged to,
+ * so "every target was boxed" was unprovable. The consequence was not honest: on
+ * any page with a form field the planner lost its vision channel entirely, which
+ * is part of why the reported Gmail run read the page five times and never saw it.
+ *
+ * The boxes name their target now (`targetSelector`), so the question can be
+ * asked per target, and the two ways a target can be uncovered are different
+ * findings:
+ *
+ *   - `unaccounted` — a target with a VALUE that no box covers. This is already
+ *     reported by `findUnlocatedValues` as an unplaceable value, and the
+ *     frame-text channel is asked to clear it in the pixels. It is a leak to
+ *     resolve, not a reason to withhold the whole frame.
+ *   - `unattributable` — a target with NO value and no box of its own. Nothing
+ *     can even name what is uncovered here, so the frame stays withheld. This is
+ *     the case the old blanket flag existed for, kept exactly as strict.
+ */
+export function unverifiedElementTargets(
+  targets: PiiTarget[] | undefined,
+  regions: Array<{ value?: string; targetSelector?: string }> | undefined,
+): { unaccounted: string[]; unattributable: string[] } {
+  const listed = (targets ?? []).filter(
+    (t) => isLocatableSelector(t?.selector ?? "") || (t?.value ?? "").trim().length > 0,
+  );
+  if (listed.length === 0) return { unaccounted: [], unattributable: [] };
+
+  const namedSelectors = new Set(
+    (regions ?? []).map((r) => (r.targetSelector ?? "").trim()).filter(Boolean),
+  );
+  const boxedValues = new Set(
+    (regions ?? []).map((r) => (r.value ?? "").trim()).filter(Boolean),
+  );
+
+  const unaccounted: string[] = [];
+  const unattributable: string[] = [];
+  for (const target of listed) {
+    const selector = (target?.selector ?? "").trim();
+    const value = (target?.value ?? "").trim();
+    // A box that names this target, or one that covers its value, is coverage.
+    if (selector && namedSelectors.has(selector)) continue;
+    if (value && boxedValues.has(value)) continue;
+    if (value) unaccounted.push(value);
+    else unattributable.push(selector);
+  }
+  return { unaccounted: [...new Set(unaccounted)], unattributable: [...new Set(unattributable)] };
+}
+
 // Masking for the warning sample is NOT reimplemented here: tokenizer.ts
 // already owns the one masking policy the whole UI uses (emails keep their
 // domain, digits vanish), and a second implementation would drift.

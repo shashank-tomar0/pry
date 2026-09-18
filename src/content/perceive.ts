@@ -7,6 +7,11 @@ import { matchPiiInText } from "../shared/text-pii-patterns";
  * produced it, which is why the service worker re-perceives after every action.
  */
 let registry: Element[] = [];
+/**
+ * How many page reads this document has answered. Incremented per snapshot;
+ * carried on every snapshot so an action can name the read its ids came from.
+ */
+let registrySeq = 0;
 
 const MAX_ELEMENTS = 80;
 const MAX_NAME = 60;
@@ -266,6 +271,10 @@ function pageText(): string {
  */
 export function snapshot(): PageSnapshot {
   registry = [];
+  // Every read gets a new generation. Ids are array indices, so a number only
+  // means anything relative to the read that produced it; this is what lets an
+  // action prove which read its id came from (see lookupElement).
+  registrySeq += 1;
   const elements: PageElement[] = [];
 
   const candidates = Array.from(document.querySelectorAll(INTERACTIVE_SELECTOR))
@@ -316,6 +325,7 @@ export function snapshot(): PageSnapshot {
   }
 
   return {
+    generation: registrySeq,
     url: location.href,
     title: document.title,
     elements,
@@ -328,12 +338,38 @@ export function snapshot(): PageSnapshot {
   };
 }
 
-/** Resolves a planner-issued element id against the current registry. */
-export function lookup(id: number): Element | undefined {
+/** The page read the current registry belongs to. */
+export function registryGeneration(): number {
+  return registrySeq;
+}
+
+/** Why a planner-issued element id could not be resolved to a live element. */
+export type ElementLookup =
+  | { ok: true; element: Element }
+  /** The id came from an older read than the one the registry now holds. */
+  | { ok: false; reason: "stale"; askedFor: number; current: number }
+  /** The id is not in the current read (or its node has been detached). */
+  | { ok: false; reason: "missing" };
+
+/**
+ * Resolves a planner-issued element id against the current registry.
+ *
+ * `generation` is the read the id came from. Resolving an id against a LATER
+ * read is not a near-miss that can be tolerated: ids are array indices, so the
+ * number that named a "Message Body" textbox before a re-render can name a
+ * "Send" button after it, and the action would land somewhere nobody asked for
+ * while reporting success. A mismatch is therefore refused, and the caller
+ * decides whether a role+name match makes the intent unambiguous enough to
+ * remap (the agent does exactly that, once).
+ */
+export function lookupElement(id: number, generation?: number): ElementLookup {
+  if (generation !== undefined && generation !== registrySeq) {
+    return { ok: false, reason: "stale", askedFor: generation, current: registrySeq };
+  }
   const el = registry[id];
   // The node may have been detached by a re-render since the snapshot.
-  if (!el || !el.isConnected) return undefined;
-  return el;
+  if (!el || !el.isConnected) return { ok: false, reason: "missing" };
+  return { ok: true, element: el };
 }
 
 // ─── Sensitive Region Detection ─────────────────────────────────────────────

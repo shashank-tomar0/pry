@@ -92,7 +92,7 @@ export function createGroqPlanner(apiKey: string, model: string): Planner {
   return {
     label: `Groq ${model}`,
 
-    async run({ system, messages, tools, signal, onText }: PlannerRequest): Promise<PlannerTurn> {
+    async run({ system, messages, tools, signal, onText, onThought }: PlannerRequest): Promise<PlannerTurn> {
       let stream: Awaited<ReturnType<typeof client.chat.completions.create>>;
 
       try {
@@ -124,7 +124,16 @@ export function createGroqPlanner(apiKey: string, model: string): Planner {
           const delta = choice.delta as any;
           const reasoning = delta?.reasoning_content || delta?.reasoning;
           if (reasoning) {
-            onText(reasoning);
+            // Groq streams a reasoning model's chain-of-thought in its own
+            // field, and it belongs on the REASONING channel — not `onText`.
+            // `onText` is the channel the panel paints as the agent's answer, so
+            // sending deliberation there printed the model's private analysis as
+            // PRY's reply AND left `liveness.reasoningChars` at zero, which
+            // silently disabled the deliberation cut on every Groq run.
+            // Measured live (gpt-oss-20b, this repo's checker): one turn streamed
+            // 3 478 chars of reasoning through `onText` and returned
+            // `turn.text === ""` while emitting a tool call.
+            onThought?.(String(reasoning));
           }
           if (delta?.content) {
             text += delta.content;

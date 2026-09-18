@@ -35,8 +35,10 @@ any screenshot or page text reaches an AI model.
 >   locally; if anything is still readable, the frame is rebuilt opaque and
 >   re-verified before it can reach a model.
 > - **Egress tripwire** — the page's own requests are watched for PII-shaped
->   leaks; intercepts are aggregated into one live EGRESS WATCH entry with a
->   per-request radar log.
+>   sends; they are aggregated into one live EGRESS WATCH entry with a
+>   per-request radar log, and the site's own backend traffic is labelled
+>   separately from genuine third-party egress. Alerts are reports, not blocks:
+>   PRY flags what left the page, it does not stop it.
 > - **Self-improving** — a local learning loop records every run, learns rules
 >   from false positives and repeated successes, and keeps an immutable privacy
 >   ledger.
@@ -76,6 +78,7 @@ after launch (recipe in `docs/launch-kit.md` §A6).
 | `activeTab` | Act on the tab the user is currently viewing. | — |
 | `storage` | Save settings, API keys, session history, learned rules, ledger locally. | No cloud sync. |
 | `offscreen` | Run the canvas/OCR privacy pipeline outside the service worker. | — |
+| `audioCapture` | Optional voice dictation: the mic button streams your speech to the speech-to-text provider you configured, so a spoken task can be transcribed into the task box. Only active while you are holding/using the mic button. | No idle or background capture. Audio is never written to disk and nothing is recorded when the mic is not active. Off by default. |
 | Host `<all_urls>` | The agent must be able to open and drive **any site the user asks it to** (Gmail, banking, government portals, …). | The extension only ever touches a page when the user submits a task for the active tab. It never scans in the background and never runs on `chrome://`, `edge://`, or the Web Store. |
 
 ---
@@ -96,7 +99,11 @@ after launch (recipe in `docs/launch-kit.md` §A6).
   the user's **task text** — both already PII-tokenized — are sent only to the
   **user-selected** LLM provider **when a task is running**, over HTTPS. With
   Ollama nothing is sent at all. (2) An optional re-OCR/redaction pipeline is
-  fully local. Screenshots are never sent raw.
+  fully local. Screenshots are never sent raw. (3) With **voice dictation
+  enabled** (off by default), microphone audio is streamed to the speech-to-text
+  provider the user configured while the mic is active; it is never stored. This
+  is disclosed in the privacy policy, including that dictated speech is
+  transcribed before tokenization, so dictation is opt-in.
 - **API keys:** stored in `chrome.storage.local` (unencrypted at rest on the
   user's own disk, standard for extensions) and used only against the chosen
   provider's API.
@@ -107,8 +114,8 @@ after launch (recipe in `docs/launch-kit.md` §A6).
 
 ## Pre-submission checklist
 
-1. `npm run verify` passes (390 pipeline + 27 tripwire + 6 OCR assertions) and
-   `npm run build` is clean.
+1. `npm run verify` passes (605 pipeline + 27 tripwire + 11 OCR + 37 egress +
+   84 offscreen integration + 20 agent-loop assertions) and `npm run build` is clean.
 2. `publish/pry-agent-1.0.0.zip` contains the full `dist/` contents — 80 entries,
    including `models/ner/onnx/model_quantized.onnx` and
    `models/blazeface/face_detection_short_range.tflite`. It is uploaded as a

@@ -1,5 +1,5 @@
 import type { ActionResult, AgentAction } from "../shared/types";
-import { lookup, snapshot } from "./perceive";
+import { lookupElement, snapshot } from "./perceive";
 import { settle, CLICK_CEILING } from "./settle";
 import {
   pickTextMatch,
@@ -295,14 +295,30 @@ function watchMutations(): { count: () => number; stop: () => void } {
   };
 }
 
-function resolve(input: Record<string, unknown>): Element | string {
+/**
+ * Resolves the id a tool call asked for, refusing one from an older page read.
+ *
+ * The refusal is the point. Element ids are positional, so "element 3" from two
+ * reads ago may be a completely different control now — and a click or a type
+ * that lands on the wrong control returns ok:true and reports success. Asking
+ * for a fresh read costs one turn; acting on the wrong element can submit a
+ * form, send a message or delete something. So a stale id is refused, and the
+ * message names both reads so the planner can see what happened.
+ */
+function resolve(input: Record<string, unknown>, generation?: number): Element | string {
   const id = input.element_id;
   if (typeof id !== "number") return "element_id must be a number";
-  const el = lookup(id);
-  if (!el) {
-    return `No element ${id} on the current page. The page changed since the last read — call read_page and use the new ids.`;
+  const found = lookupElement(id, generation);
+  if (found.ok) return found.element;
+  if (found.reason === "stale") {
+    return (
+      `Element ${id} came from page read #${found.askedFor}, but the page has been read again since ` +
+      `(#${found.current}). Element numbers are positional, so #${id} may now mean a different ` +
+      `control — the action was refused rather than risk the wrong element. ` +
+      `Call read_page and use the ids from the newest read.`
+    );
   }
-  return el;
+  return `No element ${id} on the current page. The page changed since the last read — call read_page and use the new ids.`;
 }
 
 async function bringIntoView(el: Element): Promise<void> {
@@ -471,7 +487,7 @@ export async function act(action: AgentAction): Promise<ActionResult> {
   try {
     switch (name) {
       case "click": {
-        const el = resolve(input);
+        const el = resolve(input, action.snapshotGeneration);
         if (typeof el === "string") return fail(el);
         await bringIntoView(el);
         const reaction = watchMutations();
@@ -500,14 +516,14 @@ export async function act(action: AgentAction): Promise<ActionResult> {
       }
 
       case "type": {
-        const el = resolve(input);
+        const el = resolve(input, action.snapshotGeneration);
         if (typeof el === "string") return fail(el);
         const text = typeof input.text === "string" ? input.text : "";
         return await typeInto(el, text, input.submit === true);
       }
 
       case "select": {
-        const el = resolve(input);
+        const el = resolve(input, action.snapshotGeneration);
         if (typeof el === "string") return fail(el);
         if (!(el instanceof HTMLSelectElement)) {
           return fail(`${describe(el)} is not a <select>.`);

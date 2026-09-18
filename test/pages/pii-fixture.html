@@ -62,6 +62,58 @@ Thank you for your business.</div>
 <p class="decoy">Plain prose: The quick brown fox jumps over the lazy dog near the riverbank.</p>
 <p class="pass">Expected result after a PRY run: values in sections 1 and 2 are tokenized in the model context and masked/blurred in the redacted screenshot; section 3 stays readable, with any checksum-rejected lookalikes counted as measured false positives.</p>
 
+<h2>4. Egress tripwire demo</h2>
+<p class="warn">
+  These two buttons send a request to a <strong>local</strong> collector
+  (<code>127.0.0.1:8787/collect</code>) that discards what it receives and
+  forwards nothing. Start it with <code>npm run demo:serve</code>. The first
+  button carries a card number and an email; the second carries neither, and is
+  the control that shows the tripwire is not simply flagging every request.
+  Neither depends on the collector actually being up: PRY inspects the request
+  <em>before</em> it is sent, so the alert fires either way.
+</p>
+<div class="row">
+  <button type="button" id="leak-pii">Leak the values above</button>
+  <button type="button" id="leak-clean">Clean request (control)</button>
+</div>
+<p class="decoy" id="leak-result">No request attempted yet.</p>
+
 <button type="button" id="fake-confirm">Confirm payment</button>
+
+<script>
+  // Deliberately plain: this is the page PRY is supposed to catch, so the
+  // fixture must not do anything clever that a real leak would not.
+  const COLLECTOR = "http://127.0.0.1:8787/collect";
+  const result = document.getElementById("leak-result");
+
+  async function attempt(label, payload) {
+    // Written BEFORE the request is awaited: with no collector listening the
+    // fetch rejects, and the point of the demo is the interception, which has
+    // already happened by then.
+    result.textContent = label + " — request attempted; check the ⌖ tripwire radar in the panel.";
+    try {
+      const res = await fetch(COLLECTOR, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      result.textContent = result.textContent + " Collector replied " + res.status + " (values discarded).";
+    } catch (err) {
+      result.textContent = result.textContent + " No collector listening (" + err.message + ") — the request failed, the alert still fired.";
+    }
+  }
+
+  document.getElementById("leak-pii").addEventListener("click", () =>
+    attempt("Card + email sent", {
+      email: "priya.sharma@example.in",
+      card: "4111 1111 1111 1111",
+      name: "Priya Sharma",
+    }),
+  );
+
+  document.getElementById("leak-clean").addEventListener("click", () =>
+    attempt("Clean request sent", { event: "page_view", path: "/pricing" }),
+  );
+</script>
 </body>
 </html>

@@ -7,7 +7,7 @@
  * - Findings categorized by PII kind (email, phone, aadhaar, pan, name, credentials)
  * - Before & After DOM text comparison
  * - Adversarial re-OCR verification status display
- */
+ */import { tierBadge } from "../shared/region-paint";
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
@@ -33,6 +33,8 @@ interface Detection {
   label: string;
   confidence: number;
   box?: { x: number; y: number; width: number; height: number };
+  /** The tier the painter APPLIED to this region — absent on legacy records. */
+  tier?: string;
 }
 
 interface VaultEntry {
@@ -222,8 +224,12 @@ async function drawShot(): Promise<void> {
     // Label badge: what this box is, and on the redacted pane what tier of
     // redaction it received. The tier matters — an opaque mask and a reversible
     // blur are not the same guarantee, and the audit used to show them
-    // identically.
-    const tier = isRedacted ? redactionTier(det) : "detected";
+    // identically.    // The tier is taken FROM the painter's record rather than re-derived here.
+    // This file used to hold its own copy of the rule, and that copy disagreed
+    // with the painter: a detector-found face with face destruction switched off
+    // was drawn as `opaque` on the very image meant to prove it was destroyed.
+    // With no recorded tier the badge says so rather than inventing one.
+    const tier = isRedacted ? tierBadge(det.tier) ?? "tier unknown" : "detected";
     const text = `${det.kind}: ${det.label} [${tier}]`;
     ctx.font = "bold 11px sans-serif";
     const textWidth = ctx.measureText(text).width;
@@ -233,23 +239,6 @@ async function drawShot(): Promise<void> {
     ctx.fillStyle = isRedacted && !active ? "#0b1a12" : "#ffffff";
     ctx.fillText(text, x + 4, badgeY + 12);
   });
-}
-
-/**
- * How a detection kind is actually redacted, mirroring the painter in
- * offscreen.ts. Surfaced in the overlay badge so the proof image says WHICH
- * guarantee each box carries instead of implying they are all equivalent.
- */
-function redactionTier(det: Detection): string {
-  // A detection that was reported and deliberately NOT painted (a face with
-  // face destruction switched off) must not be labelled as redacted — that is
-  // the one case where the box on the image is the leak, not the fix.
-  if (/NOT redacted/i.test(det.label)) return "none";
-  const kind = det.kind;
-  if (kind === "face") return "opaque";
-  if (kind.endsWith("_text") || kind === "image_text") return "opaque";
-  if (kind === "credential_label" || kind === "input_field" || kind === "credential") return "blur+escalate";
-  return "surrogate";
 }
 
 // --- Render Summary ---------------------------------------------------------

@@ -56,6 +56,34 @@ import {
 /** How one region is redacted. `skip` reports without painting. */
 export type RegionTier = "opaque" | "blur" | "surrogate" | "skip";
 
+/**
+ * The user-facing name of each tier — the ONE vocabulary the inspector badge,
+ * the audit panel and the docs share.
+ *
+ * `blur` reads as "blur+escalate" because that is the guarantee actually
+ * shipped, not because the painter does more: a soft region is only allowed to
+ * leave the browser if the adversarial pass failed to recover it, and a
+ * recoverable one is rebuilt opaque before egress. Labelling it plain "blur"
+ * understated the pipeline; labelling it "opaque" would have overstated it.
+ *
+ * `skip` reads as `none` — a detection that was reported and deliberately NOT
+ * painted is the one case where the box on the image marks a leak rather than a
+ * fix, so it must never be dressed up as a redaction.
+ */
+export const TIER_BADGES: Record<RegionTier, string> = {
+  opaque: "opaque",
+  blur: "blur+escalate",
+  surrogate: "surrogate",
+  skip: "none",
+};
+
+/** Badge text for a reported tier, or null when the record predates the field. */
+export function tierBadge(tier: unknown): string | null {
+  return typeof tier === "string" && tier in TIER_BADGES
+    ? TIER_BADGES[tier as RegionTier]
+    : null;
+}
+
 /** User toggles that change which tier a region receives. */
 export interface PaintPolicy {
   destroyFaces: boolean;

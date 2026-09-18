@@ -44,9 +44,21 @@ const windowStub = {
     if (ev && ev.detail) alerts.push(ev.detail);
   },
 };
+// The tripwire's own console line is one of the claims under test, so console
+// warnings from inside the page context are collected rather than printed.
+const logs = [];
 const context = {
-  console,
+  console: { warn: (...args) => logs.push(args.join(" ")), log: () => {}, error: () => {} },
   window: windowStub,
+  // The tripwire classifies every destination against the page's own site, so
+  // the stub page has to HAVE one. This fixture is a page on example.com, which
+  // makes every *.example.com host in the fixtures below same-site traffic.
+  location: {
+    href: "https://app.example.com/inbox",
+    hostname: "app.example.com",
+    origin: "https://app.example.com",
+  },
+  URL,
   navigator: { sendBeacon: () => true },
   XMLHttpRequest: class {
     open() {}
@@ -104,6 +116,33 @@ const EMAIL = "alice@example.com";
 await hookedFetch("https://bank.example.com/api/pay", { method: "POST", body: JSON.stringify({ card: VISA }) });
 check("fetch body with real Visa number alerts credit_card", lastAlert()?.piiType === "credit_card");
 check("credit_card alert masks all but last 4", lastAlert()?.sample === "•••• •••• •••• " + VISA_CLEAN.slice(-4));
+// Party is decided per request against the page's own site. This page is on
+// app.example.com, and bank.example.com shares its registrable domain — so this
+// is the site talking to its own backend, NOT exfiltration to somebody else.
+// Getting this backwards is what made a live run report the address the user
+// had just asked PRY to email as "2 third-party PII leaks".
+check("a sibling subdomain of the page is same-site, not third-party",
+  lastAlert()?.thirdParty === false,
+  JSON.stringify(lastAlert()));
+// The console line is the human-facing claim, so it is checked as text: it must
+// say what happened (observed) and must not repeat the retracted word.
+const consoleText = logs.join("\n");
+check("the console line says the send was OBSERVED, not blocked",
+  /observed, not blocked/.test(consoleText),
+  consoleText.split("\n").find((l) => l.includes("Tripwire")) ?? "no tripwire line");
+check("and it no longer says \"Intercepted\"",
+  !/Intercepted/i.test(consoleText),
+  consoleText.split("\n").find((l) => l.includes("Tripwire")) ?? "no tripwire line");
+
+// A destination that is genuinely a different site is flagged as third-party.
+alerts.length = 0;
+await hookedFetch("https://analytics.otherparty.net/collect", {
+  method: "POST",
+  body: `email=${EMAIL}`,
+});
+check("a genuinely different site is flagged third-party",
+  lastAlert()?.thirdParty === true,
+  JSON.stringify(lastAlert()));
 
 alerts.length = 0;
 await hookedFetch("https://shop.example.com/orders/" + BAD_BIN_LUHN, { method: "GET" });

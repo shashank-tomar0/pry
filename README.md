@@ -33,7 +33,7 @@ Developed for Smart India Hackathon 2026, Problem Statement 26171: *On-Device Vi
   - [6.3 Visual Redaction Tiers and the Reversibility Test](#63-visual-redaction-tiers-and-the-reversibility-test)
   - [6.4 Immutable Merkle Directed Acyclic Graph (DAG) Ledger](#64-immutable-merkle-directed-acyclic-graph-dag-ledger)
 - [7. Outbound Egress Tripwire and Security Invariants](#7-outbound-egress-tripwire-and-security-invariants)
-  - [7.1 Deny-by-Default Interception Architecture](#71-deny-by-default-interception-architecture)
+  - [7.1 Observational Egress Monitoring (not interception)](#71-observational-egress-monitoring-not-interception)
   - [7.2 Ephemeral Secret Vault Management](#72-ephemeral-secret-vault-management)
 - [8. Deep Canvas Inspector and Visual Verification](#8-deep-canvas-inspector-and-visual-verification)
 - [9. Comparative Analysis: PRY vs. RAIDX Agent](#9-comparative-analysis-pry-vs-raidx-agent)
@@ -60,7 +60,7 @@ Key capabilities of PRY include:
 - Irreversible destruction of detected faces: the region is overwritten with an opaque fill. Deliberately NOT a blur — blur is a recoverable low-pass filter. Detection is best-effort across three local channels (BlazeFace, Chrome's shape detector, and a skin-colour pass that exists specifically to catch the thumbnail-sized faces a short-range model misses). The guarantee is irreversibility of what is detected; it is not a claim of complete detection.
 - On-device adversarial OCR verification of the exact bytes that ship: every redacted region is re-read from the post-JPEG frame, and the frame is rebuilt with those regions destroyed if any readable character survives. The proof covers the regions PRY redacted — it is not evidence that it detected everything on the page.
 - Tamper-evident SHA-256 ledger with an exportable Merkle root and full leaf list (`audit-proof.json`), verifying that the recorded redactions occurred in order before transmission.
-- Pre-flight egress tripwire intercepting unauthorized external network transmissions.
+- Pre-flight egress tripwire observing the page's own outbound payloads and reporting PII-shaped sends, separating the site's own backend traffic from genuine third-party egress. **It reports; it does not block** (§7.1).
 
 ---
 
@@ -107,7 +107,7 @@ flowchart TD
             Vault["Token Map (service-worker RAM)\n- Plain Map, no encryption"]
             FPE["Surrogate Engine\n- Format-preserving (unkeyed)\n- Luhn / Verhoeff Checksums"]
             Merkle["Merkle Audit Engine\n- SHA-256 DAG Computation"]
-            Tripwire["Egress Tripwire\n- Outbound Payload Interceptor"]
+            Tripwire["Egress Tripwire\n- Outbound Payload Observer\n- Reports only, does not block"]
         end
 
         subgraph OffscreenEnv["Offscreen Document (Hardware Accelerated)"]
@@ -255,13 +255,45 @@ PRY embeds all perceptual machine learning models locally. Zero perceptual infer
 
 ### 5.4 ElevenLabs Scribe Realtime and Flash v2.5
 - **Speech-to-Text (STT):** Custom Web Audio API pipeline sampling microphone input at 16,000 Hz in single-channel linear PCM16 format. Audio frames (250 ms) are streamed over WebSocket directly to the ElevenLabs Scribe endpoint.
+- **Microphone permission:** the side panel calls `getUserMedia` directly, so the manifest must declare `audioCapture`. Chrome requires it for extension pages, and without it the device list is hidden from the extension and the failure surfaces as `NotFoundError: Requested device not found` — a hardware-sounding error for a manifest problem. If the mic reports a failure, the panel now names the actual cause (missing permission, no input device, a blocked prompt, or a device held by another app) instead of echoing Chrome's message; the check is `chrome.runtime.getManifest().permissions`, so it cannot be wrong about which case it is.
 - **Text-to-Speech (TTS):** Generates low-latency operational audio responses via ElevenLabs Flash v2.5.
-- **Vocal Privacy Boundary:** All outgoing text is sanitized by `speakSafeTransform()`. Vault tokens (such as `<CRED_1>` or synthetic credit card numbers) are stripped, preventing accidental vocalization of secrets over speakers.
+- **Vocal Privacy Boundary:** All outgoing speech is decided in one place, `voice-core.toSpeakable()`. It replaces vault tokens (such as `<CRED_1>` or synthetic credit card numbers) with the spoken word "redacted", flattens markdown, and caps length — so a secret is never vocalized. A token is a reason to **redact, never a reason to refuse**: the previous `speak()` guard checked for a token first and returned an error before that transform ran, so any answer quoting one back (the Gmail tab title alone carries `<CRED_1>`) produced "Refusing to speak: raw vault token in assistant text" instead of audio. The number of tokens spoken as "redacted" is reported, so a substitution is never mistaken for the model's own wording.
 
 ### 5.5 Remote Multimodal Planner (NVIDIA NIM)
 - **Model:** provider-configurable; the shipped default is `nvidia/nemotron-3.5-lightning-30b-a3b` through the NVIDIA NIM API (see `src/shared/models.ts`).
 - **Operational Role:** Consumes sanitized screenshots and synthetic DOM context, outputting structured JSON action plans (clicks, keystrokes, form submissions).
 - **Zero-Trust Intent:** the planner receives tokenized text and, when vision is enabled, the post-redaction frame rather than the raw one. This is a policy the pipeline enforces, not a proof: detectors have the failure modes listed in §6.5, so treat "no PII reached the model" as conditional on those detectors firing. Vision is off by default.
+
+#### 5.5.1 Planner turn policy: how a slow or looping turn is bounded
+
+A remote planner is a network service, and the failure mode that matters to the user is not a crash — it is a turn that never ends, or one that ends in junk presented as an answer. One planner turn (`agent.ts`) is bounded by **silence, not by wall clock**, because a reasoning model that is visibly making progress must be allowed to finish:
+
+| Boundary | Budget | What it catches |
+| :--- | :--- | :--- |
+| First output | 60 s warm / 90 s cold | A provider that never sends its first token. Reported once, **not** retried — two 90 s silent attempts measured on NVIDIA NIM produced 180 s of dead waiting and the same error. |
+| Mid-turn silence | 30 s | A dropped connection after output started. Retried once. |
+| Deliberation | 12 000 reasoning chars or 90 s | A model reasoning without converging. Steered once ("act now, with what you already have"), then reported. |
+| Degeneration | 4-gram short-cycle ratio ≥ 0.5, or a 40-word block repeated 3× | A model that has collapsed into a **repetition loop**. Deltas keep arriving, so no silence window can see this, and it is the one failure that used to run to the ceiling — measured live at 100 s against `nvidia/nemotron-3.5-lightning-30b-a3b`, which collapsed into "can make it one big things. can make it." for 6 233 characters. Cut in seconds, never retried, and the loop is **not** replayed in the next turn's history. |
+| Ceiling | 210 s | The absolute bound on one turn (below Manifest V3's 5-minute limit). |
+
+Two properties of this policy are deliberate and worth stating: the check reads **repetition, not duration**, because duration cannot tell a thorough model from a looping one; and every cut is **announced with its reason** — a withheld or stopped turn is narrated, never silent. Assistant text is also clamped (`MAX_HISTORY_TEXT_CHARS` = 1 200) before it is replayed as history, because the model's own monologue comes back to it on every later turn and an unbounded one is paid for repeatedly. Its precision is pinned in the harness against the verbatim reported loop, PRY's own system prompt, long narration, and an adversarial table of near-identical rows.
+
+#### 5.5.2 The frame pipeline: two waiting policies, one implementation
+
+The local pixel pipeline (capture → redact → verify → attack → record) is 1.2 s for a 1× viewport and up to 6.5 s at the 6-tile triage cap. Whether that sits in front of the next planner turn depends on exactly one question — **does the planner read the frame?**
+
+| Vision | Who reads the frame | Policy |
+| :--- | :--- | :--- |
+| **OFF** (default) | Nobody. The output is local evidence: the ledger entry, the audit panel, the run's PII totals, its re-OCR leak findings | Started and **not awaited**. It runs alongside the planner turn that follows and is joined after that turn returns (measured free: the capture is 1.2-6.5 s, the turn is seconds to minutes) |
+| **ON** | The planner, via the VLM's description of the redacted frame | Awaited before the next turn |
+
+Three properties make this safe rather than merely faster, and each is pinned in `agent-frame-audit-test` against the real loop:
+
+- **Nothing is lost by deferring.** The evidence line still reaches the planner, one step later, labelled `[Frame after the previous action: N PII redacted]` / `[Opening frame: …]` — never silently mixed into the page read below it, which is from a later moment. The ledger entry, the audit record, the run's totals and its leak evidence are all unaffected.
+- **Nothing is lost when there is nowhere to deliver it.** A turn with no tool call (a final answer, a refusal, Stop) has no tool result to carry the joined line, so it is reported as its own transcript entry instead of being dropped.
+- **Every wait is bounded by one budget** (`FRAME_AUDIT_WAIT_MS`, 15 s, over 2× the measured worst case). A capture that wedges — which is how the opening frame could hang a run *before its first planner turn*, with nothing on screen to explain it — is given up on, announced ("did not finish within 15s — continuing without a visual description"), and left to finish its own ledger entry in the background. When the planner does read the frame, the run waits for it — but never indefinitely.
+
+One implementation serves the opening frame, the post-action frame and the deferred half of both; before this it was three copies of the same ~55-line block, which is how a fix lands in one and not the others.
 
 ### 5.6 Architectural Assessment: GLiNER Model Integration
 An analysis of integrating GLiNER (Generalist and Lightweight Model for Named Entity Recognition) was conducted for the V2 roadmap:
@@ -375,7 +407,7 @@ PRY's redaction is only as good as its detection, so the bounds are stated here 
 | :--- | :--- | :--- |
 | **Regex + checksum matchers** (`pii-detector.ts`, `text-pii-patterns.ts`) | Emails, Indian phone numbers, Aadhaar (Verhoeff-validated), PAN, IFSC, SSN, card numbers (Luhn-validated), honorific/cue-phrase names, API keys and JWTs | Anything unstructured: plain names without a cue phrase, street addresses, dates of birth, medical terms, account balances. Lookalikes that fail a checksum are deliberately NOT redacted (measured as a false-positive signal instead). |
 | **Contextual analysis** (`contextual-pii.ts`) | Values in fields whose own label marks them sensitive | Needs a readable label; a bare "Account number" box on an icon-only form is not covered. |
-| **On-device NER** (token classification, `ml/ner.ts`) | Person names, organizations, locations in page prose, any casing | Bounded to 12 spans per page and to the labels in `ner-labels.ts`; the model is ~104 MB and quantized, so recall on rare or non-Latin names is imperfect; a page whose text is longer than the snapshot budget (`MAX_TEXT` = 2000 chars) is scored only on the visible main-content region. |
+| **On-device NER** (token classification, `ml/ner.ts`) | Person names, organizations, locations in page prose, any casing | Bounded to 12 spans per page and to the labels in `ner-labels.ts`; the model is ~104 MB and quantized, so recall on rare or non-Latin names is imperfect; a page whose text is longer than the snapshot budget (`MAX_TEXT` = 6000 chars, `MAX_ELEMENTS` = 80) is scored only on the visible main-content region. |
 | **Face channels** (BlazeFace → Chrome shape detector → skin colour, `offscreen.ts`) | Faces in the captured frame, down to roughly 28 px | The model channels run first and the skin-colour pass is now a SUPPLEMENT rather than a fallback: a single BlazeFace hit used to skip it entirely, which is how a page with one large portrait and a grid of thumbnails destroyed the portrait and shipped every thumbnail face. Short-range BlazeFace still misses small faces on its own, the skin-colour heuristic can miss unusual lighting and add false positives on photos, and supplementary additions are capped at 8 per frame so a photo wall cannot blot the page. A separate DOM channel marks `img[alt~=profile|avatar|photo]` and similar as `kind: "face"`; that matches URL/alt text, so it misses most modern avatars (YouTube's `yt3.ggpht.com` images carry neither word). **There is no biometric completeness guarantee** — a missed face is not detected, and the re-OCR verifier does not look for faces at all. |
 | **Text-PII pixel boxes** (`perceive.ts#locateSpans` / `location of detector values`) | Rendered text nodes, form fields, avatar images, and the elements the detectors read values out of (`locate-elements`) | Scan is capped (1.5 s, 8 000 nodes, 200 regions) and skips off-viewport matches, so a very heavy page redacts what it reaches before the budget, not everything. A detected value that cannot be located anywhere is now reported explicitly (masked) rather than silently assumed covered. |
 | **Images and canvas-rendered text** | Text baked into an `<img>`, a `<canvas>` (PDF viewers, Google Docs), a video frame or a photographed document, when frame-text triage runs | Closed by reading the frame back: `ocr-pii-triage.ts` runs on the ALREADY-REDACTED frame with the bundled Tesseract, matches what it can still read against the shared PII patterns and the spans the NER already found, and black-boxes those words (`image_text` regions). Running it after redaction is what makes it self-targeting — a DOM-redacted value is a black rectangle OCR cannot read, so anything legible there is by definition what no other channel covered. Remaining limits, all real: a name inside an image that the NER never saw anywhere on the page has no pattern to match; OCR misreads are missed; a very tall frame is triaged top-down over at most 6 slices of 900 px, and the shortfall is logged rather than implied covered; and disabling **Scan Frame Text** in Options returns this row to *nothing*. |
@@ -399,18 +431,25 @@ stateDiagram-v2
     ScanVerhoeff --> CheckSurrogate: Verhoeff Valid
 
     CheckSurrogate --> PayloadClean: Value is Known Synthetic Surrogate
-    CheckSurrogate --> TripwireTripped: Value Matches Raw PII Held for This Run
+    CheckSurrogate --> AwaitingDestination: Value Matches Raw PII Held for This Run
 
-    PayloadClean --> AllowTransmission: Forward to External Cloud
-    TripwireTripped --> AbortTransmission: Network Socket Terminated
-    AbortTransmission --> LogViolation: Record Event to Merkle Ledger
+    AwaitingDestination --> PayloadClean: Destination is the PAGE'S OWN site
+    AwaitingDestination --> TripwireTripped: Destination is a DIFFERENT site
+
+    PayloadClean --> AllowTransmission: Request proceeds (it was never held)
+    TripwireTripped --> AllowTransmission: Request STILL proceeds — observation only
+    TripwireTripped --> ReportViolation: Third-party alert to the panel and ledger
 ```
 
-### 7.1 Deny-by-Default Interception Architecture
-The Egress Tripwire (`src/background/tripwire.ts`) operates as an egress security gateway intercepting all HTTP requests, WebSocket payloads, and beacon transmissions:
-- Evaluates outgoing request bodies and query parameters against PII detection patterns.
-- Distinguishes between synthetic surrogates (which are permitted) and unmasked credentials (which trigger an immediate abort).
-- If an unmasked credential is detected, the transmission is blocked and an audit alert is recorded in the Merkle ledger.
+### 7.1 Observational Egress Monitoring (not interception)
+The Egress Tripwire (`src/content/tripwire.ts`) hooks the page's `fetch`, `XMLHttpRequest` and `navigator.sendBeacon` in the MAIN world and inspects outbound URLs and bodies:
+- Evaluates outgoing request bodies and query parameters against PII detection patterns (cards, Aadhaar, PAN, email).
+- Distinguishes between synthetic surrogates (PRY's own redaction values) and raw values.
+- Classifies the DESTINATION: a request to the page's own registrable domain is same-site traffic (a site posting to its own backend), while a different domain is third-party egress. Only the latter raises the third-party alarm; same-site sends are still listed in the radar, labelled.
+
+**What it does not do, stated plainly:** it does not block, cancel, delay or rewrite any request. Every hook calls through to the original unchanged and fails open, and no alert terminates a connection. An earlier revision of this section described a "Deny-by-Default" gateway that aborts transmissions and terminates sockets; no such code has ever existed in this repository. Treat the tripwire as a detector and an audit trail for egress the page performed, not as a firewall. Blocking third-party requests correctly requires a declarative rule the browser enforces (for example a `declarativeNetRequest` filter), which is roadmap rather than shipped behaviour.
+
+- Alerts are recorded in the privacy ledger and surfaced as one aggregated egress entry plus a per-request radar log.
 
 ### 7.2 Ephemeral Secret Vault Management
 - Token↔value mappings are held in RAM only, inside the service worker's tokenizer vault (`src/background/tokenizer.ts`). Nothing about a vault entry is written to `chrome.storage`.
@@ -440,7 +479,7 @@ PRY provides a visual verification utility accessible via the extension interfac
 | **Adversarial Verification** | Assumes visual blur filters are secure | Tesseract re-OCR of the shipped bytes over the redacted regions, with an opaque-mask rebuild as the remediation |
 | **Voice Streaming Pipeline** | Standard HTTP REST / Audio upload | 16 kHz raw PCM16 streaming over WebSocket with token suppression |
 | **Memory Security Guarantee** | Session data cached on remote infrastructure | Token map held only in service-worker memory — never persisted, cleared on worker teardown (§7.2) |
-| **Outbound Defense Layer** | Relies on LLM system prompt instructions | Deterministic Tripwire Interceptor blocks unauthorized socket traffic |
+| **Outbound Defense Layer** | Relies on LLM system prompt instructions | Deterministic tripwire observer with same-site/third-party classification — reports PII-shaped egress, does not block it (§7.1) |
 | **Full-Page Capability** | Single viewport capture | Automated scroll-and-stitch engine with coordinate re-mapping |
 
 ---
@@ -531,7 +570,7 @@ Execute the comprehensive test harness:
 ```bash
 npm run verify
 ```
-*Expected Output:* All assertions pass cleanly — **666 total: 516 pipeline + 27 tripwire + 11 OCR + 37 egress + 75 offscreen integration** — covering detection, tokenization, redaction, face-channel fusion, region→image mapping, detected-vs-boxed reconciliation, OCR frame-text triage, planner turn policy, ledger integrity, Scribe wire shapes, the adversarial attack (reconstruction thresholds calibrated against PRY's own blur kernel across five content patterns, plus the face-coverage re-probe and its escalation), and the offscreen pipeline driven end-to-end through its real message listener over real pixels. The OCR assertions run real Tesseract on rendered images, so they prove the engine returns word boxes the triage can paint over — not just that the code compiles. `offscreen-integration-test` bundles the real offscreen document, stubs only its browser-facing dependencies, and asserts the reported box equals the black actually present in the shipped bytes.
+*Expected Output:* All assertions pass cleanly — **796 total: 605 pipeline + 27 tripwire + 11 OCR + 37 egress + 84 offscreen integration + 32 agent-loop** — covering detection, tokenization, redaction, face-channel fusion, region→image mapping, detected-vs-boxed reconciliation, OCR frame-text triage, planner turn policy, ledger integrity, Scribe wire shapes, the adversarial attack (reconstruction thresholds calibrated against PRY's own blur kernel across five content patterns, plus the face-coverage re-probe and its escalation), and the offscreen pipeline driven end-to-end through its real message listener over real pixels. The OCR assertions run real Tesseract on rendered images, so they prove the engine returns word boxes the triage can paint over — not just that the code compiles. `offscreen-integration-test` bundles the real offscreen document, stubs only its browser-facing dependencies, and asserts the reported box equals the black actually present in the shipped bytes. `agent-frame-audit-test` does the same one layer up: it drives the **real** `runTask` loop with only browser I/O and the two model endpoints stubbed, and asserts the frame-evidence contract — that a deferred frame's line still reaches the planner labelled with the step it describes, that the ledger and the run's totals still count it, that a residual leak it finds is still reported, that the pixel work overlaps the planner turns instead of preceding them, and that a capture which never returns ends the run instead of hanging it.
 
 ### 11.3 Production Build Process
 Compile the TypeScript source files and assemble production bundles:
@@ -547,14 +586,57 @@ npm run build
 - `dist/inspector.js` (Deep visual verification utility)
 - `dist/tripwire.js` (Egress network security hook)
 
-### 11.4 Browser Deployment
+### 11.4 Latency Benchmark
+The per-capture cost is dominated by local pixel work, not by the model. Measure it
+with the shipped Tesseract stack and the tile geometry the pipeline actually produces:
+```bash
+npm run bench:latency
+```
+It reports the OCR cost per tile, the cost of the 6-tile triage cap, the per-tile PNG
+encode, and the cold-start cost of the first recognition. The first run on a cold file
+cache is several times slower than an immediate re-run, so compare like with like — the
+cold number is what a user pays on the first capture of a session.
+
+The other half of the wait is what each planner turn is charged, and unlike the pixel
+work it cannot be overlapped — the model cannot start before the request is built. A
+request is `{ system, tools, messages }`, measured on the real loop by
+`agent-frame-audit-test`:
+
+| Part | Measured |
+| :--- | :--- |
+| system prompt | 9.9 KB |
+| tool schemas (15 tools) | 4.5 KB |
+| conversation, per turn | ~10 KB |
+| **whole request, per turn** | **~24 KB, flat** |
+
+Two rules keep that flat. Stale page reads are pruned out of older tool results, and
+the page read the run *opened* with is pruned once an action has produced a fresher one
+— it used to sit in the first message for the whole run, so every turn carried two full
+page reads (one current, one stale) and the run's own payload grew with every step. A
+page read at the caps above is ~9 KB, which was ~48% of the conversation and ~27% of
+the whole request on every turn after the first. Earlier snapshots are only pruned when
+a fresher one genuinely exists: a read-only action (`find_text`, `wait`, `read_page`)
+renders nothing, and there the opening read is still the planner's only view of the
+page.
+
+### 11.5 Demo Fixtures
+Serve the synthetic fixtures (and the local collector sink the egress-tripwire demo
+posts to) without installing anything:
+```bash
+npm run demo:serve      # http://127.0.0.1:8787/pii-fixture.html
+```
+Content scripts do not run on `file://` without enabling *Allow access to file URLs*,
+and a page the extension cannot see looks identical to a broken build — serving over
+loopback removes that failure mode. See `test/pages/README.md`.
+
+### 11.6 Browser Deployment
 1. Open Google Chrome and navigate to `chrome://extensions/`.
 2. Enable **Developer mode** using the toggle in the upper right corner.
 3. Click **Load unpacked**. Load `dist/` (never `src/`) and reload the extension
 after every build — the side panel caches its bundle, and a stale bundle is what
 produces "my fix isn't there" reports.
 
-### 11.5 Packaged build (release artifact)
+### 11.7 Packaged build (release artifact)
 `node scripts/package.mjs` writes `publish/pry-agent-1.0.0.zip` (~125 MB: the
 model weights and wasm runtimes are included, because a build without them has no
 on-device NER, no face model, and no OCR verifier). It is **not** committed — it

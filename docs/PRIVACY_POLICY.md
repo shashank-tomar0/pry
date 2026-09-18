@@ -19,7 +19,8 @@ only over HTTPS.
 
 ## 1. Data processed on your device (never leaves it)
 
-The following data is processed locally, inside your browser, and is **never
+The following data is processed locally, inside your browser, and (with the one
+stated exception of opt-in dictation in the last bullet) is **never
 transmitted**:
 
 - **Page content the agent reads.** PRY reads the DOM of the active tab while
@@ -43,6 +44,14 @@ transmitted**:
   (`<CRED_1>`, `<ID_2>`) held in memory. Raw values exist only in your browser's
   memory and are resolved at the last moment, inside your browser, when an action
   needs them.
+- **Microphone audio, when you use voice dictation.** Dictation is **off by
+  default**. If you enable it and press the mic button, PRY captures microphone
+  audio, converts it to PCM, and streams it to the speech-to-text provider you
+  configured — so that a spoken task can be transcribed into the task box. Audio
+  is never written to disk, never stored, and never sent anywhere except the
+  speech provider you selected; the stream stops when you stop the mic. Voice
+  **output** (reading answers aloud) is likewise off by default, and never speaks
+  a vault token: any token in the text is pronounced as "redacted".
 
 ## 2. Data stored locally on your device
 
@@ -67,7 +76,16 @@ Only the following is ever transmitted, and only while a task is running:
 |---|---|---|
 | Your **task text** and a **PII-redacted page description** (tokens, never raw values) | The LLM provider **you selected** in settings | While a task is running |
 | A **redacted screenshot** (optional VLM vision) | The same LLM provider **you selected**, if you enabled vision | While a task is running |
+| **Microphone audio** (optional voice dictation) | The speech-to-text provider **you configured**, only while the mic is active | Only while you are dictating |
 | Nothing, if you use a local provider (e.g. **Ollama**) | — | Zero bytes leave your device |
+
+The dictation row is the one case where what leaves your device is not
+pre-processed for PII: speech is transcribed **before** you submit the task, and
+the transcript then enters the same tokenization pipeline as typed text. If you
+dictate a card number, the transcription request carried it — which is why
+dictation is opt-in and off by default. Do not dictate values you are unwilling
+to send to your speech provider; type them, or paste them into a field PRY can
+fill without transcribing.
 
 Everything is sent over **HTTPS**. The toolbar badge shows an honest live count of
 egress bytes ("0 KB" when nothing leaves).

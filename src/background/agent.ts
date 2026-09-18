@@ -20,15 +20,16 @@ import type {
   VerificationResult,
 } from "../shared/types";
 import { sendProtectedScreenshot } from "../shared/screenshot-egress";
+import { tierForKind, type RegionTier } from "../shared/region-paint";
 import type { ProcessedScreenshotResult } from "../shared/types";
 
 import { SYSTEM_PROMPT, SYSTEM_PROMPT_LOCAL, taskPrompt } from "./prompt";
-import { TOOLS, PAGE_ACTIONS } from "./tools";
+import { TOOLS, actionChangesFrame } from "./tools";
 import { TabController, execute, isRestricted } from "./executor";
 import { detectInjection, gate } from "./safety";
 import { detectAllPIIDetailed } from "./pii-detector";
 import { redactSnapshot } from "./redaction";
-import { tokenizer, repairTokenConcatenation, maskSample, buildTokenLegend } from "./tokenizer";
+import { tokenizer, repairTokenConcatenation, buildTokenLegend } from "./tokenizer";
 import { tryDeterministic } from "./deterministic";
 import { createPlanner } from "./providers";
 import type { ConvMessage, ToolOutcome } from "./providers/types";
@@ -38,7 +39,7 @@ import { classifyFailure } from "./failure-causes";
 import { detectContextualPII, contextualToDetectedPII } from "./contextual-pii";
 import { getApplicableRules, buildSuppressionKeys, recommendsLLMOnly } from "./learned-rules";
 import { getLessons, matchLessons } from "./lessons";
-import { getTrajectories, matchTrajectories } from "./trajectories";
+import { getTrajectories, matchTrajectories, renderTrajectoryRoutes } from "./trajectories";
 import { piiKindFromOcrLabel } from "./reocr-verification";
 import type { DetectedPII } from "./pii-detector";
 import { observeWithVision, VISION_SUPPORTED, VISION_DEFAULT_MODELS } from "./vision";
@@ -46,6 +47,11 @@ import { recordWire, tokensIn, scanForLeaks } from "./wire-log";
 import { matchPiiInText } from "../shared/text-pii-patterns";
 import { requestMlNer, requestMlGuard, setActiveNerSpans, setActivePiiTargets, type PiiTarget, probeMlFiles, selfTestMl } from "./ml-bridge";
 import { appSwitcherRefusal } from "../shared/route-guard";
+import {
+  redactionTally,
+  describeRedactionTally,
+  type RedactionTally,
+} from "../shared/metrics";
 import { fuseDetections, type NerSpanInput } from "./detector-v2";
 import {
   initLedger, recordSnapshot, recordDetections,
@@ -189,11 +195,16 @@ const AUDIT_KIND_LABELS: Record<string, string> = {
  * what was actually tokenized/redacted from page text, not just visuals. */
 function auditFromDetections(
   detections: Array<{ kind: string; confidence: number }>,
-): Array<{ kind: string; label: string; confidence: number }> {
+  policy: { destroyFaces: boolean; maskCredentials: boolean },
+): Array<{ kind: string; label: string; confidence: number; tier: RegionTier }> {
   return detections.map((d) => ({
     kind: d.kind,
     label: AUDIT_KIND_LABELS[d.kind] ?? d.kind,
     confidence: d.confidence,
+    // DOM-side detections have no paint plan of their own — their pixels are
+    // redacted through the same tier table, so ask it with the SAME policy the
+    // frame was painted under rather than leaving the tier blank.
+    tier: tierForKind(d.kind, policy),
   }));
 }
 
@@ -364,13 +375,33 @@ export interface AgentDeps {
     shipped?: boolean;
     original?: string;
     redacted?: string;
-    detections: Array<{ kind: string; label: string; confidence: number; box?: { x: number; y: number; width: number; height: number } }>;
+    detections: Array<{ kind: string; label: string; confidence: number; box?: { x: number; y: number; width: number; height: number }; tier?: string }>;
     tokens: Array<{ token: string; kind: string; sample?: string }>;
     redactedCount: number;
+    /** Why this frame's pixels were refused egress, when they were. */
+    withheld?: string[];
     verification?: VerificationResult;
   }) => void;
+  /**
+   * Report the run's redaction tally whenever it changes.
+   *
+   * The audit payload is assembled in the service worker, which sees frames but
+   * never the DOM/text channel's counts. Without this the panel had to tally the
+   * run from whichever frames its entry buffer happened to still hold, which is
+   * how the same run showed 231 and 227 at once.
+   */
+  reportTally?: (tally: RedactionTally) => void;
   /** Compact memory of finished exchanges so follow-ups can continue the chat. */
   history?: Array<{ task: string; answer: string; timestamp: number }>;
+  /**
+   * Override for how long the run will wait on one frame pipeline.
+   *
+   * Defaults to FRAME_AUDIT_WAIT_MS, which sits above the measured worst case
+   * (6.5 s at the 6-tile triage cap) with headroom. Exists so the harness can
+   * drive a capture that never settles in milliseconds instead of minutes and
+   * assert that the run gives up rather than hanging.
+   */
+  frameAuditWaitMs?: number;
 }
 
 // ─── Main Loop ──────────────────────────────────────────────────────────────
@@ -389,7 +420,20 @@ export async function runTask(
   startTabId: number,
   deps: AgentDeps,
 ): Promise<void> {
-  const { settings, emit, askConfirm, signal, captureScreenshot, recordAudit, history } = deps;
+  const { settings, emit, askConfirm, signal, captureScreenshot, recordAudit, reportTally, history } = deps;
+
+  /**
+   * How long the run will wait on one frame pipeline, wherever it waits.
+   *
+   * Every wait on the pixel pipeline is bounded by this — the opening frame
+   * that feeds the first planner turn, the post-action frame when vision is on,
+   * and the join that folds deferred evidence back in. A local capture is
+   * measured at 1.2 s for a 1× viewport and up to 6.5 s at the 6-tile triage
+   * cap, so this is more than 2× the worst case; a capture that blows past it
+   * has wedged, and the run continues without it rather than freezing with
+   * nothing on screen to explain why.
+   */
+  const FRAME_AUDIT_WAIT_MS = deps.frameAuditWaitMs ?? 15_000;
 
   // Use a shorter system prompt for small local models to avoid context overflow.
   const isLocalModel = settings.provider === "ollama";
@@ -463,7 +507,10 @@ export async function runTask(
    * description into `fallback`. Best-effort by design: any failure degrades
    * to the DOM-only observation and never blocks the run.
    */
-  async function observeScreen(processed: ProcessedScreenshotResult, fallback: string): Promise<{ text: string; shipped: boolean }> {
+  async function observeScreen(
+    processed: ProcessedScreenshotResult,
+    fallback: string,
+  ): Promise<{ text: string; shipped: boolean; withheld?: string[] }> {
     if (!visionEnabled || !visionApiKey || signal.aborted) return { text: fallback, shipped: false };
     const context = snapshot ? renderSnapshot(snapshot) : `URL: ${sanitizeUrl(tab.url ?? "")}`;
     try {
@@ -472,7 +519,10 @@ export async function runTask(
       ));
       if (!outcome.sent) {
         emit({ kind: "entry", entry: { id: nextId(), role: "system", text: `Screenshot withheld: ${outcome.reasons.join("; ")}. Continuing without image.` } });
-        return { text: fallback, shipped: false };
+        // The reasons ride back to the audit entry: a withheld frame is not a
+        // frame PRY may count as verified at run level, and the panel can only
+        // say so if it is told (see rollupFrameVerification).
+        return { text: fallback, shipped: false, withheld: [...outcome.reasons] };
       }
       const vision = outcome.value;
       sessionEgressBytes += vision.bytes;
@@ -484,6 +534,253 @@ export async function runTask(
       // "not sent" from an empty response or put provider error bodies in context.
       return { text: fallback, shipped: true };
     }
+  }
+
+  // ─── The frame pipeline, and the two policies for waiting on it ───────────
+
+  /** Label the awaited frame's line carries in the planner's observation. */
+  const FRAME_LABEL_AWAITED = "Screenshot";
+  /**
+   * Label for a frame reported one step late.
+   *
+   * It NAMES the lag rather than hiding it. The pixels are the previous
+   * action's — captured at the same instant the awaited path would have
+   * captured them, only consumed later — and a page read that mixed the two
+   * silently would read as though it came from the wrong moment.
+   */
+  const FRAME_LABEL_DEFERRED = "Frame after the previous action";
+  /** Label for the run's opening frame when it too is deferred (vision off). */
+  const FRAME_LABEL_OPENING = "Opening frame";
+
+  /**
+   * The audit-only pipeline in flight, if any.
+   *
+   * Doubles as the serialisation handle (see startFrameAudit) and as the handle
+   * a join waits on, which is why it is NOT cleared the moment it settles: a
+   * slot cleared early would let the next capture run concurrently with a
+   * pipeline that had merely outlived its join budget.
+   */
+  let pendingFrameAudit: Promise<{ summary: string } | null> | null = null;
+  /** True once this pipeline's line has been handed over (delivered at most once). */
+  let frameAuditDelivered = false;
+  /** Evidence joined after the last planner turn, not yet handed to the planner. */
+  let carriedFrameNote = "";
+
+  /**
+   * One frame through the pixel pipeline: capture → redact → verify → attack →
+   * record evidence. Returns the evidence line the planner reads, and the
+   * observation text to use in place of `observationSoFar` (the VLM's
+   * description when vision is on), or null when there was no frame.
+   *
+   * WHY THIS IS A NAMED FUNCTION AND NOT AN INLINE BLOCK
+   *
+   * There are two call sites and they must wait differently:
+   *
+   *   - before the first planner turn, and after every action while VISION IS
+   *     ON, the caller AWAITS it — a frame, or the VLM's description of it, is
+   *     what the next turn reasons about, so the chain belongs on the critical
+   *     path;
+   *   - after an action while VISION IS OFF, the caller STARTS it and keeps
+   *     going (startFrameAudit). Nothing about that frame reaches the planner,
+   *     so the work is purely local evidence — ledger entries, the audit panel,
+   *     the run's PII totals and its re-OCR leak findings — and it was sitting
+   *     between the action and the next planner turn for no reader's benefit.
+   *     Measured at 1.2 s for a 1× viewport and up to 6.5 s at the 6-tile
+   *     triage cap, once per page-changing action, all of it paid before the
+   *     model was even asked what to do next.
+   *
+   * Keeping one implementation is the point: the two sites used to be two
+   * copies of this ~55-line block, which is how a fix lands in one and not the
+   * other.
+   */
+  async function runFrameAudit(
+    domDetections: Array<{ kind: string; confidence: number }>,
+    observationSoFar: string,
+    /** `FRAME_LABEL_AWAITED` / `FRAME_LABEL_DEFERRED`, or "" for no line. */
+    summaryLabel: string,
+  ): Promise<{ summary: string; observation: string; shipped: boolean } | null> {
+    if (!captureScreenshot) return null;
+    // Snapshot the vault BEFORE any await: the audit entry describes the tokens
+    // that were live for THIS frame, and a deferred pipeline can otherwise read
+    // a vault that a later page read has already added to.
+    const tokensAtCapture = tokenizer.getTokenSummary();
+    try {
+      const screenshotResult = await captureScreenshot(controller.tabId);
+      if (!screenshotResult) return null;
+
+      const processed = screenshotResult.processed;
+      const visualDetections = processed.detections.map((d) => ({
+        kind: d.kind,
+        label: d.label,
+        confidence: d.confidence,
+        box: d.box,
+        // Carried straight from the painter — the view never re-derives it.
+        tier: d.tier,
+      }));
+      const verification = processed.verification;
+      noteVerification(verification);
+
+      let summary = "";
+      if (summaryLabel) {
+        summary = `[${summaryLabel}: ${processed.redactedCount} PII redacted]`;
+        if (verification && verification.regionsChecked > 0) {
+          summary += verification.verified
+            ? ` [Re-OCR VERIFIED: ${verification.regionsRedacted}/${verification.regionsChecked} regions confirmed redacted]`
+            : ` [Re-OCR WARNING: ${verification.summary}]`;
+        }
+      }
+      let observation = summary ? `${observationSoFar}\n\n${summary}` : observationSoFar;
+
+      // Ledger: visual detections + redaction + re-OCR verification proof.
+      if (visualDetections.length > 0) {
+        recordDetections(visualDetections.map((d) => ({ ...d, method: "visual" }))).catch(() => {});
+      }
+      if (processed.redactedCount > 0) {
+        ledgerRecordRedaction(processed.redactedCount, "visual").catch(() => {});
+      }
+      if (verification && verification.regionsChecked > 0) {
+        ledgerRecordVerification(verification.verified, verification.regionsChecked, verification.leakedPatterns.length).catch(() => {});
+      }
+
+      // Track visual detections in experience memory too (faces, avatars).
+      for (const det of visualDetections) {
+        trackedPII.push({
+          kind: det.kind,
+          method: "visual",
+          outcome: "true_positive",
+          confidence: det.confidence,
+        });
+      }
+      piiFrameRegions += processed.redactedCount;
+      reportCurrentTally();
+
+      // Optional VLM vision: only the redacted screenshot leaves. Run before
+      // the audit record so the panel's caption reflects whether pixels
+      // actually left the browser.
+      let shippedToModel = false;
+      let withheldReasons: string[] | undefined;
+      if (visionEnabled && visionApiKey && !signal.aborted) {
+        const described = await observeScreen(processed, observation);
+        shippedToModel = described.shipped;
+        withheldReasons = described.withheld;
+        observation = described.text;
+      }
+
+      // Record for privacy audit — DOM detections + visuals.
+      recordAudit?.({
+        original: screenshotResult.original,
+        redacted: processed.redactedDataUrl,
+        detections: [...visualDetections, ...auditFromDetections(domDetections, settings.privacy)],
+        tokens: tokensAtCapture,
+        redactedCount: processed.redactedCount,
+        shipped: shippedToModel,
+        withheld: withheldReasons,
+        verification,
+      });
+
+      return { summary, observation, shipped: shippedToModel };
+    } catch {
+      // Capture is optional — DOM perception still works without it.
+      return null;
+    }
+  }
+
+  /**
+   * Start the frame pipeline and keep going (vision off).
+   *
+   * NEVER two captures at once. In the normal case that is free — the previous
+   * frame is joined after the next planner turn, which is always before this is
+   * called again — but a pipeline that outlived its join budget is still
+   * running, so the new one chains behind it. The offscreen document's face
+   * detectors are module singletons, and a second frame processed through a
+   * detector the first is mid-way through using is exactly the kind of quiet
+   * corruption this project treats as a privacy bug rather than a glitch.
+   *
+   * Queuing delays EVIDENCE only: this function is fire-and-forget, so no
+   * planner turn ever waits on it.
+   */
+  function startFrameAudit(
+    domDetections: Array<{ kind: string; confidence: number }>,
+    /** `FRAME_LABEL_DEFERRED` after an action, `FRAME_LABEL_OPENING` at the start. */
+    label: string,
+  ): void {
+    const previous = pendingFrameAudit;
+    const settled = previous ? previous.then(() => undefined, () => undefined) : Promise.resolve();
+    pendingFrameAudit = settled
+      .then(() => runFrameAudit(domDetections, "", label))
+      .then((outcome) => (outcome ? { summary: outcome.summary } : null))
+      .catch(() => null);
+    frameAuditDelivered = false;
+  }
+
+  /**
+   * Wait for the in-flight evidence pipeline and return its line, or "".
+   *
+   * Called after a planner turn — the point at which the pipeline has had the
+   * whole turn to finish in parallel with it, so the wait is normally free.
+   * The line is delivered AT MOST ONCE (`frameAuditDelivered`, set before the
+   * wait so a second join cannot re-deliver it, and so a wedged pipeline is not
+   * re-awaited by every later turn).
+   */
+  async function joinFrameAudit(): Promise<string> {
+    const pending = pendingFrameAudit;
+    if (!pending || frameAuditDelivered) return "";
+    frameAuditDelivered = true;
+    const outcome = await joinEvidence(pending, FRAME_AUDIT_WAIT_MS);
+    return outcome?.summary ?? "";
+  }
+
+  /**
+   * Await a frame the planner actually reads, with a ceiling.
+   *
+   * Used by the two sites whose output goes INTO a planner turn (the opening
+   * frame and, with vision on, the post-action frame). `joinEvidence` collapses
+   * "the pipeline finished with nothing" and "the pipeline never finished" into
+   * the same null, so the result is wrapped: the callers must be able to tell a
+   * frame that had nothing to report from a capture that wedged, because only
+   * the second one is worth telling the user about.
+   */
+  async function awaitFrame(
+    run: Promise<{ observation: string } | null>,
+  ): Promise<{ kind: "done"; value: { observation: string } | null } | { kind: "timeout" }> {
+    const settled = await joinEvidence(run.then((value) => ({ value })), FRAME_AUDIT_WAIT_MS);
+    return settled ? { kind: "done", value: settled.value } : { kind: "timeout" };
+  }
+
+  /** One honest line when a frame the planner needed did not arrive in time. */
+  function noteFrameTimeout(where: string): void {
+    emit({
+      kind: "entry",
+      entry: {
+        id: nextId(),
+        role: "system",
+        text:
+          `Frame capture (${where}) did not finish within ${Math.round(FRAME_AUDIT_WAIT_MS / 1000)}s — ` +
+          `continuing without a visual description of that frame. The redaction pipeline keeps ` +
+          `running and still files its ledger entry and audit record.`,
+      },
+    });
+  }
+
+  /**
+   * Report frame evidence that was joined but never handed to a planner turn.
+   *
+   * The line is joined AFTER a planner turn and delivered on that turn's first
+   * tool result — so a turn that ends the run (a final answer, a refusal, Stop)
+   * has nowhere to carry it. Dropping it silently would take the ONLY
+   * planner-visible record of that frame out of the run with no trace, which is
+   * exactly the class of quiet omission this codebase treats as a bug. The
+   * ledger and the audit panel do not depend on this — the pipeline filed those
+   * itself — so this is about the transcript telling the whole story.
+   */
+  function reportUndeliveredFrameNote(): void {
+    if (!carriedFrameNote) return;
+    const note = carriedFrameNote;
+    carriedFrameNote = "";
+    emit({
+      kind: "entry",
+      entry: { id: nextId(), role: "system", text: `Last frame audit: ${note}` },
+    });
   }
 
   // ── Privacy Budget Ledger ──
@@ -521,6 +818,16 @@ export async function runTask(
   /** Elements of the snapshot the model most recently saw — used to resolve
    * stale element ids by role+name without burning a planner round trip. */
   let lastRenderedElements: Array<{ id: number; role: string; name: string }> = [];
+  /**
+   * The page read `lastRenderedElements` came from.
+   *
+   * Element ids are positional, so the ids in a tool call are only meaningful
+   * against the read the model was shown. Carrying that read's generation lets
+   * the page refuse an id from an earlier one (see act.ts resolve) and lets the
+   * loop tell "this number still means the same control" apart from "this
+   * number now means something else".
+   */
+  let lastRenderedGeneration: number | undefined;
 
   // Apply privacy pipeline to initial snapshot.
   const pageType = classifyPageType(tab.url ?? "", tab.title ?? "", snapshot?.text ?? "");
@@ -557,7 +864,26 @@ export async function runTask(
     });
   }
 
-  let piiTotal = 0;
+  // The run's redactions, counted by CHANNEL and never summed until reported.
+  //
+  // One variable held both halves, and the two processes tallied from different
+  // sources: this loop counted DOM items + frame regions, while the audit chip
+  // summed only frame regions, and only over the frames its entry buffer still
+  // held (it evicts the middle of a long run). A single run therefore reported
+  // 231 "items redacted", 227 "Redacted" and 2 "Vault Tokens" on three surfaces.
+  // Keeping the parts apart makes `total === pageItems + frameRegions` true by
+  // construction and lets every surface show the same decomposition.
+  let piiPageItems = 0;
+  let piiFrameRegions = 0;
+  /** The tally as it stands now — reported live so the panel never has to guess. */
+  const currentTally = () => redactionTally(piiPageItems, piiFrameRegions, tokenizer.size);
+  const reportCurrentTally = (): void => {
+    try {
+      reportTally?.(currentTally());
+    } catch {
+      // Reporting totals is evidence, never a reason to fail a run.
+    }
+  };
   const mlFlags = {
     ner: settings.ml?.ner !== false,
     guard: settings.ml?.guard !== false,
@@ -727,7 +1053,8 @@ export async function runTask(
       ledgerRecordRedaction(piiCount, "dom").catch(() => {});
     }
 
-    piiTotal += piiCount;
+    piiPageItems += piiCount;
+    reportCurrentTally();
 
     // Track PII detections for experience memory.
     for (const det of detections) {
@@ -780,100 +1107,43 @@ export async function runTask(
     }
   }
 
-  // Capture initial screenshot through privacy pipeline (if available).
-  if (captureScreenshot) {
-    try {
-      const screenshotResult = await captureScreenshot(controller.tabId);
-      if (screenshotResult) {
-        const processed = screenshotResult.processed;
-        const visualDetections = processed.detections.map((d) => ({
-          kind: d.kind,
-          label: d.label,
-          confidence: d.confidence,
-          box: d.box,
-        }));
-        const verification = processed.verification;
-        noteVerification(verification);
-
-        // Ledger: visual detections + redaction + re-OCR verification proof.
-        if (visualDetections.length > 0) {
-          recordDetections(visualDetections.map((d) => ({ ...d, method: "visual" }))).catch(() => {});
-        }
-        if (processed.redactedCount > 0) {
-          ledgerRecordRedaction(processed.redactedCount, "visual").catch(() => {});
-        }
-        if (verification && verification.regionsChecked > 0) {
-          ledgerRecordVerification(verification.verified, verification.regionsChecked, verification.leakedPatterns.length).catch(() => {});
-        }
-
-        // Track visual detections in experience memory too (faces, avatars).
-        for (const det of visualDetections) {
-          trackedPII.push({
-            kind: det.kind,
-            method: "visual",
-            outcome: "true_positive",
-            confidence: det.confidence,
-          });
-        }
-        piiTotal += processed.redactedCount;
-
-        // Optional VLM vision: only the redacted screenshot leaves. Its
-        // description rides in the first planner turn so the agent genuinely
-        // sees the screen before planning a single action. This runs BEFORE
-        // the audit record so the panel can say whether the frame really
-        // shipped instead of assuming it did.
-        let shippedToModel = false;
-        if (visionEnabled && visionApiKey && !signal.aborted) {
-          const described = await observeScreen(processed, "");
-          initialVisionNote = described.text;
-          shippedToModel = described.shipped;
-        }
-
-        // Record for privacy audit — DOM textual detections AND visual ones,
-        // so the panel shows every PII item this snapshot handled.
-        recordAudit?.({
-          original: screenshotResult.original,
-          redacted: processed.redactedDataUrl,
-          detections: [...visualDetections, ...auditFromDetections(lastDomDetections)],
-          tokens: tokenizer.getTokenSummary(),
-          redactedCount: processed.redactedCount,
-          shipped: shippedToModel,
-          verification,
-        });
-      }
-    } catch {
-      // Screenshot capture is optional — DOM perception still works.
-    }
+  // Capture the opening frame through the privacy pipeline (if available).
+  //
+  // The SAME two waiting policies as the post-action site, for the same reason:
+  //
+  //   VISION ON — the frame's description is what the first planner turn
+  //   reasons about, so it is awaited. Bounded (see FRAME_AUDIT_WAIT_MS):
+  //   this site is the one place a wedged capture could hang a run before the
+  //   model was ever asked anything, and it has no planner turn to hide behind.
+  //
+  //   VISION OFF — nothing about this frame reaches the planner either. It is
+  //   started and joined after the first planner turn, like every post-action
+  //   frame, so the first planner call of a run stops paying 1.2-6.5 s of local
+  //   pixel work for evidence it never reads.
+  //
+  // No summary label in the awaited case: the opening frame is not part of an
+  // action's observation, and its VLM description becomes `initialVisionNote`.
+  if (
+    frameNeedsPlannerWait({ visionEnabled, hasVisionKey: visionApiKey !== "", aborted: signal.aborted })
+  ) {
+    const opening = await awaitFrame(runFrameAudit(lastDomDetections, "", ""));
+    if (opening.kind === "done" && opening.value) initialVisionNote = opening.value.observation;
+    if (opening.kind === "timeout") noteFrameTimeout("opening frame");
+  } else {
+    startFrameAudit(lastDomDetections, FRAME_LABEL_OPENING);
   }
 
-  // Tokenize PII in the user's task (same vault as page PII).
-  // This ensures the LLM sees <ORG_3> in both the task and the page.
-  const { task: tokenizedTask, tokenCount: taskTokenCount, newEntries: taskTokens } =
-    tokenizer.tokenizeTask(task);
-  if (taskTokenCount > 0) {
-    // Name what was taken, in masked form. "tokenized 1 PII item" left the user
-    // unable to tell whether PRY had redacted their address or garbled their
-    // instruction — a redaction visible only as a count is indistinguishable
-    // from the agent misreading the request. maskSample keeps the raw value out
-    // of the transcript while making the SUBSTITUTION legible: the user sees
-    // which words of their own sentence the model never received.
-    const shown = taskTokens
-      .slice(0, 4)
-      .map((e) => `"${maskSample(e.original)}" → ${e.token}`)
-      .join(", ");
-    const more = taskTokens.length > 4 ? ` (+${taskTokens.length - 4} more)` : "";
-    emit({
-      kind: "entry",
-      entry: {
-        id: nextId(),
-        role: "system",
-        text:
-          `Task privacy: ${taskTokenCount} value(s) replaced before the model saw your request — ` +
-          `${shown}${more}. The token is swapped back automatically when an action types it, ` +
-          `so the task still uses your real value.`,
-      },
-    });
-  }
+  // Tokenize PII in the user's task (same vault as page PII), so the planner
+  // sees one token vocabulary across the task and the page.
+  //
+  // The REPORT of what was taken is not made here. By the time runTask is
+  // called, the service worker has already tokenized the task and passed the
+  // tokenized string in, so this pass finds nothing new — the line that used to
+  // live here was guarded on a count that is structurally always 0, and never
+  // rendered. It now lives where the substitution actually happens
+  // (service-worker `start`), which is also the only pass that still has the
+  // raw words to name in masked form.
+  const { task: tokenizedTask } = tokenizer.tokenizeTask(task);
 
   // Previous-task memory: a compact, re-tokenized recap of the last few runs
   // so follow-ups ("continue", "also do X on that email") have context. It
@@ -911,19 +1181,11 @@ export async function runTask(
       `\n--- End lessons ---`
     );
   })();
-  const trajectoriesBlock = (() => {
-    const relevant = matchTrajectories(storedTrajectories, domain, pageType);
-    if (relevant.length === 0) return "";
-    return (
-      `--- How similar tasks succeeded here before ---\n` +
-      `These are ROUTES from older, different tasks. Copy the route, never the values: ` +
-      `every name, search term, and parameter below belonged to that older task, not to yours. ` +
-      `If your task omits something (a search term, a recipient), proceed WITHOUT it — ` +
-      `never borrow a value from these examples.\n\n` +
-      relevant.map((t) => `Task: ${t.task}\nSteps: ${t.steps}`).join("\n\n") +
-      `\n--- End past successes ---`
-    );
-  })();
+  // The wording here is behavior, so it lives in trajectories.ts as a pure,
+  // tested function (see renderTrajectoryRoutes for why).
+  const trajectoriesBlock = renderTrajectoryRoutes(
+    matchTrajectories(storedTrajectories, domain, pageType),
+  );
 
   // Truncate snapshot to avoid context overflow across all providers.
   if (snapshot && snapshot.elements.length > maxSnapshotElements) {
@@ -938,23 +1200,42 @@ export async function runTask(
     snapshot = { ...snapshot, elements: kept, truncated: true };
   }
 
+  // Everything in the opening message EXCEPT the page read, so that read can be
+  // pruned in place once a fresher one exists (see the prune inside the loop).
+  // It is the one block that otherwise re-renders in full on EVERY turn: a page
+  // read is roughly 8-15 KB (up to 80 elements plus the snapshot text budget),
+  // so a six-turn run pays ~50-90 KB of egress and the prefill latency that
+  // comes with it for a page the planner has already moved past.
+  const openingContext =
+    (historyBlock ? `${historyBlock}\n\n` : "") +
+    (lessonsBlock ? `${lessonsBlock}\n\n` : "") +
+    (trajectoriesBlock ? `${trajectoriesBlock}\n\n` : "") +
+    taskPrompt(
+      tokenizedTask,
+      sanitizeUrl(tab.url ?? ""),
+      sanitizeTextPII(tab.title ?? ""),
+      // Built from the live vault, filtered to the tokens that are actually
+      // IN this task, so it always matches what the planner is looking at
+      // and never contains a value — only the category. It used to be built
+      // from the entries THIS pass created, which is structurally empty
+      // (the worker already tokenized the task), so the legend the prompt
+      // promised the planner was silently blank.
+      buildTokenLegend(
+        tokenizer.getEntries().filter((e) => tokenizedTask.includes(e.token)),
+      ),
+    );
+
+  const OPENING_PAGE_OMITTED =
+    "\n\n[Opening page snapshot omitted — the newest page read below supersedes it]";
+  const openingVisionNote = initialVisionNote ? `\n\n${initialVisionNote}` : "";
+
   const messages: ConvMessage[] = [
     {
       role: "user",
       content:
-        (historyBlock ? `${historyBlock}\n\n` : "") +
-        (lessonsBlock ? `${lessonsBlock}\n\n` : "") +
-        (trajectoriesBlock ? `${trajectoriesBlock}\n\n` : "") +
-        taskPrompt(
-          tokenizedTask,
-          sanitizeUrl(tab.url ?? ""),
-          sanitizeTextPII(tab.title ?? ""),
-          // Built from the live vault, so it always matches the tokens actually
-          // in the task, and it never contains a value — only the category.
-          buildTokenLegend(taskTokens),
-        ) +
+        openingContext +
         (snapshot ? `\n\n--- Current page ---\n${renderSnapshot(snapshot)}` : "") +
-        (initialVisionNote ? `\n\n${initialVisionNote}` : ""),
+        openingVisionNote,
     },
   ];
   lastRenderedElements = snapshot?.elements ?? [];
@@ -1042,13 +1323,19 @@ export async function runTask(
       (hasSuccessfulActions || trackedActions.length === 0) &&
       finalAnswerGiven;
 
+    // Read the tally BEFORE the vault is cleared: the token population is part
+    // of the run's evidence, and `tokenizer.clear()` at the end of this handler
+    // would report zero tokens for a run that created two.
+    const tally = currentTally();
+    reportCurrentTally();
+
     emit({
       kind: "entry",
       entry: {
         id: nextId(),
         role: "system",
         text:
-          `Task ended. Total PII items redacted: ${piiTotal}. ` +
+          `Task ended. ${describeRedactionTally(tally)}. ` +
           (sanitizeCtx.ruleCount > 0 || falsePositiveCount > 0
             ? `Learning: ${sanitizeCtx.ruleCount} rule(s) consulted, ${falsePositiveCount} false positive(s) filtered. `
             : "") +
@@ -1070,7 +1357,7 @@ export async function runTask(
       actions: trackedActions,
       taskSuccess,
       durationMs: Date.now() - runStartTime,
-      piiRedacted: piiTotal,
+      piiRedacted: tally.total,
       estimatedTokens,
       rulesApplied: sanitizeCtx.ruleCount,
       egressBytes: sessionEgressBytes,
@@ -1093,8 +1380,11 @@ export async function runTask(
   for (let step = 0; step < settings.maxSteps; step++) {
     if (signal.aborted) { finishTask(); return; }
 
-    // The model plans against the snapshot rendered in the previous turn.
+    // The model plans against the snapshot rendered in the previous turn, and
+    // its ids are only meaningful against THAT read — so the read is recorded
+    // with them.
     lastRenderedElements = snapshot?.elements ?? [];
+    lastRenderedGeneration = snapshot?.generation;
 
     // Loop detection — a stuck planner gets one chance to act on advice before
     // the run is stopped, because "keep re-reading the page" is usually a
@@ -1150,7 +1440,11 @@ export async function runTask(
         // through the same last-moment path the LLM actions use, so a typed
         // value like an email is real by execution time, not "<CRED_1>".
         const detInput = resolveTokens(detResult.action.input);
-        const detAction = { ...detResult.action, input: detInput };
+        const detAction = {
+          ...detResult.action,
+          input: detInput,
+          snapshotGeneration: snapshot?.generation,
+        };
         const detId = nextId();
         emit({
           kind: "entry",
@@ -1399,7 +1693,7 @@ export async function runTask(
 
     // Honest, reason-specific failure text (see turnCutShortMessage).
     const turnCutShortMessage = (
-      reason: "silent" | "ceiling" | "deliberation",
+      reason: "silent" | "ceiling" | "deliberation" | "degenerate" | "salad",
       liveness: TurnLiveness,
       waitedMs: number,
     ): string => turnCutShortMessageFor(planner.label, reason, liveness, waitedMs, firstOutputBudgetMs);
@@ -1451,9 +1745,17 @@ export async function runTask(
         return;
       }
       if (seconds * 1000 < 5_000) return;
+      // "no tokens yet" on its own reads as a frozen panel, and the reported
+      // complaint about this line was exactly that: a status telling the user
+      // nothing they can act on while a slow provider streams nothing. Past the
+      // grace window it says who is late and what the way out is. A turn that
+      // has produced NOTHING gets cut at the first-output budget regardless
+      // (see withTurnBudget), so this is not a hang the user has to sit out.
       const thought = thoughtChars > 0
         ? ` · model is reasoning (${thoughtChars.toLocaleString()} chars so far)`
-        : " · no tokens yet";
+        : seconds >= 30
+          ? ` · no tokens yet — the provider has not sent its first token (Stop cancels)`
+          : " · no tokens yet";
       const text = `Waiting on the planner — ${seconds}s${thought}`;
       if (!waitEntryId) {
         waitEntryId = nextId();
@@ -1507,11 +1809,17 @@ export async function runTask(
             // thorough, only for being dead.
             liveness.lastEventAt = performance.now();
             liveness.events++;
+            // …and it joins the degeneration tail. This channel is where the
+            // reported runaway arrived: NIM/Llama models stream
+            // chain-of-thought through delta.content, so a content-channel loop
+            // scores zero on the reasoning signal.
+            recordStreamedOutput(liveness, delta);
             onText(delta);
           },
           onThought: (delta) => {
             liveness.lastEventAt = performance.now();
             liveness.events++;
+            recordStreamedOutput(liveness, delta);
             liveness.reasoningChars += delta.length;
             if (liveness.reasoningStartedAt === 0) {
               liveness.reasoningStartedAt = performance.now();
@@ -1572,7 +1880,13 @@ export async function runTask(
       // the same slow model and gets cut the same way. Retrying it is what
       // turned "this model reasons slowly" into an endless "retrying once…"
       // loop with the run never reaching a terminal state.
-      const cutWhileStreaming = firstTurnLiveness.ended === "ceiling";
+      // A salad cut joins the ceiling and loop cuts: the model was answering
+      // and what it answered was unusable, so re-sending the same prompt buys
+      // the same garbage. Only a genuine silence is worth one retry.
+      const cutWhileStreaming =
+        firstTurnLiveness.ended === "ceiling" ||
+        firstTurnLiveness.ended === "degenerate" ||
+        firstTurnLiveness.ended === "salad";
       const deliberated = firstTurnLiveness.ended === "deliberation";
 
       // A deliberation cut is steered, not failed: the model has everything it
@@ -1597,6 +1911,16 @@ export async function runTask(
       } else if (!isRetryablePlannerError(firstMessage) || cutWhileStreaming) {
         settleWait("failed");
         errorCount++;
+        // A collapse cut has the same display problem as the final-answer guard
+        // further down: the deltas were already painted into the answer card, so
+        // the transcript would show the glitch as PRY's answer directly above a
+        // notice saying it is not an answer. Discard it first.
+        if (
+          opened &&
+          (firstTurnLiveness.ended === "salad" || firstTurnLiveness.ended === "degenerate")
+        ) {
+          emit({ kind: "patch", id: entryId, replace: true, text: DISCARDED_STREAM_NOTE });
+        }
         emit({
           kind: "entry",
           entry: { id: nextId(), role: "error", text: firstMessage },
@@ -1654,7 +1978,28 @@ export async function runTask(
       }
     }
 
-    messages.push({ role: "assistant", text: turn.text, toolCalls: turn.toolCalls });
+    // ─── Join the previous action's audit-only frame pipeline ───
+    //
+    // The wait is free HERE and only here: the pipeline was started right after
+    // the previous action, and this line runs after the planner turn that
+    // overlapped it. Joining it where it is started — which is what this code
+    // used to do implicitly by awaiting the capture inline — is what serialised
+    // local pixel work with every planner call.
+    //
+    // The flushed line describes the PREVIOUS step's frame, so it is labelled
+    // as such when it is handed to the planner below.
+    carriedFrameNote = await joinFrameAudit();
+
+    // Replay is clamped: whatever the model wrote comes back to it on every
+    // later turn, so an unbounded monologue is paid for repeatedly — and a
+    // model that already rambled will happily continue its own ramble. Turns
+    // that end the run (no tool calls) never reach this line, so a real answer
+    // is never truncated.
+    messages.push({
+      role: "assistant",
+      text: clampAssistantTextForHistory(turn.text),
+      toolCalls: turn.toolCalls,
+    });
 
     // Narration was display-capped above. Tool-call turns stay short (the
     // step card already says what happened); final answers deliver the rest
@@ -1663,6 +2008,37 @@ export async function runTask(
     // would duplicate text. When narration never opened the card (all
     // whitespace flushes), a patch would target a node the panel does not
     // have and the answer would be silently dropped — open the card instead.
+    // A turn that produced glitch text instead of language must never be
+    // presented as the answer. The watchdog above catches this while the turn is
+    // still streaming; this catches a salad that finished before a tick, and it
+    // is what keeps a run from reporting a task it never performed as finished
+    // (the live shape: zero tool calls, a wall of punctuation, "Task ended.").
+    if (turn.stopReason !== "refusal" && turn.toolCalls.length === 0 && isWordSalad(turn.text)) {
+      errorCount++;
+      // The stream reached the panel as it arrived, so a card may already be
+      // showing the glitch as PRY's answer — with a Copy button. Replace it: the
+      // run is about to say this text is not an answer, and leaving it on screen
+      // would be the transcript contradicting itself.
+      if (opened) {
+        emit({ kind: "patch", id: entryId, replace: true, text: DISCARDED_STREAM_NOTE });
+      }
+      emit({
+        kind: "entry",
+        entry: {
+          id: nextId(),
+          role: "error",
+          text:
+            `The planner (${planner.label}) answered with text that is not language — ` +
+            `${nonLatinLetterScripts(turn.text).length} scripts mixed into punctuation fragments — ` +
+            `so it is not shown as the task's result. No action was taken on the page this turn. ` +
+            `Rerun, or switch to a steadier model (Groq openai/gpt-oss-20b) in the options.`,
+        },
+      });
+      reportUndeliveredFrameNote();
+      finishTask();
+      return;
+    }
+
     if (turn.stopReason !== "refusal" && turn.toolCalls.length === 0) {
       const full = tokenizer.redactValues(turn.text);
       if (full.trim()) {
@@ -1689,13 +2065,17 @@ export async function runTask(
           text: `The model declined this request (${turn.refusal ?? "unspecified"}).`,
         },
       });
+      reportUndeliveredFrameNote();
       finishTask();
       return;
     }
 
-    // No tools left to call — the model has given its final answer.
+    // No tools left to call — the model has given its final answer. This turn
+    // has no tool result to carry the joined frame evidence (see the join
+    // above), so it is reported here instead of being dropped.
     if (turn.toolCalls.length === 0) {
       finalAnswerGiven = true;
+      reportUndeliveredFrameNote();
       finishTask();
       return;
     }
@@ -1705,7 +2085,9 @@ export async function runTask(
     for (const call of turn.toolCalls) {
       // Stop must unwind through finishTask (vault clear, running=false,
       // experience emit) — a bare return freezes the panel on RUNNING forever.
-      if (signal.aborted) { finishTask(); return; }
+      // The joined frame evidence has not been handed to a planner turn yet at
+      // this point, so it is reported rather than lost with the run.
+      if (signal.aborted) { reportUndeliveredFrameNote(); finishTask(); return; }
 
       const stepId = nextId();
 
@@ -1727,16 +2109,25 @@ export async function runTask(
       // detection still works on the tokenized snapshot (name/role/attrs never
       // carry the value), so moving resolution first loses nothing.
 
-      // VALIDATE: reject element IDs the client never sent.
-      // When stale, auto-receive and inject fresh snapshot to save an LLM round trip.
+      // VALIDATE: reject element IDs the client never sent, and ids whose read
+      // is no longer the page's. When stale, auto-receive and inject a fresh
+      // snapshot to save an LLM round trip.
+      let idGeneration = lastRenderedGeneration;
       const elementId = call.input.element_id;
       if (typeof elementId === "number") {
-        // The id refers to a snapshot the model saw earlier — the current
-        // snapshot no longer contains it, so look it up in what was last shown.
-        const staleTarget = lastRenderedElements.find((e) => e.id === elementId);
-        const elExists = snapshot?.elements.some((e) => e.id === elementId);
-        if (!elExists) {
-          // Auto-receive: get fresh snapshot so the LLM immediately has new IDs.
+        // The id refers to a read the model was shown. Existence is NOT enough
+        // to trust it: ids are positional indices, so "element 3" can exist in
+        // both the old and the new read while naming two different controls.
+        // What makes the number safe is (a) that it came from the CURRENT read,
+        // or (b) that the element at that index is still the same control.
+        const intended = lastRenderedElements.find((e) => e.id === elementId);
+        let current = snapshot?.elements.find((e) => e.id === elementId);
+        const sameRead =
+          snapshot?.generation === undefined || snapshot.generation === idGeneration;
+
+        if (!current) {
+          // Gone from the page entirely. Re-perceive so the answer carries
+          // current ids, and so a remap has something to match against.
           const freshSnapshot = await controller.snapshot();
           if (freshSnapshot) {
             const { sanitized: freshSanitized } = sanitizeSnapshot(freshSnapshot, sanitizeCtx);
@@ -1752,30 +2143,61 @@ export async function runTask(
             }
           }
 
-          // One-shot auto-retry: if exactly ONE fresh element matches the
-          // stale one by role+name, remap and execute it right away — this is
-          // the "model clicked the same video three times" failure mode, and
-          // it should never cost an extra LLM round trip. Ambiguous matches
-          // (0 or 2+) fall through to the re-perceived error instead.
-          let staleRemapped = false;
-          if (staleTarget && (call.name === "click" || call.name === "type") && snapshot) {
-            const target = staleTarget;
-            const matches = snapshot.elements.filter(
-              (e) => e.role === target.role && e.name === target.name,
-            );
-            if (matches.length === 1) {
-              call.input.element_id = matches[0].id;
-              staleRemapped = true;
-            }
+          current = snapshot?.elements.find((e) => e.id === elementId);
+        }
+
+        // Same number, DIFFERENT control. This is the silent mis-target: the
+        // page re-rendered between the read and the action, the number now sits
+        // on another element, and acting on it would report success for
+        // something nobody asked for.
+        const drifted =
+          current !== undefined &&
+          intended !== undefined &&
+          !sameRead &&
+          (current.role !== intended.role || current.name !== intended.name);
+
+        if (!current || drifted) {
+          // One-shot auto-retry: if exactly ONE element in the current read
+          // matches what the model meant by role+name, remap and execute it
+          // right away — this is the "model clicked the same video three times"
+          // failure mode, and it should never cost an extra LLM round trip.
+          // Ambiguous matches (0 or 2+) fall through to the refusal instead.
+          const canRemap =
+            call.name === "click" || call.name === "type" || call.name === "select";
+          const matches = intended && snapshot && canRemap
+            ? snapshot.elements.filter((e) => e.role === intended.role && e.name === intended.name)
+            : [];
+          const staleRemapped = matches.length === 1;
+          if (staleRemapped) {
+            call.input.element_id = matches[0].id;
+            idGeneration = snapshot?.generation ?? idGeneration;
           }
 
           if (!staleRemapped) {
             const freshRendered = snapshot ? renderSnapshot(snapshot) : "(no snapshot available)";
-            emit({ kind: "patch", id: stepId, text: `Element ${elementId} stale — re-perceived page.`, pending: false });
+            // The refusal names BOTH meanings of the number: "element 3 was not
+            // found" would send the planner hunting for a missing element when
+            // the real problem is that #3 is a different control now.
+            const refusal = drifted
+              ? `Element ${elementId} is a different control now: it was a ${intended!.role} named ` +
+                `${JSON.stringify(intended!.name)}, but the current page has a ${current!.role} named ` +
+                `${JSON.stringify(current!.name)} at that number. Element numbers are positional and the ` +
+                `page changed since it was read, so the action was refused rather than risk acting on ` +
+                `the wrong element. Here are the current elements — pick the right one and retry:`
+              : `Element ${elementId}${intended ? ` (${intended.role} ${JSON.stringify(intended.name)})` : ""} ` +
+                `is no longer on the page. Here are the current elements — pick the right one and retry:`;
+            emit({
+              kind: "patch",
+              id: stepId,
+              text: drifted
+                ? "Refused — that element number now points at a different control."
+                : `Element ${elementId} stale — re-perceived page.`,
+              pending: false,
+            });
             results.push({
               id: call.id,
               isError: true,
-              content: `Element ${elementId} not found. The page changed. Here are the current elements — pick the right one and retry:
+              content: `${refusal}
 
 ${freshRendered}`,
             });
@@ -1785,11 +2207,20 @@ ${freshRendered}`,
           emit({
             kind: "patch",
             id: stepId,
-            text: `Element ${elementId} stale — matched "${staleTarget?.name ?? "element"}" (now #${call.input.element_id}); retrying automatically.`,
+            text: drifted
+              ? `Element ${elementId} now sits on ${current?.role ?? "another element"} ${JSON.stringify(current?.name ?? "")} — matched the ${intended!.role} ${JSON.stringify(intended!.name)} at #${call.input.element_id}; retrying automatically.`
+              : `Element ${elementId} stale — matched "${intended?.name ?? "element"}" (now #${call.input.element_id}); retrying automatically.`,
             pending: false,
           });
           // Fall through: the normal VALIDATE → RESOLVE → execute path now
           // runs against the fresh id without another planner round trip.
+        } else if (!sameRead) {
+          // Same number, same control: the positional handle still lands where
+          // the model meant, because the page re-rendered without the ids
+          // shifting under it. Stamp the read that is current now, so the
+          // page's own generation check accepts a valid id instead of refusing
+          // it for having been taken from a read that is merely older.
+          idGeneration = snapshot?.generation ?? idGeneration;
         }
       }
 
@@ -1815,7 +2246,14 @@ ${freshRendered}`,
 
       // RESOLVE: swap tokens → real values from vault (last possible moment).
       const resolvedInput = resolveTokens(call.input);
-      const resolvedAction = { name: call.name as never, input: resolvedInput };
+      // The generation travels with the action so the page can refuse an id
+      // from a read that is no longer current instead of resolving it against
+      // whatever the registry holds now.
+      const resolvedAction = {
+        name: call.name as never,
+        input: resolvedInput,
+        snapshotGeneration: idGeneration,
+      };
 
       // POST-RESOLVE GUARD: any token syntax that survives resolution means
       // the vault could not honor it (vault mismatch, corrupted token text).
@@ -1942,9 +2380,19 @@ ${freshRendered}`,
       // Verify: re-perceive after anything that could have changed the page,
       // then apply the privacy pipeline to the fresh snapshot.
       let observation = safeDetail;
-      const mayHaveChanged = PAGE_ACTIONS.has(call.name)
-        ? call.name !== "find_text" && call.name !== "wait"
-        : true;
+
+      // Evidence from the PREVIOUS action's frame, joined after this turn's
+      // planner call (see the join above). Handed over once, on the first tool
+      // result of the turn, and labelled with the step it actually describes —
+      // the snapshot below it is from THIS step, and a reader that mixed the
+      // two would take the frame for the wrong moment.
+      if (carriedFrameNote) {
+        observation = `${carriedFrameNote}\n\n${observation}`;
+        carriedFrameNote = "";
+      }
+      // Read-only actions cannot change pixels, and a re-capture is the most
+      // expensive thing this loop does (see actionChangesFrame).
+      const mayHaveChanged = actionChangesFrame(call.name);
 
       if (mayHaveChanged) {
         const fresh = result.snapshot ?? (await controller.snapshot());
@@ -1973,7 +2421,8 @@ ${freshRendered}`,
             const off = snapshot.elements.filter((e) => e.attrs?.offscreen);
             snapshot = { ...snapshot, elements: [...vis, ...off].slice(0, maxSnapshotElements), truncated: true };
           }
-          piiTotal += piiCount;
+          piiPageItems += piiCount;
+          reportCurrentTally();
 
           // Track PII detections from fresh snapshot.
           for (const det of freshDetections) {
@@ -1995,73 +2444,35 @@ ${freshRendered}`,
           warnIfInjected(fresh, emit);
 
           // Capture screenshot after page change (if available).
+          //
+          // TWO WAITING POLICIES, and the difference is only who reads the
+          // result:
+          //
+          //   VISION ON — the frame (or the VLM's description of it) is what
+          //   the next turn reasons about, so the chain is awaited here.
+          //
+          //   VISION OFF (the default) — not one byte of this frame reaches
+          //   the planner. The work is local evidence: the ledger, the audit
+          //   panel, the run's PII totals and its re-OCR leak findings. It is
+          //   STARTED and left to run in parallel with the planner turn that
+          //   follows, then joined after that turn returns (see the join below
+          //   the assistant push) — because awaiting it here is what put
+          //   1.2-6.5 s of local pixel work in front of every page-changing
+          //   step's planner call.
+          const frameGoesToPlanner = frameNeedsPlannerWait({
+            visionEnabled,
+            hasVisionKey: visionApiKey !== "",
+            aborted: signal.aborted,
+          });
           if (captureScreenshot) {
-            try {
-              const screenshotResult = await captureScreenshot(controller.tabId);
-              if (screenshotResult) {
-                const processed = screenshotResult.processed;
-                const visualDetections = processed.detections.map((d) => ({
-                  kind: d.kind,
-                  label: d.label,
-                  confidence: d.confidence,
-                  box: d.box,
-                }));
-                const verification = processed.verification;
-                noteVerification(verification);
-
-                observation += `\n\n[Screenshot: ${processed.redactedCount} PII redacted]`;
-                if (verification && verification.regionsChecked > 0) {
-                  observation += verification.verified
-                    ? ` [Re-OCR VERIFIED: ${verification.regionsRedacted}/${verification.regionsChecked} regions confirmed redacted]`
-                    : ` [Re-OCR WARNING: ${verification.summary}]`;
-                }
-
-                // Ledger: visual detections + redaction + verification proof.
-                if (visualDetections.length > 0) {
-                  recordDetections(visualDetections.map((d) => ({ ...d, method: "visual" }))).catch(() => {});
-                }
-                if (processed.redactedCount > 0) {
-                  ledgerRecordRedaction(processed.redactedCount, "visual").catch(() => {});
-                }
-                if (verification && verification.regionsChecked > 0) {
-                  ledgerRecordVerification(verification.verified, verification.regionsChecked, verification.leakedPatterns.length).catch(() => {});
-                }
-
-                // Track visual detections in experience memory too (faces, avatars).
-                for (const det of visualDetections) {
-                  trackedPII.push({
-                    kind: det.kind,
-                    method: "visual",
-                    outcome: "true_positive",
-                    confidence: det.confidence,
-                  });
-                }
-                piiTotal += processed.redactedCount;
-
-                // Optional VLM vision: describe the redacted screen for the
-                // planner. Request bytes count toward the honest egress badge.
-                // Run before the audit record so the panel's caption reflects
-                // whether pixels actually left the browser.
-                let shippedToModel = false;
-                if (visionEnabled && visionApiKey && !signal.aborted) {
-                  const described = await observeScreen(processed, observation);
-                  shippedToModel = described.shipped;
-                  observation = described.text;
-                }
-
-                // Record for privacy audit — fresh DOM detections + visuals.
-                recordAudit?.({
-                  original: screenshotResult.original,
-                  redacted: processed.redactedDataUrl,
-                  detections: [...visualDetections, ...auditFromDetections(freshDetections)],
-                  tokens: tokenizer.getTokenSummary(),
-                  redactedCount: processed.redactedCount,
-                  shipped: shippedToModel,
-                  verification,
-                });
-              }
-            } catch {
-              // Screenshot is optional.
+            if (frameGoesToPlanner) {
+              const awaited = await awaitFrame(
+                runFrameAudit(freshDetections, observation, FRAME_LABEL_AWAITED),
+              );
+              if (awaited.kind === "done" && awaited.value) observation = awaited.value.observation;
+              if (awaited.kind === "timeout") noteFrameTimeout("after this action");
+            } else {
+              startFrameAudit(freshDetections, FRAME_LABEL_DEFERRED);
             }
           }
 
@@ -2083,6 +2494,21 @@ ${freshRendered}`,
     // Prune stale DOM snapshots from earlier tool results.
     // The planner only needs the *latest* page state; retaining multiple historical DOM dumps
     // causes massive egress bloat (>100KB), exhausting provider rate limits and stalling inference.
+    //
+    // An action that changed the page produced a fresher read than the one the
+    // run opened with, which makes that opening read stale — and it lives in
+    // messages[0], which the loop below never touches because it only walks
+    // tool results. So a multi-turn run carried TWO full page renders on every
+    // turn where one was current. Prune it only when a fresher read genuinely
+    // exists: a read-only action (find_text, wait) renders nothing, so there the
+    // opening read is still the planner's only view of the page.
+    if (results.some((r) => r.content.includes("\n\n--- Page after this action"))) {
+      const opening = messages[0];
+      if (opening && opening.role === "user" && opening.content.includes("\n\n--- Current page ---")) {
+        opening.content = openingContext + OPENING_PAGE_OMITTED + openingVisionNote;
+      }
+    }
+
     for (const msg of messages) {
       if (msg.role === "tool") {
         for (const res of msg.results) {
@@ -2098,6 +2524,21 @@ ${freshRendered}`,
 
     messages.push({ role: "tool", results });
   }
+
+  // The step cap ended the run, which is the one exit that can arrive while an
+  // audit-only frame pipeline is still in flight (every other exit is preceded
+  // by a planner turn, which joins it). Its redaction count and its re-OCR leak
+  // findings belong in this run's totals and its learning memory, so it is
+  // joined once here — bounded, so a wedged capture cannot hold the run open.
+  //
+  // Deliberately NOT done on the early exits (Stop, a failed planner turn): the
+  // user is waiting to be let out, and the pipeline still files its ledger entry
+  // and audit record on its own either way.
+  // `||` and not `=`: this is also reached when the last planner turn's
+  // evidence was never delivered (the loop ran out of steps before any tool
+  // result could carry it), and overwriting it would drop that frame.
+  carriedFrameNote = carriedFrameNote || (await joinFrameAudit());
+  reportUndeliveredFrameNote();
 
   // Normal loop completion — emit experience.
   finishTask();
@@ -2176,6 +2617,261 @@ const MAX_REASONING_MS = 90_000;
 const MIN_REASONING_CHARS_FOR_TIME_CUT = 1_000;
 
 /**
+ * What an answer card says once its stream has been ruled not-language.
+ *
+ * Streamed text is painted into the card as it arrives, so by the time either
+ * guard (the watchdog's cut, or the final-answer check) can rule on it, the wall
+ * of fragments is already on screen where the answer belongs — with a Copy
+ * button. This replaces it, because a transcript that prints the glitch and then
+ * explains it was not an answer is still showing it as one.
+ */
+const DISCARDED_STREAM_NOTE =
+  "The model's output was discarded — it was punctuation and mixed-script fragments " +
+  "rather than language, so it is not an answer to this task. See the notice below.";
+
+/**
+ * Degeneration guard.
+ *
+ * A small model on a long prompt does not fail loudly, it LOOPS. The reported
+ * failure against `nvidia/nemotron-3.5-lightning-30b-a3b` on a Gmail tab: a
+ * 100 s turn whose output collapsed into "can make it one big things. can make
+ * it. 0 1 can make it one. And can one big things." for thousands of
+ * characters. Nothing already in this budget could see it:
+ *
+ *   - deltas kept arriving, so the silence window never tripped;
+ *   - the deliberation caps sit at 12 000 reasoning chars and only count the
+ *     `onThought` channel — this model streams its chain-of-thought through
+ *     `delta.content` as well (see the note on MAX_NARRATION_CHARS), so a
+ *     content-channel ramble scored zero on the deliberation signal;
+ *   - the run then presented the loop to the user as the answer, spoke it,
+ *     and re-sent it in the next turn's history.
+ *
+ * Duration cannot distinguish a thorough model from a looping one, and neither
+ * can plain repetition frequency: a legitimate table dump really does reuse the
+ * same phrases, and a first attempt at this guard that counted every repeated
+ * word 4-gram flagged a 250-word table of near-identical rows as a runaway.
+ *
+ * Two signals, because loops come in two shapes and neither alone is enough.
+ * Both are measured in the harness against the verbatim reported output, PRY's
+ * system prompt, long narration, and an adversarial table:
+ *
+ *   1. SHORT CYCLE — the same few words come back a handful of words later,
+ *      over and over. A repeat only counts when the same 4-gram recurs within
+ *      DEGENERATION_CYCLE_MAX_WORDS of its last occurrence. The real runaway
+ *      repeats a ~6-word cycle and scores 0.65-0.9; the table dump, whose rows
+ *      are ~22 words apart, scores 0, and the system prompt scores 0.
+ *   2. REPEATED BLOCK — some LONG verbatim stretch appears three or more times
+ *      in the window. This catches a loop with a long period, which signal 1
+ *      deliberately ignores: with a 22-word cycle every 4-gram repeat sits
+ *      outside the short-cycle window, so a model re-emitting the same
+ *      paragraph word-for-word would slip through. Three copies of a 40-word
+ *      block is 120 words of byte-identical text, which no legitimate answer
+ *      produces — and a table, whose rows differ in at least their leading
+ *      value, does not either.
+ */
+const DEGENERATION_WINDOW_CHARS = 4_000;
+/** Shorter than this and the ratio is noise, not evidence. */
+const DEGENERATION_MIN_WORDS = 120;
+const DEGENERATION_REPEAT_RATIO = 0.5;
+const DEGENERATION_GRAM = 4;
+/** Longest gap, in words, at which a 4-gram repeat still reads as a cycle. */
+const DEGENERATION_CYCLE_MAX_WORDS = 16;
+/** Length of the long verbatim block signal 2 looks for. */
+const DEGENERATION_BLOCK_WORDS = 40;
+/** How many copies of that block mark the turn as looping. */
+const DEGENERATION_BLOCK_OCCURRENCES = 3;
+/** Punctuation share at or above which output is measured for word salad. */
+const DEGENERATION_SALAD_PUNCT_DENSITY = 0.25;
+/** Distinct non-Latin scripts that mark a sample as salad rather than prose. */
+const DEGENERATION_SALAD_SCRIPTS = 3;
+
+/**
+ * Longest assistant text replayed to the planner as history.
+ *
+ * The model's own words come back to it every turn, so an unbounded monologue
+ * is paid for on EVERY subsequent turn — both in prompt tokens and in the
+ * model's tendency to continue what it already wrote. A real answer never ends
+ * up here (a turn with no tool calls ends the run); this bounds narration
+ * before a tool call, which is meant to be one line.
+ */
+export const MAX_HISTORY_TEXT_CHARS = 1_200;
+
+/** The recent tail of a stream, capped so the degeneration scan stays cheap. */
+export function tailOf(text: string, windowChars: number = DEGENERATION_WINDOW_CHARS): string {
+  return text.length <= windowChars ? text : text.slice(text.length - windowChars);
+}
+
+/**
+ * Append a streamed delta to the liveness record's rolling tail.
+ *
+ * Exported so the window's behaviour is pinned by the harness rather than
+ * inferred from the loop: the check must see the END of the stream, so the
+ * oldest characters are the ones dropped.
+ */
+export function recordStreamedOutput(liveness: TurnLiveness, delta: string): void {
+  liveness.outputTail = tailOf(liveness.outputTail + delta);
+}
+
+/**
+ * The repeated fraction a loop produces: exits for the harness to report.
+ *
+ * Words are normalised to letters/digits so punctuation and casing cannot hide
+ * a cycle, and the return value is the share of positions whose 4-gram came
+ * back within the short-cycle window.
+ */
+export function degenerationRatio(text: string): number {
+  const words = normaliseWords(text);
+  if (words.length < DEGENERATION_GRAM) return 0;
+
+  const lastSeen = new Map<string, number>();
+  let repeats = 0;
+  let total = 0;
+  for (let i = 0; i + DEGENERATION_GRAM <= words.length; i++) {
+    const gram = words.slice(i, i + DEGENERATION_GRAM).join(" ");
+    total++;
+    const previous = lastSeen.get(gram);
+    if (previous !== undefined && i - previous <= DEGENERATION_CYCLE_MAX_WORDS) repeats++;
+    lastSeen.set(gram, i);
+  }
+  return total === 0 ? 0 : repeats / total;
+}
+
+/**
+ * True when the window contains the same long verbatim block several times.
+ *
+ * The long-period signal: a model re-emitting a paragraph word-for-word. It is
+ * deliberately exact and long, so a table of similar rows — which differs in at
+ * least one value per row — cannot trigger it.
+ */
+export function hasRepeatedBlock(text: string): boolean {
+  const words = normaliseWords(text);
+  if (words.length < DEGENERATION_BLOCK_WORDS * DEGENERATION_BLOCK_OCCURRENCES) return false;
+  const counts = new Map<string, number>();
+  for (let i = 0; i + DEGENERATION_BLOCK_WORDS <= words.length; i++) {
+    const block = words.slice(i, i + DEGENERATION_BLOCK_WORDS).join(" ");
+    const seen = (counts.get(block) ?? 0) + 1;
+    if (seen >= DEGENERATION_BLOCK_OCCURRENCES) return true;
+    counts.set(block, seen);
+  }
+  return false;
+}
+
+/** Lowercased letters/digits only — punctuation and casing cannot hide a loop. */
+function normaliseWords(text: string): string[] {
+  return String(text ?? "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+/**
+ * True when streamed output has collapsed into a repetition loop.
+ *
+ * Pure, and deliberately conservative: it needs a long-enough sample (120
+ * words) AND one of the two signals above, so a long final answer, a code
+ * block, or a table of near-identical rows is not misread as a runaway — see
+ * the adversarial cases in the harness.
+ */
+export function isDegenerateOutput(text: string): boolean {
+  const words = normaliseWords(text);
+  if (words.length < DEGENERATION_MIN_WORDS) return false;
+  return degenerationRatio(text) >= DEGENERATION_REPEAT_RATIO || hasRepeatedBlock(text);
+}
+
+/**
+ * Share of characters that are neither letters, digits nor whitespace.
+ *
+ * Prose runs a few percent, a dense code block about 0.17, a markdown table
+ * about the same. Text that is mostly punctuation is not being written in any
+ * language, which is the failure this measures.
+ */
+export function punctuationDensity(text: string): number {
+  const s = String(text ?? "");
+  if (s.length === 0) return 0;
+  const punct = (s.match(/[^\p{L}\p{N}\s]/gu) ?? []).length;
+  return punct / s.length;
+}
+
+/**
+ * Which letter scripts a sample uses, ignoring Latin and its accented forms.
+ *
+ * Accented Latin (`é`, `ñ`, `ł`) is ordinary European prose and is deliberately
+ * not counted — a French or Polish answer is one language, not several. The
+ * buckets are the big non-Latin blocks: Devanagari, Arabic, CJK/kana/Hangul,
+ * Greek, Cyrillic.
+ */
+export function nonLatinLetterScripts(text: string): string[] {
+  const buckets = new Set<string>();
+  for (const ch of String(text ?? "")) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp <= 0x7f || !/\p{L}/u.test(ch)) continue;
+    if (cp >= 0x0900 && cp <= 0x097f) buckets.add("devanagari");
+    else if (cp >= 0x0600 && cp <= 0x06ff) buckets.add("arabic");
+    else if (
+      (cp >= 0x4e00 && cp <= 0x9fff) ||
+      (cp >= 0x3040 && cp <= 0x30ff) ||
+      (cp >= 0xac00 && cp <= 0xd7af)
+    ) buckets.add("cjk");
+    else if (cp >= 0x0370 && cp <= 0x03ff) buckets.add("greek");
+    else if (cp >= 0x0400 && cp <= 0x04ff) buckets.add("cyrillic");
+  }
+  return [...buckets];
+}
+
+/**
+ * True when output has broken down into glitch text rather than language.
+ *
+ * This is a DIFFERENT failure from the repetition loop above, and the guard that
+ * catches loops cannot see it: a live run against
+ * `nvidia/nemotron-3.5-lightning-30b-a3b` streamed 45 updates of "…people, ))
+ * land, ), λ, łu, …", which has a repetition ratio of 0.000 — every 4-gram
+ * unique — so `isDegenerateOutput` returned false, the turn was accepted as the
+ * final answer, and the run reported the task ended. The task had not been
+ * started (no tool call was ever made).
+ *
+ * Two independent conditions, both measured on the real sample and on the
+ * legitimate outputs an agent actually produces (prose, a markdown table, a
+ * code block, minified JSON, four Latin languages, a two-script translation
+ * answer):
+ *
+ *   - punctuation density ≥ 0.25 — the sample is a quarter punctuation, versus
+ *     0.16 for the worst legitimate sample measured;
+ *   - letters from ≥ 3 non-Latin scripts — the sample is simultaneously
+ *     Devanagari, Arabic, CJK and Greek, which no single answer written by
+ *     anyone or any model is. Legitimate multilingual answers measured 0-2.
+ *
+ * Requiring BOTH is what keeps a table of pipes (0 scripts) and a minified JSON
+ * blob (0.49 punctuation, 0 scripts) out of it, while the observed salad scores
+ * 0.42 and 4. It needs the same 120-word floor, so a short fragment can never
+ * trigger it.
+ */
+export function isWordSalad(text: string): boolean {
+  if (normaliseWords(text).length < DEGENERATION_MIN_WORDS) return false;
+  if (punctuationDensity(text) < DEGENERATION_SALAD_PUNCT_DENSITY) return false;
+  return nonLatinLetterScripts(text).length >= DEGENERATION_SALAD_SCRIPTS;
+}
+
+/**
+ * Clamp assistant text before it is replayed as conversation history.
+ *
+ * Truncation happens on a word boundary and is announced, so the model is
+ * never handed half a word and never mistakes a cut for things it did not
+ * write. Whitespace-only text collapses to "" (nothing to replay).
+ */
+export function clampAssistantTextForHistory(
+  text: string,
+  maxChars: number = MAX_HISTORY_TEXT_CHARS,
+): string {
+  const raw = String(text ?? "").trim();
+  if (raw.length <= maxChars) return raw;
+  const cut = raw.slice(0, maxChars);
+  const boundary = cut.lastIndexOf(" ");
+  const kept = boundary > maxChars * 0.5 ? cut.slice(0, boundary) : cut;
+  return `${kept.trimEnd()} …[truncated for length]`;
+}
+
+/**
  * What the steered turn is told. Short, imperative, and it names the two
  * handles this situation actually needs: act now, and use click_text when the
  * target has no element id (which is the usual reason for the deliberation in
@@ -2224,8 +2920,14 @@ interface TurnLiveness {
   reasoningChars: number;
   /** When reasoning started; 0 while the turn has produced none. */
   reasoningStartedAt: number;
+  /**
+   * Rolling tail of everything this turn has streamed, whichever channel it
+   * arrived on. The degeneration guard reads it: a content-channel ramble is
+   * invisible to `reasoningChars`, and this is the only signal that catches one.
+   */
+  outputTail: string;
   /** How the turn ended; the retry policy reads this. */
-  ended: "settled" | "silent" | "ceiling" | "deliberation";
+  ended: "settled" | "silent" | "ceiling" | "deliberation" | "degenerate" | "salad";
 }
 
 export function newTurnLiveness(): TurnLiveness {
@@ -2234,6 +2936,7 @@ export function newTurnLiveness(): TurnLiveness {
     events: 0,
     reasoningChars: 0,
     reasoningStartedAt: 0,
+    outputTail: "",
     ended: "settled",
   };
 }
@@ -2248,16 +2951,41 @@ export function newTurnLiveness(): TurnLiveness {
  *     while it was still streaming is not a hiccup — the retry would re-send the
  *     same prompt to the same slow model and be stopped identically, which is
  *     exactly how a slow reasoning model produced an endless "retrying once…"
- *     loop instead of an actionable error.
+ *     loop instead of an actionable error;
+ *   - `degenerate` is the same shape of failure reached faster: the model WAS
+ *     answering, it just stopped saying anything new, so a retry re-sends the
+ *     prompt that caused the loop. Its wording therefore avoids every retry
+ *     keyword too, and names the model choice as the fix.
  */
 export function turnCutShortMessageFor(
   plannerLabel: string,
-  reason: "silent" | "ceiling" | "deliberation",
+  reason: "silent" | "ceiling" | "deliberation" | "degenerate" | "salad",
   liveness: TurnLiveness,
   waitedMs: number,
   firstOutputBudgetMs: number,
 ): string {
   const waited = Math.round(waitedMs / 1000);
+  if (reason === "salad") {
+    // Retry keywords are deliberately absent, for the same reason the loop cut
+    // avoids them: the model WAS answering, and what it answered was unusable,
+    // so re-sending the prompt buys the same text back.
+    return (
+      `The planner (${plannerLabel}) stopped writing language after ${waited}s — the output was ` +
+      `punctuation and mixed-script fragments rather than sentences, so the turn was cut before the ` +
+      `rest of the run inherited it. This is a model failure on a prompt this size, so the prompt is ` +
+      `not re-sent and no action was taken. Rerun, or switch to a steadier model ` +
+      `(Groq openai/gpt-oss-20b) in the options.`
+    );
+  }
+  if (reason === "degenerate") {
+    return (
+      `The planner (${plannerLabel}) collapsed into a repetition loop after ${waited}s — it was ` +
+      `producing text but nothing new, so the turn was stopped before the rest of the run ` +
+      `inherited it. This is a model failure on a prompt this size, so the prompt is not ` +
+      `re-sent and the loop is not carried into the next turn. Rerun, or switch to a ` +
+      `steadier model (Groq openai/gpt-oss-20b) in the options.`
+    );
+  }
   if (reason === "deliberation") {
     // Deliberately free of the retry keywords: this is not a transient
     // hiccup, it is the model not converging. The caller steers instead of
@@ -2301,6 +3029,59 @@ export function turnCutShortMessageFor(
  * `maxMs` bounds the whole turn. The original promise's later settle is
  * absorbed so nothing is unhandled.
  */
+/**
+ * Whether a frame captured after an action must be COMPLETE before the next
+ * planner turn, or may run alongside it.
+ *
+ * The question is not "is the pipeline important" — it always is — but "who
+ * reads its output next":
+ *
+ *   - VISION ON: the redacted frame, or the VLM's description of it, is what
+ *     the next turn reasons about, so the pipeline is on the critical path and
+ *     must finish first.
+ *   - VISION OFF (the default): nothing about the frame reaches the planner.
+ *     The output is local evidence — the ledger entry, the audit panel, the
+ *     run's PII totals and its re-OCR leak findings — and it is joined after
+ *     the planner turn instead of in front of it.
+ *
+ * Pure and exported so both halves are pinned by the harness. The "vision on"
+ * direction is the load-bearing one: deferring an awaited frame would hand the
+ * planner a description of a screen from before the action it just took.
+ */
+export function frameNeedsPlannerWait(input: {
+  visionEnabled: boolean;
+  hasVisionKey: boolean;
+  aborted: boolean;
+}): boolean {
+  return input.visionEnabled && input.hasVisionKey && !input.aborted;
+}
+
+/**
+ * Join deferred evidence that is not allowed to block if it misbehaves.
+ *
+ * Resolves with the work's value when it settles inside `timeoutMs`, and with
+ * `null` when it does not — or when it fails, because a pipeline that throws
+ * must never take the run down from a join site whose whole purpose is to fold
+ * in a line of evidence. The caller keeps a handle to the work either way, so a
+ * timeout only skips the LINE: the pipeline still finishes and still files its
+ * own ledger entry and audit record.
+ */
+export async function joinEvidence<T>(pending: Promise<T | null>, timeoutMs: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      pending.catch(() => null),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+  } finally {
+    // Never leave the safety-net timer behind: a live timer keeps a service
+    // worker awake and, on the last join of a run, delays shutdown for nothing.
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
 export function withTurnBudget<T>(
   promise: Promise<T>,
   liveness: TurnLiveness,
@@ -2313,13 +3094,22 @@ export function withTurnBudget<T>(
     maxReasoningChars?: number;
     /** …or that reasons for this long, once it has said something substantial. */
     maxReasoningMs?: number;
-    messageFor: (reason: "silent" | "ceiling" | "deliberation", liveness: TurnLiveness, waitedMs: number) => string;
+    /** Set false to run a turn whose output is expected to repeat (tests). */
+    detectDegeneration?: boolean;
+    messageFor: (
+      reason: "silent" | "ceiling" | "deliberation" | "degenerate" | "salad",
+      liveness: TurnLiveness,
+      waitedMs: number,
+    ) => string;
   },
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const startedAt = performance.now();
     let done = false;
-    const finish = (reason: "silent" | "ceiling" | "deliberation", waitedMs: number): void => {
+    const finish = (
+      reason: "silent" | "ceiling" | "deliberation" | "degenerate" | "salad",
+      waitedMs: number,
+    ): void => {
       done = true;
       clearInterval(ticker);
       liveness.ended = reason;
@@ -2331,6 +3121,34 @@ export function withTurnBudget<T>(
       if (liveness.events === 0) {
         if (waited > opts.firstOutputMs) finish("silent", waited);
         return;
+      }
+      // A turn that has collapsed is not going to converge, and it is checked
+      // FIRST so the user gets the junk stopped in seconds rather than sitting
+      // through the 90 s deliberation cut or the 210 s ceiling — measured at
+      // 100 s of rambling before this guard existed.
+      //
+      // It is also checked BEFORE the silence window, because the collapse is
+      // the finding and any silence after it is a symptom. The reported shape:
+      // 45 streamed updates of "…people, )) land, ), λ, łu, …" followed by 30 s
+      // of quiet. The idle branch read the quiet first, called the turn a
+      // stall, and — because mid-stream silence carries the retryable "stopped
+      // streaming" wording — re-sent the prompt that had produced the glitch,
+      // which produced it again. Reading the tail first turns that into one
+      // salad cut with no retry.
+      if (opts.detectDegeneration !== false) {
+        // Word salad is checked before the loop because it is the failure the
+        // loop guard cannot see at all: every 4-gram is unique, so a sample that
+        // is pure glitch scores 0 on the repetition signal while it is
+        // unmistakably not language. Telling the user "repetition loop" for that
+        // would be a wrong explanation of a right cut.
+        if (isWordSalad(liveness.outputTail)) {
+          finish("salad", waited);
+          return;
+        }
+        if (isDegenerateOutput(liveness.outputTail)) {
+          finish("degenerate", waited);
+          return;
+        }
       }
       if (performance.now() - liveness.lastEventAt > opts.idleMs) {
         finish("silent", waited);

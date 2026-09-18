@@ -44,6 +44,48 @@ export function containsVaultToken(text: string): boolean {
   return /<[A-Z]+_\d+>/.test(String(text ?? ""));
 }
 
+/** Blunt sweep used only as a last resort (see toSpeakable). */
+export function stripVaultTokens(text: string): string {
+  return String(text ?? "").replace(/<[A-Z]+_\d+>/g, SPOKEN_REDACTED);
+}
+
+/** What the speaker should actually be handed, plus what it cost. */
+export interface SpeakableText {
+  /** Guaranteed token-free, markdown-flattened, length-capped. */
+  text: string;
+  /** How many vault tokens were pronounced as "redacted". */
+  redactedTokens: number;
+}
+
+/**
+ * The ONE decision about what may be spoken aloud.
+ *
+ * Why this function exists instead of the guard that used to live in
+ * `voice-controller.speak()`: the controller refused to speak at all when the
+ * text contained a token, and it refused BEFORE `speakSafeTransform` ran — so
+ * the transform whose entire documented job is "pronounce tokens as [redacted]"
+ * was unreachable exactly when it was needed. The reported symptom was a
+ * transcript line reading "Voice: Refusing to speak: raw vault token in
+ * assistant text (this is a bug, please report)" instead of audio, on any run
+ * where the model quoted a token back (the Gmail tab title alone carries
+ * `<CRED_1>`, so this is the common case, not an edge case).
+ *
+ * A token in the text is not a reason to go silent — it is the reason the
+ * redaction below exists. Refusing is now impossible by construction: the
+ * transform runs first, and anything it somehow missed is swept afterwards, so
+ * `containsVaultToken(result.text)` is always false.
+ */
+export function toSpeakable(text: string, maxChars = 600): SpeakableText {
+  const raw = String(text ?? "");
+  const redactedTokens = (raw.match(/<[A-Z]+_\d+>/g) ?? []).length;
+  const transformed = speakSafeTransform(raw, maxChars);
+  // Defense in depth: `speakSafeTransform` strips tokens before it caps, so
+  // this only fires if its pattern is ever changed out from under this. Even
+  // then, the speaker gets clean text rather than guaranteed silence.
+  const text2 = containsVaultToken(transformed) ? stripVaultTokens(transformed) : transformed;
+  return { text: text2, redactedTokens };
+}
+
 /**
  * Convert Float32 audio samples [-1, 1] to 16-bit PCM (little-endian bytes),
  * the format Scribe Realtime expects after base64 encoding.
@@ -108,6 +150,107 @@ export const TTS_OUTPUT_FORMAT = "pcm_16000"; // 16 kHz mono PCM for streaming p
  * nothing to do with the user's setup. Premade voices work on the free plan.
  */
 export const DEFAULT_TTS_VOICE_ID = "SAz9YHcvj6GT2YYXdXww"; // River — relaxed, neutral
+
+/**
+ * Why a microphone request failed, as far as a caller can tell.
+ *
+ * Chrome reports every one of these as some flavour of "Requested device not
+ * found" or "Permission denied", and the fixes are completely different — so
+ * the panel used to show the raw error and the user had no next move. The
+ * causes are distinguishable at runtime, and this is the decision table.
+ */
+export type MicFailureKind =
+  /** The extension build never requested audioCapture — getUserMedia cannot work. */
+  | "missing-permission"
+  /** The permission is declared, but no audio input device is visible. */
+  | "no-device"
+  /** The user (or a previous silent dismissal) blocked mic access. */
+  | "blocked"
+  /** A device exists but the OS or another app holds it. */
+  | "busy"
+  /** Device is fine; the requested constraints are not supported by it. */
+  | "constraints"
+  | "unknown";
+
+export interface MicFailureSignals {
+  /** Error `name`, e.g. `NotFoundError`, `NotAllowedError`, `NotReadableError`. */
+  name?: string;
+  /** Raw message, shown verbatim as the last resort. */
+  message?: string;
+  /** Does THIS build declare `audioCapture` in its manifest? */
+  hasCapturePermission: boolean;
+  /** `audioinput` entries visible to the page, or null when enumeration failed. */
+  audioInputs: number | null;
+}
+
+export function classifyMicFailure(s: MicFailureSignals): MicFailureKind {
+  const name = String(s.name ?? "");
+  const message = String(s.message ?? "");
+  // Decisive and checkable at runtime: without the permission, Chrome hides
+  // every input device from an extension page and reports NotFoundError.
+  if (!s.hasCapturePermission) return "missing-permission";
+  if (name === "NotAllowedError" || name === "SecurityError") return "blocked";
+  if (/dismiss|denied|not allowed/i.test(message)) return "blocked";
+  if (name === "NotReadableError" || name === "TrackStartError") return "busy";
+  if (name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError") return "constraints";
+  // No devices at all is the other cause of the SAME error string, so it is
+  // only reachable once the permission question is settled.
+  if (s.audioInputs === 0) return "no-device";
+  return "unknown";
+}
+
+/** The actionable next step for a failure kind — what the panel shows. */
+export function micFailureAdvice(kind: MicFailureKind, raw?: string): string {
+  const detail = raw ? ` (${raw})` : "";
+  switch (kind) {
+    case "missing-permission":
+      return (
+        "this build of PRY has no `audioCapture` permission, so Chrome refuses to hand any " +
+        "microphone to the side panel — it reports every device as missing. Rebuild/reload the " +
+        `extension from a current source tree (the permission is in src/manifest.json)${detail}.`
+      );
+    case "no-device":
+      return (
+        "no microphone is visible to the browser. Connect or enable an input device, check " +
+        "the OS sound settings, then press the mic again" +
+        detail +
+        "."
+      );
+    case "blocked":
+      return (
+        "mic access was blocked. Chrome shows the Allow prompt once; after a dismissal it stays " +
+        "silent, so allow it permanently: open chrome://extensions → PRY → Details → Site " +
+        `settings → set Microphone to "Allow", then press the mic again${detail}.`
+      );
+    case "busy":
+      return `another app is holding the microphone. Close it and retry${detail}.`;
+    case "constraints":
+      return `the microphone rejected the requested audio settings${detail}. Retrying with defaults…`;
+    default:
+      return (
+        "could not open the microphone" + detail +
+        ". Check chrome://extensions → PRY → Details → Site settings → Microphone is " +
+        '"Allow", and that an input device is connected.'
+      );
+  }
+}
+
+/**
+ * Constraints for the dictation capture.
+ *
+ * The tuned set asks for 16 kHz mono with echo cancellation and noise
+ * suppression — but a device that does not support those exact constraints
+ * fails the whole `getUserMedia` call, which used to end the attempt. Callers
+ * try this first and fall back to `{ audio: true }` (see voice-controller).
+ */
+export const MIC_AUDIO_CONSTRAINTS: MediaTrackConstraints = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  channelCount: 1,
+};
+
+/** Fallback constraints: any input the browser will give us. */
+export const MIC_FALLBACK_CONSTRAINTS: MediaStreamConstraints = { audio: true };
 
 export function ttsRequestBody(text: string): Record<string, unknown> {
   return {

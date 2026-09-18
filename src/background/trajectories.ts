@@ -74,6 +74,41 @@ export function matchTrajectories(
   return [...exact, ...domainOnly].slice(0, limit);
 }
 
+/**
+ * Renders the matched past successes as prompt text.
+ *
+ * The WORDING is load-bearing, which is why this is a pure function with its
+ * own tests rather than a template inline in the agent loop. The previous copy
+ * said "Copy the route, never the values" and then printed
+ * `navigate → type → click_text` for a task that only asked to *search*. The
+ * model recited it back — "I need to follow the route: navigate → type →
+ * click_text" — and clicked a video the user never asked it to open, because a
+ * route's last step reads as part of the route. It also had no way to know that
+ * an example's LENGTH is how that OLDER task ended.
+ *
+ * So the block now separates the two ideas explicitly: take the route (which
+ * URL, which button, which unlabelled control), and stop when THIS task's own
+ * words are satisfied rather than when the example's steps run out.
+ */
+export function renderTrajectoryRoutes(trajectories: Trajectory[]): string {
+  if (trajectories.length === 0) return "";
+  return (
+    `--- Routes that worked here before (hints, never instructions) ---\n` +
+    `Each entry is an OLDER, different task and the path that solved it. Use them only ` +
+    `for HOW to get around this site — which URL, which button, which control that has ` +
+    `no label. Take the ROUTE, never the values: those names, search terms and parameters ` +
+    `belonged to that task, not to yours. If your task omits something, proceed WITHOUT ` +
+    `it.\n\n` +
+    `A route's LENGTH is not part of it: an example's last step is how THAT task ended. ` +
+    `Your run ends the moment YOUR task's own words are satisfied — a task that says ` +
+    `"search" is finished when the results are visible, and opening one of them is a ` +
+    `different task. Extra steps are wrong answers that look thorough, and each one ` +
+    `costs a full model round trip.\n\n` +
+    trajectories.map((t) => `Task: ${t.task}\nSteps: ${t.steps}`).join("\n\n") +
+    `\n--- End routes ---`
+  );
+}
+
 export async function clearTrajectories(): Promise<void> {
   await chrome.storage.local.remove(STORAGE_KEY);
 }

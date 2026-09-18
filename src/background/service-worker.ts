@@ -1,6 +1,7 @@
 import type {
   AgentEvent,
   PanelCommand,
+  PrivacyAuditPayload,
   ProcessedScreenshotResult,
   Settings,
   TranscriptEntry,
@@ -9,6 +10,7 @@ import type {
 } from "../shared/types";
 import { createTripwireAggregator } from "./tripwire-aggregator";
 import { normaliseSettings } from "../shared/types";
+import { redactionTally, rollupFrameVerification, type RedactionTally } from "../shared/metrics";
 import { regionMappingFor } from "../shared/region-mapping";
 import { VISION_SUPPORTED } from "./vision";
 import { tokenizer, maskSample } from "./tokenizer";
@@ -45,8 +47,9 @@ const CONVERSATION_TASK_MAX = 400;
 const CONVERSATION_ANSWER_MAX = 800;
 
 // ─── Tripwire aggregation ─────────────────────────────────────────────────────
-// One live transcript entry instead of one per intercepted request, plus a
-// capped detail log for the radar drawer.
+// One live transcript entry instead of one per observed request, plus a capped
+// detail log for the radar drawer. The wording says "observed": these hooks
+// call through unchanged and nothing here can stop a request.
 const tripwireAggregator = createTripwireAggregator();
 const tripwireLog: TripwireAlertDetail[] = [];
 const TRIPWIRE_LOG_CAP = 60;
@@ -142,9 +145,11 @@ function emit(event: AgentEvent): void {
   } else if (event.kind === "patch") {
     const entry = transcript.find((e) => e.id === event.id);
     if (entry) {
-      // Text deltas append; step updates replace.
+      // Text deltas append; step updates replace. An assistant patch may opt out
+      // of the append with `replace` — see the discarded-stream case in agent.ts.
       if (event.text !== undefined) {
-        entry.text = entry.role === "assistant" ? entry.text + event.text : event.text;
+        entry.text =
+          entry.role === "assistant" && !event.replace ? entry.text + event.text : event.text;
       }
       if (event.pending !== undefined) entry.pending = event.pending;
     }
@@ -191,6 +196,13 @@ function askConfirm(id: string, summary: string): Promise<boolean> {
  */
 async function warmOffscreen(): Promise<void> {
   await ensureOffscreenDocument();
+  // The document existing is not the same as the work being warm. Tesseract is
+  // built lazily on first use, and that first use is the user's first capture —
+  // measured at ~10.5 s of cold start before any page work happens. Starting it
+  // here overlaps it with the opening perception and the first planner turn,
+  // which the run is paying for anyway. Fire-and-forget: OCR is best-effort
+  // everywhere, and a failed warm-up must not fail a run.
+  chrome.runtime.sendMessage({ type: "warm-ocr" }).catch(() => undefined);
 }
 
 /**
@@ -731,11 +743,13 @@ let lastUnlocatedSignature = "";
 interface AuditEntry {
   original?: string;
   redacted?: string;
-  detections: Array<{ kind: string; label: string; confidence: number }>;
+  detections: Array<{ kind: string; label: string; confidence: number; tier?: string }>;
   tokens: Array<{ token: string; kind: string; sample?: string }>;
   redactedCount: number;
   /** True when this frame's redacted image was actually sent to a VLM. */
   shipped?: boolean;
+  /** Why the protection gate refused this frame's pixels, when it did. */
+  withheld?: string[];
   verification?: VerificationResult;
   timestamp: number;
 }
@@ -743,15 +757,39 @@ interface AuditEntry {
 let auditEntries: AuditEntry[] = [];
 let taskStartTime = 0;
 
+/**
+ * The run's redaction tally, as reported by the agent that counted it.
+ *
+ * The agent sees both channels (DOM/text items per perception, painted regions
+ * per frame); this worker sees only the frames, and only those still inside the
+ * entry buffer. Deriving the run's total here is what made the chip disagree
+ * with the transcript, so the agent's number is kept and the local sum is used
+ * only when no run has reported one.
+ */
+let runTally: RedactionTally | null = null;
+
+/**
+ * The tally the agent last reported, read through a call.
+ *
+ * Deliberately not a bare variable read at the use sites: the agent reports
+ * from inside a callback, which is not part of the linear flow TS analyses, so
+ * a direct read after `runTally = null` narrows to `null` and the report is
+ * erased from the type.
+ */
+function reportedTally(): RedactionTally | null {
+  return runTally;
+}
+
 const MAX_AUDIT_ENTRIES = 10;
 
 function recordAuditEntry(data: {
   original?: string;
   redacted?: string;
-  detections: Array<{ kind: string; label: string; confidence: number; box?: { x: number; y: number; width: number; height: number } }>;
+  detections: Array<{ kind: string; label: string; confidence: number; box?: { x: number; y: number; width: number; height: number }; tier?: string }>;
   tokens: Array<{ token: string; kind: string; sample?: string }>;
   redactedCount: number;
   shipped?: boolean;
+  withheld?: string[];
   verification?: VerificationResult;
 }): void {
   // Limit stored entries to prevent memory bloat (each base64 screenshot ~1-5MB).
@@ -767,8 +805,19 @@ function recordAuditEntry(data: {
   });
 }
 
-function emitPrivacyAudit(): void {
-  const allDetections: Array<{ kind: string; label: string; confidence: number; box?: { x: number; y: number; width: number; height: number } }> = [];
+/**
+ * Build the privacy-audit payload from the entries recorded so far.
+ *
+ * Split out of `emitPrivacyAudit` so the panel can ASK for it (get-audit)
+ * instead of only receiving it as a live event. The audit used to exist only as
+ * a broadcast: if the side panel was not listening at that instant — reloaded,
+ * or the service worker had been evicted and restarted, which MV3 does on a
+ * timer — the Privacy Audit panel rendered empty and the run's evidence looked
+ * like it had never happened.
+ */
+function buildPrivacyAudit(): PrivacyAuditPayload | null {
+  if (auditEntries.length === 0) return null;
+  const allDetections: Array<{ kind: string; label: string; confidence: number; box?: { x: number; y: number; width: number; height: number }; tier?: string }> = [];
   const allTokens: Array<{ token: string; kind: string; sample?: string }> = [];
   let totalRedacted = 0;
 
@@ -793,23 +842,37 @@ function emitPrivacyAudit(): void {
 
   // Latest re-OCR verification result, shown as a proof badge in the audit.
   const lastVerification = [...auditEntries].reverse().find((e) => e.verification)?.verification;
+  const rollup = rollupFrameVerification(auditEntries);
 
-  emit({
-    kind: "privacy-audit",
-    audit: {
-      screenshots,
-      allDetections,
-      allTokens,
-      totalRedacted,
-      totalScreenshots: auditEntries.length,
-      totalPIIDetections: allDetections.length,
-      durationMs: Date.now() - taskStartTime,
-      // Did ANY frame in this run reach a vision model? Only then is the
-      // redacted pane "what shipped to the model".
-      shipped: auditEntries.some((e) => e.shipped === true),
-      verification: lastVerification,
-    },
-  });
+  // The run's tally: the agent's own count when it has reported one, else what
+  // this worker can honestly derive from the frames it holds (page items are
+  // the channel it cannot see, so it reports none rather than inventing any).
+  const tally =
+    reportedTally() ??
+    redactionTally(0, auditEntries.reduce((sum, e) => sum + e.redactedCount, 0), new Set(allTokens.map((t) => t.token)).size);
+
+  return {
+    screenshots,
+    allDetections,
+    allTokens,
+    // Frame regions only. The chip must label it that way and read the run
+    // total from `tally` — this number is never the whole run's redactions.
+    totalRedacted,
+    totalScreenshots: auditEntries.length,
+    totalPIIDetections: allDetections.length,
+    durationMs: Date.now() - taskStartTime,
+    // Did ANY frame in this run reach a vision model? Only then is the
+    // redacted pane "what shipped to the model".
+    shipped: rollup.framesShipped > 0,
+    verification: lastVerification,
+    verificationRollup: rollup,
+    tally,
+  };
+}
+
+function emitPrivacyAudit(): void {
+  const audit = buildPrivacyAudit();
+  if (audit) emit({ kind: "privacy-audit", audit });
 }
 
 // ─── Agent Loop ──────────────────────────────────────────────────────────────
@@ -825,12 +888,15 @@ async function start(task: string, tabId: number): Promise<void> {
   //   2. the session stored to chrome.storage holds the tokenized task, not a
   //      raw password/card/name the user happened to type into the request.
   // The shared tokenizer de-dupes, so runTask's own pass adds no new tokens.
-  const { task: tokenizedTask } = tokenizer.tokenizeTask(task);
+  const { task: tokenizedTask, newEntries: taskTokens } = tokenizer.tokenizeTask(task);
 
   running = true;
   abort = new AbortController();
   taskStartTime = Date.now();
   auditEntries = [];
+  // A new run must not inherit the previous run's totals: the panel renders
+  // this payload live, and stale counts under a fresh task are a false claim.
+  runTally = null;
   emit({ kind: "status", running: true });
 
   // Create the offscreen runtime BEFORE runTask's first NER/guard call. It is
@@ -838,6 +904,34 @@ async function start(task: string, tabId: number): Promise<void> {
   // runTask, and a failure here only means ML degrades as before.
   void warmOffscreen();
   emit({ kind: "entry", entry: { id: `u-${Date.now()}`, role: "user", text: tokenizedTask } });
+
+  // Name what was taken out of the user's OWN sentence, in masked form, right
+  // after the task they typed so the transcript reads task → what changed.
+  //
+  // This is the only place that can report it: runTask receives the
+  // already-tokenized task, so its own pass finds nothing new and a line
+  // guarded there never renders. Without this, the user sees a `<PII_1>` they
+  // never typed and no statement of what it stood for — and a redaction
+  // invisible in your own request is indistinguishable from the agent
+  // misreading you.
+  if (taskTokens.length > 0) {
+    const shown = taskTokens
+      .slice(0, 4)
+      .map((e) => `"${maskSample(e.original)}" → ${e.token}`)
+      .join(", ");
+    const more = taskTokens.length > 4 ? ` (+${taskTokens.length - 4} more)` : "";
+    emit({
+      kind: "entry",
+      entry: {
+        id: `p-${Date.now()}`,
+        role: "system",
+        text:
+          `Task privacy: ${taskTokens.length} value(s) replaced before the model saw your request — ` +
+          `${shown}${more}. The token is swapped back automatically when an action types it, ` +
+          `so the task still uses your real value.`,
+      },
+    });
+  }
 
   try {
     await runTask(tokenizedTask, tabId, {
@@ -850,6 +944,9 @@ async function start(task: string, tabId: number): Promise<void> {
       captureScreenshot: (id) =>
         captureAndProcessScreenshot(id, settings.privacy, settings.fullPageCapture),
       recordAudit: recordAuditEntry,
+      reportTally: (tally) => {
+        runTally = tally;
+      },
       history: conversationMemory,
     });
   } catch (error) {
@@ -880,7 +977,10 @@ async function start(task: string, tabId: number): Promise<void> {
       status: hasError ? "failed" : wasAborted ? "stopped" : "completed",
       transcript: [...transcript],
       summary: lastEntry?.text?.slice(0, 200) ?? "Task completed",
-      piiRedacted: auditEntries.reduce((sum, e) => sum + e.redactedCount, 0),
+      // The agent's tally is authoritative; the frame sum is the fallback for a
+      // run that died before reporting (and undercounts once entries evict).
+      piiRedacted:
+        reportedTally()?.total ?? auditEntries.reduce((sum, e) => sum + e.redactedCount, 0),
       durationMs: Date.now() - taskStartTime,
     });
 
@@ -1188,6 +1288,14 @@ chrome.runtime.onMessage.addListener(
           alerts: tripwireLog,
           summary: tripwireAggregator.summary(),
         });
+        return false;
+
+      case "get-audit":
+        // Re-serve the current run's audit on demand. The panel asks for this
+        // when the user opens Privacy Audit, so the evidence is still there
+        // after a panel reload (it used to be a broadcast-only payload, and a
+        // panel that missed the event showed an empty audit).
+        sendResponse({ audit: buildPrivacyAudit() });
         return false;
 
       case "get-wire-log":

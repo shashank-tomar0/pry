@@ -232,6 +232,37 @@ export class PIITokenizer {
   }
 
   /**
+   * Replace every occurrence of one vault value in `text` with its token.
+   *
+   * The replacement is chosen by PATTERN SHAPE, and that is the whole point.
+   * Letter-run values (names, organisations) get the word-bound pattern, whose
+   * leading capture group — the character BEFORE the value — must be re-emitted
+   * so the surrounding text survives. Every other value (an email, an Aadhaar
+   * number, a card, an API key) gets a bare pattern with NO capture group. One
+   * callback written for the grouped case is silently wrong for the bare one:
+   * with no groups, `String.replace` passes the match OFFSET as the second
+   * argument, so the callback splices that offset into the text as if it were
+   * a leading delimiter.
+   *
+   * Live failure this fixes (the panel's own transcript): a clean action detail
+   * of `Typed "<email>" into …` re-redacted to `Typed "7<CRED_1>" … Field now
+   * shows: "86<CRED_1>"` — 7 and 86 being the email's offsets in each half of
+   * the same string — and a snapshot value rendered as `0<CRED_1>` (offset 0).
+   * The planner read those digits as a corrupted recipient, spent the rest of
+   * the run trying to reconcile a value nobody typed, and timed out mid-task.
+   */
+  private replaceValueWithToken(text: string, entry: TokenEntry): string {
+    const escaped = entry.original.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (this.isLetterRun(entry.original)) {
+      return text.replace(
+        this.wordBoundPattern(escaped),
+        (_match, lead: string) => `${lead ?? ""}${entry.token}`,
+      );
+    }
+    return text.replace(new RegExp(escaped, "g"), () => entry.token);
+  }
+
+  /**
    * Generate a unique token for a value.
    * If the value was already tokenized, return the existing token.
    */
@@ -611,12 +642,7 @@ export class PIITokenizer {
     for (const entry of entries) {
       const val = entry.original;
       if (out.includes(val)) {
-        const escaped = val.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const isAlpha = this.isLetterRun(val);
-        const pattern = isAlpha
-          ? this.wordBoundPattern(escaped)
-          : new RegExp(escaped, "g");
-        out = out.replace(pattern, (match, lead) => `${lead ?? ""}${entry.token}`);
+        out = this.replaceValueWithToken(out, entry);
         continue;
       }
 
@@ -676,14 +702,8 @@ export class PIITokenizer {
     const replaceIn = (text: string): string => {
       let out = String(text);
       for (const entry of entries) {
-        const val = entry.original;
-        if (!out.includes(val)) continue;
-        const escaped = val.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const isAlpha = this.isLetterRun(val);
-        const pattern = isAlpha
-          ? this.wordBoundPattern(escaped)
-          : new RegExp(escaped, "g");
-        out = out.replace(pattern, (match, lead) => `${lead ?? ""}${entry.token}`);
+        if (!out.includes(entry.original)) continue;
+        out = this.replaceValueWithToken(out, entry);
       }
       return out;
     };

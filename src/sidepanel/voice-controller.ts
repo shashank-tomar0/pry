@@ -11,13 +11,21 @@
  *    submit().
  *  - TTS: subscribe to the final-answer transcript stream and play each
  *    step's text through the shared AudioContext. Spoken text is run through
- *    voice-core.speakSafeTransform() so vault tokens never reach the speaker.
+ *    voice-core.toSpeakable(), which is the single decision about what may be
+ *    read aloud: vault tokens are pronounced "redacted" (never refused, see
+ *    that function), markdown is flattened, and the result is length-capped.
  *
  * The whole module is feature-flagged on settings.elevenlabs.sttEnabled /
  * .ttsEnabled; UI must consult the flag before constructing this.
  */
 
-import { containsVaultToken, speakSafeTransform } from "./voice-core";
+import {
+  MIC_AUDIO_CONSTRAINTS,
+  MIC_FALLBACK_CONSTRAINTS,
+  classifyMicFailure,
+  micFailureAdvice,
+  toSpeakable,
+} from "./voice-core";
 import {
   SCRIBE_SAMPLE_RATE_HZ,
   ScribeConnection,
@@ -98,9 +106,7 @@ export class VoiceController {
       // Mic FIRST (inside the user gesture): the permission prompt and the
       // AudioContext appear instantly, and the context isn't suspended for
       // being created in a detached async continuation after the network mint.
-      this.mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1, sampleRate: SCRIBE_SAMPLE_RATE_HZ },
-      });
+      this.mediaStream = await this.openMicrophone();
       if (this.cancelListening) {
         this.cleanup();
         return;
@@ -176,6 +182,67 @@ export class VoiceController {
       const message = err instanceof Error ? err.message : String(err);
       this.callbacks.onError?.(message);
       this.setState("error");
+    }
+  }
+
+  /**
+   * Open the microphone, or explain in one sentence why it did not open.
+   *
+   * The panel used to surface Chrome's raw error, and Chrome reports four
+   * completely different problems with the same few words — "Requested device
+   * not found" is the message for a missing `audioCapture` permission (an
+   * extension page sees no devices at all without it), for a machine with no
+   * input device, and for a device another app has taken. There is no next move
+   * a user can infer from that string, so the failure is classified here from
+   * two facts that are checkable at runtime: whether THIS build declares the
+   * permission, and whether any `audioinput` is visible.
+   */
+  private async openMicrophone(): Promise<MediaStream> {
+    const tuned: MediaStreamConstraints = {
+      audio: { ...MIC_AUDIO_CONSTRAINTS, sampleRate: SCRIBE_SAMPLE_RATE_HZ },
+    };
+    try {
+      return await navigator.mediaDevices.getUserMedia(tuned);
+    } catch (err) {
+      const first = err as { name?: string; message?: string };
+      // A device that dislikes the tuned set should still dictate. Plain
+      // constraint values are "ideal" rather than required, so this is rare —
+      // but a rare total failure of a feature the user has to click blind is
+      // worth one cheap retry.
+      if (first?.name === "OverconstrainedError" || first?.name === "TypeError") {
+        try {
+          return await navigator.mediaDevices.getUserMedia(MIC_FALLBACK_CONSTRAINTS);
+        } catch {
+          // Fall through to the diagnostic using the ORIGINAL error.
+        }
+      }
+
+      const hasCapturePermission = (() => {
+        try {
+          const perms: string[] = (chrome.runtime.getManifest() as { permissions?: string[] }).permissions ?? [];
+          return perms.includes("audioCapture");
+        } catch {
+          // No extension context (a test harness, a plain page): do not claim
+          // the permission is missing when we cannot check it.
+          return true;
+        }
+      })();
+
+      let audioInputs: number | null = null;
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        audioInputs = devices.filter((d) => d.kind === "audioinput").length;
+      } catch {
+        audioInputs = null;
+      }
+
+      const kind = classifyMicFailure({
+        name: first?.name,
+        message: first?.message,
+        hasCapturePermission,
+        audioInputs,
+      });
+      throw new Error(micFailureAdvice(kind, first?.message));
     }
   }
 
@@ -269,16 +336,26 @@ export class VoiceController {
     this.nextPlaybackTime = 0;
   }
 
-  /** Speak text via streaming TTS. Refuses any string containing a raw vault token. */
+  /**
+   * Speak text via streaming TTS.
+   *
+   * Tokens are REDACTED for the speaker, never a reason to refuse: every token
+   * in the text is pronounced as "redacted" by `toSpeakable`, which is the whole
+   * point of that transform. The old guard here ran before the transform and
+   * returned early whenever a token was present, so any answer that quoted one
+   * back — the Gmail tab title alone carries `<CRED_1>` — produced the error
+   * line "Refusing to speak: raw vault token in assistant text (this is a bug,
+   * please report)" and no audio. The token count is surfaced instead, so a
+   * silent substitution is never mistaken for the model's own wording.
+   */
   async speak(text: string): Promise<void> {
-    if (containsVaultToken(text)) {
-      this.callbacks.onError?.(
-        "Refusing to speak: raw vault token in assistant text (this is a bug, please report).",
-      );
-      return;
-    }
-    const safe = speakSafeTransform(text);
+    const { text: safe, redactedTokens } = toSpeakable(text);
     if (!safe) return;
+    if (redactedTokens > 0) {
+      this.callbacks.onError?.(
+        `Voice: spoke ${redactedTokens} vault token(s) as "redacted" — no secret was read aloud.`,
+      );
+    }
     if (!this.config.voiceId) {
       this.callbacks.onError?.("ElevenLabs voice id is required for TTS.");
       return;

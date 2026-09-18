@@ -85,6 +85,23 @@ async function recognize(dataUrl: string, timeoutMs: number): Promise<Page | nul
 }
 
 /**
+ * Start the Tesseract worker early, without waiting for it.
+ *
+ * WHY: the worker is built lazily on the first recognition, and that first
+ * recognition is expensive — measured at ~10.5 s here (WASM core + eng trained
+ * data + engine init), before any page work. It used to be paid inside the
+ * first capture of every run, on the user's critical path, right after their
+ * first action. Warming it while the opening perception and the first planner
+ * turn are in flight moves that cost into time the run is already spending.
+ *
+ * Best-effort by design: a failure here must not surface as a run error, since
+ * `recognize` resets and retries the worker itself.
+ */
+export function warmOcrWorker(): void {
+  void getWorker().catch(() => undefined);
+}
+
+/**
  * OCR a data URL (redacted screenshot) and return its recognized text.
  * Returns null on any failure or timeout — the caller falls back to the
  * pixel-region verification result.

@@ -11,14 +11,19 @@ export const TOOLS: ToolSpec[] = [
     description:
       "Re-read the current page and return a fresh list of elements with new ids. " +
       "Element ids are only valid for the most recent read — call this after any " +
-      "navigation, or whenever an id you expected no longer resolves.",
+      "navigation, or whenever an id you expected no longer resolves. This is " +
+      "enforced, not advice: an id from an earlier read is refused rather than " +
+      "applied to whatever now sits at that number, and the refusal names the " +
+      "read you are holding versus the one the page is on.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "click",
     description:
       "Click an element by its id from the most recent page read. Use this for " +
-      "links, buttons, checkboxes, tabs, and menu items.",
+      "links, buttons, checkboxes, tabs, and menu items. Ids are positional: if " +
+      "the page changed since the id was issued, the click is refused (and, when " +
+      "the intended control is still uniquely identifiable, retried on it).",
     parameters: {
       type: "object",
       properties: {
@@ -52,7 +57,9 @@ export const TOOLS: ToolSpec[] = [
     name: "type",
     description:
       "Type text into a text field, replacing whatever is already there. Set " +
-      "submit to true to press Enter afterwards, which is usually how you run a search.",
+      "submit to true to press Enter afterwards, which is usually how you run a " +
+      "search. The element_id must come from the most recent page read; an id " +
+      "from an earlier read is refused rather than typed into a different control.",
     parameters: {
       type: "object",
       properties: {
@@ -193,3 +200,30 @@ export const PAGE_ACTIONS = new Set([
   "wait",
   "read_page",
 ]);
+
+/**
+ * Actions that cannot change a single pixel.
+ *
+ * `find_text` and `wait` were already excluded from the post-action capture;
+ * `read_page` was not, so a pure text read paid for a full fresh frame — and a
+ * frame is not cheap: capture → paint → OCR triage (up to 6 tiles) → pixel
+ * verification → OCR re-read → adversarial probes, all awaited before the next
+ * planner turn. Measured locally at 2.6 s for a 1x viewport and 10.1 s at the
+ * 6-tile cap, per capture, before any model latency is counted.
+ *
+ * Reading the page as text cannot alter it, so re-capturing after a read is
+ * cost with no new evidence attached to it.
+ */
+export const READ_ONLY_ACTIONS = new Set(["find_text", "wait", "read_page"]);
+
+/**
+ * Whether an action justifies re-capturing the tab's pixels.
+ *
+ * Anything unknown is treated as frame-changing (the conservative direction:
+ * a missed capture costs a stale screenshot, a false skip costs an action taken
+ * on a page the agent has not seen). Pure and exported so the policy is pinned
+ * by the harness rather than inferred from the loop.
+ */
+export function actionChangesFrame(actionName: string): boolean {
+  return !READ_ONLY_ACTIONS.has(actionName);
+}

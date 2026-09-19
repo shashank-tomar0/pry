@@ -26,6 +26,11 @@ export interface LedgerEntry {
   hash: string;
   /** Hash of the previous entry (chain). */
   prevHash: string;
+  /**
+   * Which digest rule this entry was written with. Absent on entries written
+   * before the canonical scheme existed — see `hashContent`.
+   */
+  scheme?: number;
 }
 
 export interface PrivacyLedger {
@@ -52,6 +57,11 @@ export interface PrivacyLedger {
      * either INTACT or TAMPERED would be a claim we cannot back.
      */
     chainHeadUnverifiable: boolean;
+    /**
+     * Legacy entries whose digest cannot be re-derived (see
+     * ChainVerification.legacyUnverifiable). Zero on a fresh install.
+     */
+    chainLegacyUnverifiable: number;
     /** Entries written by the CURRENT session, out of `entries.length`. */
     sessionEntries: number;
   };
@@ -77,6 +87,17 @@ export interface ChainVerification {
   headLinkUnverifiable: boolean;
   /** True when the retained head is not the first entry ever written. */
   trimmed: boolean;
+  /** Entries written before the canonical digest scheme. */
+  legacyEntries: number;
+  /**
+   * Legacy entries whose recorded digest could not be re-derived at all.
+   *
+   * NOT tampering: their digest covered a key order that `chrome.storage.local`
+   * does not preserve, so the bytes needed to reproduce it are gone. Reported
+   * separately so the verdict can be exact — "unverifiable" and "altered" are
+   * different findings and only one of them is an accusation.
+   */
+  legacyUnverifiable: number;
   reasons: string[];
 }
 
@@ -143,14 +164,93 @@ async function sha256(message: string): Promise<string> {
 // ─── Ledger Implementation ──────────────────────────────────────────────────
 
 /**
- * The exact bytes a `LedgerEntry.hash` is a digest of.
+ * Current digests are over a CANONICAL serialization, and the entry says so.
  *
- * One function, used by both the writer and the verifier, because the digest is
- * over a JSON string and JSON preserves key ORDER: if the two ever assembled
- * this object separately, every entry would fail verification for a reason that
- * has nothing to do with tampering.
+ * WHY THIS EXISTS — the key-order bug
+ *
+ * The legacy digest was `JSON.stringify({ seq, timestamp, type, data, prevHash })`
+ * and `JSON.stringify` follows each object's OWN KEY ORDER. The entry is then
+ * persisted through `chrome.storage.local`, whose round trip is not guaranteed to
+ * hand those keys back in the same order. For an entry whose payload is two
+ * primitives — a `redact` entry is `{ redactedCount, method }` — key order is the
+ * ONLY thing that can move, and when it moves the stored bytes no longer hash to
+ * the recorded digest.
+ *
+ * Observed live: the panel reported `TAMPERED · Hash mismatch: entry 1823
+ * (redact) does not match its recorded digest` on a ledger whose entries had
+ * never been touched. A badge that cries tampering on its own storage layer is
+ * worse than no badge: the one artefact this project offers for accountability
+ * was reporting itself as broken.
+ *
+ * The fix is to stop hashing a byte string whose key order the storage layer
+ * controls. `canonicalJson` sorts keys recursively, so the digest is a function of
+ * the VALUES alone — reproducible from whatever the storage layer gives back.
+ *
+ * LEGACY ENTRIES. Entries written before this have no `scheme`, and their digest
+ * covered an order that was not preserved, so it cannot be re-derived at all.
+ * They are reported as exactly that (`legacyUnverifiable`) instead of as
+ * tampering — the verifier says which of the two it can actually prove.
+ *
+ * BUMP THIS WHENEVER THE HASHED CONTENT SHAPE CHANGES. An entry's digest can
+ * only be re-derived by the rule that produced it, so the version tag is what
+ * lets a newer build tell "written under a rule I no longer derive" apart from
+ * "edited after the fact". Leaving the tag alone across a rule change makes
+ * every honest entry from the older build read as TAMPERED — a panel accusing
+ * the user of editing an audit record that only the code changed (observed
+ * repeatedly while this scheme was being iterated on).
+ *
+ *   1 — no tag at all; `JSON.stringify` of an object in write order.
+ *   2 — carried the tag but hashed content in a shape this build no longer
+ *       derives (development iteration, never released).
+ *   3 — canonical (recursively key-sorted) encoding of
+ *       {scheme, seq, timestamp, type, data, prevHash}; what ships.
  */
+export const LEDGER_HASH_SCHEME = 3;
+
+/** Recursively key-sorted copy of a JSON value. Arrays keep their order. */
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(source).sort()) {
+      // `undefined` is dropped, exactly as JSON.stringify would: a key whose value
+      // is undefined is absent from the stringified form, and pretending
+      // otherwise would make the canonical form differ from the stored one.
+      if (source[key] === undefined) continue;
+      out[key] = canonicalize(source[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** Deterministic JSON for any value a ledger entry can hold. */
+export function canonicalJson(value: unknown): string {
+  return JSON.stringify(canonicalize(value) ?? null);
+}
+
+/** The bytes a CURRENT entry's hash is a digest of — see LEDGER_HASH_SCHEME. */
 function hashContent(entry: Pick<LedgerEntry, "seq" | "timestamp" | "type" | "data" | "prevHash">): string {
+  return canonicalJson({
+    scheme: LEDGER_HASH_SCHEME,
+    seq: entry.seq,
+    timestamp: entry.timestamp,
+    type: entry.type,
+    data: entry.data,
+    prevHash: entry.prevHash,
+  });
+}
+
+/**
+ * The digest rule for entries written before the scheme existed.
+ *
+ * Kept, and used ONLY for entries that declare no scheme, because reproducing an
+ * old digest is the difference between "this was written by an older build" and
+ * "this was altered". It is order-dependent by definition — that is the bug — so a
+ * failure under it is not by itself evidence of tampering.
+ */
+function legacyHashContent(entry: Pick<LedgerEntry, "seq" | "timestamp" | "type" | "data" | "prevHash">): string {
   return JSON.stringify({
     seq: entry.seq,
     timestamp: entry.timestamp,
@@ -193,7 +293,9 @@ export async function addEntry(
     const seq = store.entryCounter + 1;
     const timestamp = Date.now();
 
-    // Build the content to hash (excluding hash fields).
+    // Build the content to hash (excluding hash fields). Canonical, and the
+    // scheme travels WITH the entry so a verifier never has to guess which rule
+    // produced a digest.
     const hash = await sha256(hashContent({ seq, timestamp, type, data, prevHash: store.lastHash }));
 
     const entry: LedgerEntry = {
@@ -203,6 +305,7 @@ export async function addEntry(
       data,
       hash,
       prevHash: store.lastHash,
+      scheme: LEDGER_HASH_SCHEME,
     };
 
     store.lastHash = hash;
@@ -283,21 +386,65 @@ export async function verifyLedgerChain(entries: LedgerEntry[]): Promise<ChainVe
   let hashesIntact = true;
   let linksIntact = true;
   let firstBadSeq: number | undefined;
+  let legacyEntries = 0;
+  let legacyUnverifiable = 0;
+  /**
+   * The first "this entry cannot be checked" note, held ASIDE from `reasons`.
+   *
+   * `reasons` carries ONE reason, and that slot belongs to a finding — a digest
+   * that was recomputed and did not match, or a link that does not join. A note
+   * about what the check could not cover must never claim it first: entries
+   * written before the canonical scheme are the OLDEST in the window, so writing
+   * their note in place meant the slot was gone before the loop could reach a
+   * later, genuine mismatch. The panel's TAMPERED line prints `reasons[0]`, so
+   * the one accusation this project makes arrived as "…predates the canonical
+   * digest scheme… unverifiable, not evidence of tampering" — a tamper notice
+   * whose stated reason denied that anything had been altered.
+   *
+   * It is appended only once the loop is over and no finding took the slot.
+   */
+  let unverifiableNote: string | null = null;
 
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
-    const expected = await sha256(hashContent(entry));
-    if (expected !== entry.hash) {
-      hashesIntact = false;
-      if (firstBadSeq === undefined) firstBadSeq = entry.seq;
-      // Do NOT push a reason per entry: one tampered entry is one finding.
-      // The entry's TYPE is named because it is the only handle an operator has
-      // on which write went wrong — "entry 1512" alone sent the reader looking at
-      // a ledger of 500 without saying whether it was a snapshot, a redaction or
-      // a verification, and those are three different code paths.
-      if (reasons.length === 0) {
-        reasons.push(`entry ${entry.seq} (${entry.type}) does not match its recorded digest`);
+    if (entry.scheme === LEDGER_HASH_SCHEME) {
+      const expected = await sha256(hashContent(entry));
+      if (expected !== entry.hash) {
+        hashesIntact = false;
+        if (firstBadSeq === undefined) firstBadSeq = entry.seq;
+        // Do NOT push a reason per entry: one tampered entry is one finding.
+        // The entry's TYPE is named because it is the only handle an operator has
+        // on which write went wrong — "entry 1512" alone sent the reader looking at
+        // a ledger of 500 without saying whether it was a snapshot, a redaction or
+        // a verification, and those are three different code paths.
+        if (reasons.length === 0) {
+          reasons.push(`entry ${entry.seq} (${entry.type}) does not match its recorded digest`);
+        }
       }
+    } else if (entry.scheme === undefined) {
+      // Written before the canonical scheme. Try the old order-dependent rule:
+      // it reproduces the digest when the storage round trip happened to keep the
+      // key order, and cannot when it did not. A failure here is reported as
+      // unverifiable, NOT as tampering — see ChainVerification.legacyUnverifiable.
+      legacyEntries++;
+      const expected = await sha256(legacyHashContent(entry));
+      if (expected !== entry.hash) {
+        legacyUnverifiable++;
+        unverifiableNote ??=
+          `entry ${entry.seq} (${entry.type}) predates the canonical digest scheme, and its ` +
+          `legacy digest covered an object key order that browser storage does not preserve — ` +
+          `unverifiable, not evidence of tampering`;
+      }
+    } else {
+      // Tagged with a DIFFERENT (older) scheme. Its digest was produced by a
+      // rule this build does not implement, so it cannot be re-derived here —
+      // and "cannot re-derive" is not "was edited". Reporting it as unverifiable
+      // names the real situation: the rule changed, not the record.
+      legacyEntries++;
+      legacyUnverifiable++;
+      unverifiableNote ??=
+        `entry ${entry.seq} (${entry.type}) was written under digest scheme ${entry.scheme}; ` +
+        `this build derives scheme ${LEDGER_HASH_SCHEME} — unverifiable, not evidence of tampering`;
     }
     if (i > 0 && entry.prevHash !== entries[i - 1].hash) {
       linksIntact = false;
@@ -311,6 +458,13 @@ export async function verifyLedgerChain(entries: LedgerEntry[]): Promise<ChainVe
   if (trimmed && reasons.length === 0) {
     reasons.push(`head link unverifiable: ${entries[0].seq - 1} earlier entr(ies) were trimmed`);
   }
+  // Only now — with every digest mismatch, broken link and trimmed head having
+  // had their chance at the slot — may a note explain what the check could not
+  // cover. See `unverifiableNote`. Its COUNT is reported either way, so folding
+  // the note away here never hides that the chain was partly unverifiable.
+  if (reasons.length === 0 && unverifiableNote !== null) {
+    reasons.push(unverifiableNote);
+  }
 
   return {
     hashesIntact,
@@ -320,6 +474,8 @@ export async function verifyLedgerChain(entries: LedgerEntry[]): Promise<ChainVe
     firstBadSeq,
     headLinkUnverifiable: trimmed,
     trimmed,
+    legacyEntries,
+    legacyUnverifiable,
     reasons,
   };
 }
@@ -378,6 +534,7 @@ export async function getLedger(): Promise<PrivacyLedger> {
       chainValid: chain.valid,
       chainHashesIntact: chain.hashesIntact,
       chainHeadUnverifiable: chain.headLinkUnverifiable,
+      chainLegacyUnverifiable: chain.legacyUnverifiable,
       sessionEntries: sessionEntries(store),
     },
   };
@@ -394,6 +551,12 @@ export async function getLedgerSummary(): Promise<{
   chainHashesIntact: boolean;
   /** Older entries were trimmed, so the head link cannot be checked. */
   chainHeadUnverifiable: boolean;
+  /**
+   * Legacy entries that predate the canonical digest scheme and cannot be
+   * re-derived. Reported so the badge can say "unverifiable" instead of
+   * "tampered" — the two are different claims.
+   */
+  chainLegacyUnverifiable: number;
   chainReasons: string[];
   sessionId: string;
   /** Entries written by the current session, out of `totalEntries`. */
@@ -414,6 +577,7 @@ export async function getLedgerSummary(): Promise<{
     chainValid: chain.valid,
     chainHashesIntact: chain.hashesIntact,
     chainHeadUnverifiable: chain.headLinkUnverifiable,
+    chainLegacyUnverifiable: chain.legacyUnverifiable,
     chainReasons: chain.reasons,
     sessionId: store.sessionId ?? `session-${entries[0]?.timestamp ?? Date.now()}`,
     sessionEntries: sessionEntries(store),
@@ -469,6 +633,8 @@ export async function exportCertifiedAuditProof(): Promise<{
   chainValid: boolean;
   chainHashesIntact: boolean;
   chainHeadUnverifiable: boolean;
+  /** Legacy entries the digest scheme cannot re-derive — see ChainVerification. */
+  chainLegacyUnverifiable: number;
   chainReasons: string[];
   /**
    * What the proof actually covers. Without this the consumer of the file has
@@ -497,6 +663,7 @@ export async function exportCertifiedAuditProof(): Promise<{
     chainValid: ledger.summary.chainValid,
     chainHashesIntact: ledger.summary.chainHashesIntact,
     chainHeadUnverifiable: ledger.summary.chainHeadUnverifiable,
+    chainLegacyUnverifiable: ledger.summary.chainLegacyUnverifiable,
     chainReasons: (await verifyLedgerChain(store.entries)).reasons,
     coverage: {
       retainedFromSeq: first ? first.seq : null,

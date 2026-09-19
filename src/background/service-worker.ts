@@ -9,6 +9,7 @@ import type {
   VerificationResult,
 } from "../shared/types";
 import { createTripwireAggregator } from "./tripwire-aggregator";
+import { normalizeTripwireAlert } from "../shared/tripwire-alert";
 import { normaliseSettings } from "../shared/types";
 import { redactionTally, rollupFrameVerification, type RedactionTally } from "../shared/metrics";
 import { regionMappingFor, reconcileCaptureShift } from "../shared/region-mapping";
@@ -19,6 +20,7 @@ import { getActiveNerSpans, getActivePiiTargets } from "./ml-bridge";
 import { findUnlocatedValues, unplacedAfterLocators, unverifiedElementTargets } from "../shared/redaction-reconciliation";
 import { ensureOffscreenDocument } from "./offscreen-doc";
 import { runTask } from "./agent";
+import { warmOcrWorker } from "../offscreen/ocr";
 import { createPlanner } from "./providers";
 import { generateLessons } from "./lesson-generator";
 import { getLessons, recordLessons } from "./lessons";
@@ -30,6 +32,8 @@ import { clearLedger, getLedgerSummary, recordRedaction } from "./privacy-ledger
 import { applyCaptureEvidence } from "../shared/screenshot-protection";
 import { applyReflectionResults, getLearnedRules, getRulesSummary } from "./learned-rules";
 import type { RunExperience } from "./experience-memory";
+import { checkProviderAvailability, invalidateNvidiaCache } from "./providers/availability";
+import type { ModelAvailability } from "./providers/availability";
 
 // The side panel can be closed and reopened mid-run, so the transcript lives
 // here rather than in the panel's own memory.
@@ -202,6 +206,11 @@ async function warmOffscreen(): Promise<void> {
   // here overlaps it with the opening perception and the first planner turn,
   // which the run is paying for anyway. Fire-and-forget: OCR is best-effort
   // everywhere, and a failed warm-up must not fail a run.
+  //
+  // Called directly on the worker side so the warm-up starts even if the
+  // offscreen document's message handler has not yet registered (it also
+  // listens for warm-ocr, so both paths start the same engine).
+  warmOcrWorker();
   chrome.runtime.sendMessage({ type: "warm-ocr" }).catch(() => undefined);
 }
 
@@ -989,12 +998,21 @@ function buildPrivacyAudit(): PrivacyAuditPayload | null {
     totalRedacted += entry.redactedCount;
   }
 
-  // Take at most 5 screenshots for the audit (to keep the UI manageable).
-  // Each carries its OWN detections so the panel's proof overlays are drawn
+  // Carry at most 5 screenshot pairs, and always the FIRST frame of the run
+  // even when it has to displace a middle one. Each base64 frame is 1-5 MB, so
+  // the cap is real; but the frames it dropped were the OLDEST, and the oldest
+  // is the opening frame — the one that shows which page the run started from.
+  // That is why the panel listed "6 frames" over a gallery with no comparison
+  // for the run's first frame: `slice(-5)` had silently discarded it.
+  // Each pair carries its OWN detections so the panel's proof overlays are drawn
   // only on the frame they belong to — never bleeding boxes across frames.
-  const screenshots = auditEntries
-    .filter((e) => e.original || e.redacted)
-    .slice(-5)
+  const withPixels = auditEntries.filter((e) => e.original || e.redacted);
+  const SCREENSHOT_CAP = 5;
+  const kept =
+    withPixels.length <= SCREENSHOT_CAP
+      ? withPixels
+      : [withPixels[0], ...withPixels.slice(-(SCREENSHOT_CAP - 1))];
+  const screenshots = kept
     .map((e) => ({
       original: e.original,
       redacted: e.redacted,
@@ -1015,6 +1033,9 @@ function buildPrivacyAudit(): PrivacyAuditPayload | null {
 
   return {
     screenshots,
+    // How many frames actually HAVE pixels to show, so the gallery can say what
+    // it is showing instead of looking complete while frames are missing.
+    framesWithPixels: withPixels.length,
     allDetections,
     allTokens,
     // Frame regions only. The chip must label it that way and read the run
@@ -1036,6 +1057,94 @@ function emitPrivacyAudit(): void {
   const audit = buildPrivacyAudit();
   if (audit) emit({ kind: "privacy-audit", audit });
 }
+
+// ─── Provider availability checker ──────────────────────────────────────────
+
+/**
+ * Cached provider availability state. Updated on startup, settings change,
+ * and when the panel asks for it.
+ */
+let nvidiaAvailability: ModelAvailability | null = null;
+// Narrowing helper: TS loses track of `nvidiaAvailability` across the `await`
+// in the IIFE below because it is a module-level `let`. Re-declare as a const
+// here so the guard after the await can narrow without a separate variable.
+type NarrowedAvailability = ModelAvailability & { configuredModelAvailable: boolean; error: string };
+
+/**
+ * Check NVIDIA model availability and cache the result. Fire-and-forget safe.
+ */
+async function refreshNvidiaAvailability(): Promise<void> {
+  const settings = await loadSettings();
+  const apiKey = settings.apiKeys.nvidia ?? "";
+  const model = (settings.models.nvidia ?? "").trim() || "";
+
+  if (!apiKey || !model) {
+    nvidiaAvailability = {
+      reachable: false,
+      status: null,
+      availableModels: [],
+      configuredModelAvailable: false,
+      checkedAt: Date.now(),
+      error: !apiKey ? "No NVIDIA API key configured" : "No NVIDIA model selected",
+    };
+    return;
+  }
+
+  nvidiaAvailability = await checkProviderAvailability("nvidia", apiKey, model);
+}
+
+/**
+ * Message handler: panel asks for provider availability status.
+ */
+chrome.runtime.onMessage.addListener(
+  (message: { type: string; provider?: string }, _sender, sendResponse) => {
+    if (message.type === "get-provider-availability") {
+      // Return cached status immediately, refresh in background if stale.
+      const provider = message.provider ?? "nvidia";
+      if (provider === "nvidia" && (!nvidiaAvailability || nvidiaAvailability.checkedAt < Date.now() - 60_000)) {
+        // Stale or missing — refresh async, panel will get the new value
+        // on next poll or when the service worker pushes an update.
+        void refreshNvidiaAvailability();
+      }
+      sendResponse({ providerAvailability: nvidiaAvailability });
+      return true; // async response
+    }
+    return false;
+  },
+);
+
+// ─── Startup: check provider availability ───────────────────────────────────
+
+/**
+ * On startup, quietly check if the configured NVIDIA model is still available.
+ * This runs fire-and-forget — it must never block extension initialization.
+ */
+void (async () => {
+  await refreshNvidiaAvailability();
+  // If the model is unavailable, surface a warning in the panel.
+  const avail = nvidiaAvailability;
+  if (avail && (avail as NarrowedAvailability).configuredModelAvailable === false && (avail as NarrowedAvailability).error) {
+    emit({
+      kind: "entry",
+      entry: {
+        id: `model-check-${Date.now()}`,
+        role: "system",
+        text: `NVIDIA: ${(avail as NarrowedAvailability).error}. Open Options → Test Providers to pick a currently available model.`,
+      },
+    });
+  }
+})();
+
+// ─── Settings change: re-check availability ─────────────────────────────────
+
+chrome.storage.onChanged.addListener(async (changes: Record<string, chrome.storage.StorageChange>) => {
+  if (changes.settings) {
+    // Invalidate cached model list when settings change.
+    await invalidateNvidiaCache();
+    // Re-check in background.
+    void refreshNvidiaAvailability();
+  }
+});
 
 // ─── Agent Loop ──────────────────────────────────────────────────────────────
 
@@ -1250,13 +1359,10 @@ chrome.runtime.onMessage.addListener(
     if ((command as any).type === "TRIPWIRE_ALERT") {
       const detail = (command as any).detail;
       if (detail) {
-        handleTripwireAlert({
-          url: String(detail.url ?? ""),
-          method: String(detail.method ?? "REQUEST"),
-          piiType: String(detail.piiType ?? "pii"),
-          sample: String(detail.sample ?? ""),
-          timestamp: Number(detail.timestamp) || Date.now(),
-        });
+        // The page's own same-site / third-party verdict is part of the alert —
+        // see normalizeTripwireAlert for what dropping it did to a live run.
+        const alert = normalizeTripwireAlert(detail);
+        if (alert) handleTripwireAlert(alert);
       }
       sendResponse({ ok: true });
       return false;

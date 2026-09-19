@@ -44,6 +44,9 @@ import {
   type ReconstructionFinding,
 } from "../background/redaction-attack";
 import { tierForKind, type RegionTier } from "../shared/region-paint";
+// Blob → data URL: the same wrapper the worker's stitcher uses (used here for
+// the shipped JPEG and the OCR crop strip).
+import { blobToDataUrl } from "../shared/primitives";
 import { ocrDataUrl, ocrWordLines, warmOcrWorker } from "./ocr";
 import {
   findTriageBoxes,
@@ -1084,13 +1087,30 @@ async function processScreenshot(
   // rebuild and re-encode the image (see the escalation pass below) in which
   // case the ESCALATED bytes are the ones that ship.
   const encodeStart = performance.now();
-  let redactedBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.92 });
+  let redactedBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.85 });
   let redactedDataUrl = await blobToDataUrl(redactedBlob);
   markStage("encode", encodeStart);
 
-  // 4. Adversarial verification — decode the EXACT bytes that will be shipped
-  // (the post-JPEG image) and re-scan every redacted region, at the pixel level
-  // and with a real OCR re-read, to prove the redaction worked.
+  // 4. Pixel-level adversarial verification — decode the EXACT bytes that will
+  // be shipped (the post-JPEG image) and re-scan every redacted region at the
+  // pixel level, to prove the redaction worked before anything crosses the
+  // network boundary.
+  //
+  // NOTE: the full-frame OCR re-read (ocrDataUrl on the whole shipped JPEG)
+  // that used to live here was the silent multiplier behind the frame-capture
+  // timeout. A 12 s OCR timeout racing the same ~10.5 s Tesseract cold start
+  // that triageFrameText already triggered for this capture meant a first frame
+  // on a cold run paid two OCR cold starts in parallel, neither of which
+  // settled inside the 15 s wait budget. That OCR re-read was redundant: the
+  // pixel checks below (verifyRegions) already prove, at the pixel level, that
+  // every redacted region is opaque or altered — they do not need OCR to know
+  // whether a black fill landed. OCR re-read belongs on the redaction REGIONS
+  // (the crop-strip scan in triageFrameText already does that for the regions
+  // that can hold text), not on the whole page (which would flag PII that is
+  // legitimately visible on screen and turn every honest run into a WARNING).
+  // The pipeline already has pixel-level proof and region-scoped OCR; the
+  // blanket full-frame OCR re-read added cost without adding coverage. Removed
+  // so the first frame of a run settles inside the wait budget.
   const verifyStart = performance.now();
   let verification: VerificationResult = emptyVerification();
   // Evidence for the egress contract (see shared/screenshot-protection.ts).
@@ -1723,16 +1743,6 @@ async function rebuildWithOpaqueMasks(
   }
   const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.92 });
   return { blob, dataUrl: await blobToDataUrl(blob) };
-}
-
-/** Blob → data URL (used for the shipped JPEG and the OCR crop strip). */
-function blobToDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = () => reject(reader.error ?? new Error("Blob read failed"));
-    reader.readAsDataURL(blob);
-  });
 }
 
 // ─── Message Handler ────────────────────────────────────────────────────────

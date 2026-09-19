@@ -18,6 +18,7 @@ const maxStepsEl = $<HTMLInputElement>("maxSteps");
 const confirmRiskyEl = $<HTMLInputElement>("confirmRisky");
 const fullPageCaptureEl = $<HTMLInputElement>("fullPageCapture");
 const fastPlannerEl = $<HTMLInputElement>("fastPlanner");
+const autoFastPlannerEl = $<HTMLInputElement>("autoFastPlannerOnSlowProvider");
 
 // ElevenLabs voice (hack branch).
 const elApiKeyEl = $<HTMLInputElement>("elevenlabs-api-key");
@@ -119,6 +120,10 @@ function renderAll(): void {
   confirmRiskyEl.checked = settings.confirmRisky;
   fullPageCaptureEl.checked = Boolean(settings.fullPageCapture);
   fastPlannerEl.checked = Boolean(settings.fastPlanner);
+  // Default ON: a missing key in stored settings means "not yet chosen", and
+  // the consent that matters here is the announcement in the transcript, not the
+  // absence of a checkbox.
+  autoFastPlannerEl.checked = settings.autoFastPlannerOnSlowProvider !== false;
 
   // ElevenLabs voice.
   elApiKeyEl.value = settings.elevenlabs.apiKey;
@@ -284,6 +289,7 @@ $("save").addEventListener("click", async () => {
   settings.confirmRisky = confirmRiskyEl.checked;
   settings.fullPageCapture = fullPageCaptureEl.checked;
   settings.fastPlanner = fastPlannerEl.checked;
+  settings.autoFastPlannerOnSlowProvider = autoFastPlannerEl.checked;
 
   // ElevenLabs: enabling either voice feature without a key is silently
   // a no-op (the side panel checks the flag + key together), but warn so

@@ -19,6 +19,7 @@
  */
 
 import type { ProviderId } from "./providers/types";
+import { estimateUtf8Bytes } from "../shared/primitives";
 
 /** What one visual observation produced. */
 export interface VisionObservation {
@@ -84,14 +85,6 @@ function splitDataUrl(dataUrl: string): { mediaType: string; base64: string } {
     mediaType: match ? match[1] : "image/jpeg",
     base64: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl,
   };
-}
-
-function estimateUtf8Bytes(value: string): number {
-  try {
-    return new TextEncoder().encode(value).length;
-  } catch {
-    return value.length;
-  }
 }
 
 /**

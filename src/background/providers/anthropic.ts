@@ -65,7 +65,8 @@ export function createAnthropicPlanner(apiKey: string, model: string): Planner {
   return {
     label: `Anthropic ${model}`,
 
-    async run({ system, messages, tools, signal, onText }: PlannerRequest): Promise<PlannerTurn> {
+    async run({ system, messages, tools, signal, onText, onMilestone }: PlannerRequest): Promise<PlannerTurn> {
+      onMilestone?.("requested", performance.now());
       const stream = client.messages.stream(
         {
           model,
@@ -78,6 +79,21 @@ export function createAnthropicPlanner(apiKey: string, model: string): Planner {
       );
 
       stream.on("text", onText);
+      // `connect` fires when the response begins — headers arrived, so Anthropic
+      // answered. Body events come later, once the model starts producing, and
+      // the distance between the two is the run's evidence for "queued" rather
+      // than "thinking".
+      stream.on("connect", () => onMilestone?.("headers", performance.now()));
+      // The first content block, of ANY type: a text block starts streaming the
+      // answer, and a `tool_use` block is the other way a turn produces output
+      // with no prose at all. Reporting only on "text" would leave every
+      // tool-calling turn unmeasured — see PlannerMilestone.
+      let outputReported = false;
+      stream.on("contentBlock", () => {
+        if (outputReported) return;
+        outputReported = true;
+        onMilestone?.("output", performance.now());
+      });
 
       let response: Anthropic.Message;
       try {

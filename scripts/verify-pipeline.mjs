@@ -797,7 +797,9 @@ ok("user corrections counted in stats", statsK.totalUserCorrections === 1, `got 
 // ─── Scenario L: model interruptions are hardened ──────────────────────────
 console.log("\n=== Scenario L: blank-model fallback + friendly model errors ===\n");
 
-const { modelUnavailableReason } = await import("../src/background/providers/errors.ts");
+const { modelUnavailableReason, transportFailure, describeOpenAIError } = await import(
+  "../src/background/providers/errors.ts",
+);
 const { createPlanner } = await import("../src/background/providers/index.ts");
 const { PROVIDERS, PROVIDER_IDS } = await import("../src/shared/models.ts");
 const { DEFAULT_SETTINGS } = await import("../src/shared/types.ts");
@@ -837,9 +839,9 @@ const fastOn = createPlanner({
   fastPlanner: true,
 });
 ok("fast planner mode uses the provider's plain model",
-  /llama-3.1-8b-instruct/.test(fastOn.label), `label=${fastOn.label}`);
+  /gpt-oss-20b/.test(fastOn.label), `label=${fastOn.label}`);
 ok("and the label names the model that will actually be called",
-  fastOn.label.includes("meta/llama-3.1-8b-instruct") &&
+  fastOn.label.includes("openai/gpt-oss-20b") &&
     !fastOn.label.includes("nemotron-3.5-lightning"));
 const fastOff = createPlanner({
   provider: "nvidia",
@@ -1141,9 +1143,15 @@ ok("Aadhaar surrogate is 12 digits (formatted as XXXX XXXX XXXX)",
 // Verhoeff check: computing check digit of the first 11 digits must equal the 12th digit
 const aadhaarPrefix11 = surrAadhaarDigits.slice(0, 11);
 const expectedCheck = computeVerhoeffCheckDigit(aadhaarPrefix11);
+// …and the VALIDATOR accepts the whole number, which is the assertion that is
+// not tautological: the check-digit function places the digit, and
+// `isAadhaarNumber` (a different function, run over the finished value) is what
+// the rest of the pipeline uses to decide the value is an Aadhaar at all. The
+// generator and its checksum arithmetic used to be two separate copies of the
+// same tables; this is what would have caught them disagreeing.
 ok("Aadhaar surrogate passes Verhoeff checksum",
-  expectedCheck === parseInt(surrAadhaarDigits[11], 10),
-  `prefix=${aadhaarPrefix11} expected=${expectedCheck} got=${surrAadhaarDigits[11]}`);
+  expectedCheck === parseInt(surrAadhaarDigits[11], 10) && isAadhaarNumber(surrAadhaarDigits),
+  `prefix=${aadhaarPrefix11} expected=${expectedCheck} got=${surrAadhaarDigits[11]} valid=${isAadhaarNumber(surrAadhaarDigits)}`);
 
 // Luhn card surrogate must be 19 chars (4+sp+4+sp+4+sp+4) and Luhn-valid
 const cardSurr = generateLuhnCardSurrogate();
@@ -1154,8 +1162,8 @@ ok("Card surrogate is 16 digits (formatted as XXXX XXXX XXXX XXXX)",
 // Luhn validation: sum of all digits via Luhn algorithm must be divisible by 10
 const luhnCheck = computeLuhnCheckDigit(surrCardDigits.slice(0, 15));
 ok("Card surrogate passes Luhn checksum",
-  luhnCheck === parseInt(surrCardDigits[15], 10),
-  `expected check=${luhnCheck} got=${surrCardDigits[15]}`);
+  luhnCheck === parseInt(surrCardDigits[15], 10) && isCardNumber(surrCardDigits),
+  `expected check=${luhnCheck} got=${surrCardDigits[15]} valid=${isCardNumber(surrCardDigits)}`);
 
 // PAN surrogate must match PAN format: AAAAA9999A (5 letters, 4 digits, 1 letter)
 const panSurr = generatePanSurrogate();
@@ -1449,6 +1457,19 @@ const detProtoGmail = tryDeterministic("go to https://gmail", navSnap);
 ok("protocol URL with bare host is also corrected (https://gmail → https://gmail.com/)",
   detProtoGmail.resolved && String(detProtoGmail.action?.input.url).startsWith("https://gmail.com"),
   JSON.stringify(detProtoGmail.action?.input));
+// 2b. Single-token site aliases resolve without a planner turn: "open yt" is
+// the reported task, and it used to fall through to the reasoning model.
+const detYt = tryDeterministic("open yt", navSnap);
+ok("deterministic 'open yt' resolves via the site alias",
+  detYt.resolved && detYt.action?.input.url === "https://youtube.com",
+  JSON.stringify(detYt.action?.input));
+const detMail = tryDeterministic("open mail", navSnap);
+ok("deterministic 'open mail' resolves to the first satisfying host",
+  detMail.resolved && detMail.action?.input.url === "https://mail.google.com",
+  JSON.stringify(detMail.action?.input));
+const detYtSteps = tryDeterministic("open yt and search for iit", navSnap);
+ok("multi-step 'open yt and ...' still falls through to the planner",
+  !detYtSteps.resolved);
 
 // 3. Chrome error pages are recognized at the executor layer.
 ok("chrome-error URL yields its error code",
@@ -2316,6 +2337,22 @@ ok("overlap coverage is measured against the SMALLER box",
   ));
 ok("overlapArea is zero for disjoint boxes",
   overlapArea(modelBigFace, skinThumbB) === 0);
+// One implementation, shared with the OCR triage's "is this region already
+// covered" test: two copies of the same geometry are one fix away from
+// disagreeing about which regions count as covered.
+{
+  const { overlapArea: sharedOverlap } = await import("../src/shared/primitives.ts");
+  const { dropCoveredBoxes } = await import("../src/shared/ocr-pii-triage.ts");
+  ok("the face channels and the OCR triage share one box-overlap implementation",
+    overlapArea === sharedOverlap,
+    `face=${typeof overlapArea} shared=${typeof sharedOverlap}`);
+  // …and the shared helper still does the job at the triage's call site: a box
+  // another region already covers is dropped, one that is not survives.
+  const triageBox = { x: 10, y: 10, width: 100, height: 20, value: "a@b.com", kind: "email", label: "email", source: "pattern" };
+  ok("and the triage still drops a box another region already covers",
+    dropCoveredBoxes([triageBox], [{ x: 10, y: 10, width: 100, height: 20 }], 0.3).length === 0 &&
+      dropCoveredBoxes([triageBox], [{ x: 200, y: 200, width: 20, height: 20 }], 0.3).length === 1);
+}
 
 // A confident detection is never trimmed to make room for a heuristic guess.
 const manyModelFaces = Array.from({ length: 12 }, (_, i) => ({
@@ -2579,11 +2616,26 @@ ok("the audit chip is keyed on the evidence it displays",
   /function auditChipSignature\(/.test(panelSource) &&
     /lastChip\.dataset\.auditSignature === signature/.test(panelSource));
 ok("so a re-render of the same payload does not append a second card",
-  /lastChip\.classList\.contains\("audit-chip"\)/.test(panelSource) &&
+  /const chips = transcriptEl\.querySelectorAll\("\.audit-chip"\);/.test(panelSource) &&
     /chip\.dataset\.auditSignature = signature;/.test(panelSource));
-ok("and a later run with different numbers still gets its own card",
+// The reported "why are there two of these": the chip used to be recognised only
+// as the transcript's LAST ELEMENT, and the voice note that reports a spoken
+// vault token is appended after it — so the pull that INSPECT PROOF triggers
+// found a voice entry at the end, missed the existing chip, and appended a twin.
+ok("the dedupe finds the newest chip even when an entry landed after it",
+  /const lastChip = chips\.length > 0 \? chips\[chips\.length - 1\] : null;/.test(panelSource));
+ok("and a later run still gets its own card",
   /totalScreenshots/.test(panelSource.slice(panelSource.indexOf("function auditChipSignature"),
     panelSource.indexOf("function appendAuditVerificationChip"))));
+// The panel rendered "Voice: Voice: spoke 1 vault token(s)…": the voice controller
+// labels its own message and emitLocalStatus prefixed it again.
+ok("a voice status that is already labelled is not labelled twice",
+  /const label = \/\^\\s\*voice:\/i\.test\(status\) \? "" : "Voice: ";/.test(panelSource) &&
+    /text: `\$\{label\}\$\{status\}`/.test(panelSource));
+ok("the signature carries the run's newest frame, so two identical runs are not merged",
+  /const lastFrame =/.test(panelSource.slice(panelSource.indexOf("function auditChipSignature"),
+    panelSource.indexOf("function appendAuditVerificationChip"))) &&
+    /audit\.screenshots\[audit\.screenshots\.length - 1\]/.test(panelSource));
 // The badge used to read "ALL FRAMES VERIFIED" over a frame with a plainly
 // readable face, because the check that ran is narrower than that sentence. It
 // now names the check (re-OCR, over the frames it covered) and the card states
@@ -2697,7 +2749,8 @@ console.log("\n=== Scenario AK: planner turn liveness policy ===\n");
 
 const {
   withTurnBudget, newTurnLiveness, turnCutShortMessageFor, isRetryablePlannerError,
-  retryPolicyFor, RETRY_FIRST_OUTPUT_MS, scriptSwitchRate,
+  retryPolicyFor, RETRY_FIRST_OUTPUT_MS, scriptSwitchRate, plannerWaitCause,
+  unansweredTurnMessageFor, UNANSWERED_HEADERS_MS, plannerDiagnosticsReport,
 } = await import("../src/background/agent.ts");
 
 const budgetOpts = (messageFor) => ({
@@ -3688,20 +3741,285 @@ ok("the proven-endpoint retry is bounded by the short budget, not a second 90s w
 // failure on an unproven endpoint is still worth its one attempt.
 ok("the endpoint evidence never suppresses a real hiccup",
   retryPolicyFor(live({ ended: "settled" }), "Groq returned 503 — the service is overloaded, try again.", { endpointProvenThisRun: false }).retry === true);
+// The OTHER half of the same distinction, and the one a real socket taught this
+// policy: response headers prove the endpoint ACCEPTED a request from this run
+// even when no token ever streamed. Without that fact the run refused a retry to
+// a stall the endpoint had already acknowledged, and explained the refusal by
+// saying it "had not answered anything in this run" — a sentence printed beside a
+// diagnostics block reading "headers after 0.1s". The harness drives this against
+// a fake endpoint that sends headers and no body (scenario "stalled body").
+const ackedSilence = live({ ended: "silent", events: 0, endedAfterMs: 90_000 });
+ok("a silence from an endpoint that ACKNOWLEDGED the request is retried once",
+  retryPolicyFor(ackedSilence, silentMessage, { endpointAnsweredThisRun: true }).retry === true);
+ok("and the no-retry wording is kept for the endpoint that said nothing at all",
+  retryPolicyFor(ackedSilence, silentMessage, { endpointAnsweredThisRun: false }).retry === false &&
+    /had not answered anything in this run/.test(
+      retryPolicyFor(ackedSilence, silentMessage, { endpointAnsweredThisRun: false }).because,
+    ));
 
 // The budget must not shrink as the prompt grows. The prompt of a later turn
 // carries the page read, the history and the frame text — the largest requests
 // of the run — and time-to-first-token scales with prompt size, so the smaller
 // budget used to land on exactly the turns most likely to be cut.
 const agentBudgetSource = await readFile("src/background/agent.ts", "utf8");
+// The budgets are read through injectable defaults now (the harness drives a
+// 90 s silence in 300 ms), so what this asserts is that the SHIPPED numbers are
+// the ones a run with no overrides gets — same claim, stated where the defaults
+// are: no per-step split, and a retry that is cheaper than a first attempt.
 ok("every non-retry turn gets the same first-output budget (no cold/continuation split)",
-  /retry \? RETRY_FIRST_OUTPUT_MS : FIRST_OUTPUT_TIMEOUT_MS/.test(agentBudgetSource) &&
-  !/isColdTurn \? FIRST_OUTPUT_TIMEOUT_COLD_MS/.test(agentBudgetSource));
+  /const firstOutputMs = deps\.firstOutputMs \?\? FIRST_OUTPUT_TIMEOUT_MS/.test(agentBudgetSource) &&
+    /const retryFirstOutputMs = deps\.retryFirstOutputMs \?\? RETRY_FIRST_OUTPUT_MS/.test(agentBudgetSource) &&
+    /retry \? retryFirstOutputMs : firstOutputMs/.test(agentBudgetSource) &&
+    !/isColdTurn/.test(agentBudgetSource));
+ok("and a retry still gets the short budget rather than the full one",
+  /budgetFor = \(retry: boolean\): number =>\s*\n\s*retry \? retryFirstOutputMs : firstOutputMs/.test(agentBudgetSource) &&
+    RETRY_FIRST_OUTPUT_MS < 90_000);
 ok("the loop hands the retry policy the endpoint evidence instead of the message alone",
-  /retryPolicyFor\(firstTurnLiveness, firstMessage, \{[\s\S]{0,120}?endpointProvenThisRun: endpointServedThisRun/.test(agentBudgetSource));
+  /retryPolicyFor\(firstTurnLiveness, firstMessage, \{[\s\S]{0,160}?endpointProvenThisRun: endpointServedThisRun/.test(agentBudgetSource) &&
+    /endpointAnsweredThisRun,/.test(agentBudgetSource));
 ok("and that evidence is set where a turn actually resolved",
   /turn = await runPlannerTurn\(new AbortController\(\), firstTurnLiveness\);\n\s*endpointServedThisRun = true;/.test(agentBudgetSource) &&
-  /runPlannerTurn\(new AbortController\(\), newTurnLiveness\(\), true\);\n\s*endpointServedThisRun = true;/.test(agentBudgetSource));
+  // The retry passes isRetry=false DELIBERATELY (see the comment above the
+  // call): a dropped mid-answer means the model already saw the prompt, so the
+  // retry gets the full first-output window while the unanswered-headers cut
+  // still applies. An earlier revision of this assertion pinned `true`.
+  /runPlannerTurn\(new AbortController\(\), retryLiveness, false\);\n\s*endpointServedThisRun = true;/.test(agentBudgetSource));
+
+// ── What the silence was actually spent on ──────────────────────────────────
+// The reported run could not tell "the provider never answered" from "it
+// answered and the model is thinking", and both printed "no tokens yet". That
+// is what turned a 90 s wait into "the model is slow" — a conclusion about the
+// model, reached from evidence that cannot see the model. The adapters now
+// report the response headers and one pure function turns those boundary
+// timings into the sentence the ticker and the failure message both print.
+const neverAnswered = plannerWaitCause({ requestedAt: 0, headersAt: 0 }, 41_000);
+ok("a request no endpoint acknowledged says exactly that",
+  /no response headers have come back/.test(neverAnswered) && /stalled connection/.test(neverAnswered),
+  neverAnswered);
+ok("and it rules the model out, because the model never saw the prompt",
+  /the model has not seen it yet/.test(neverAnswered));
+ok("and it does not rule out the machine, which it cannot measure from here",
+  /machine too busy to put the request on the wire/.test(neverAnswered));
+
+const answeredThenQuiet = plannerWaitCause({ requestedAt: 1_000, headersAt: 1_400 }, 91_000);
+ok("an endpoint that answered and then went quiet is described as the provider's wait",
+  /accepted the request 0\.4s after it left/.test(answeredThenQuiet) &&
+    /sent no body for 90s/.test(answeredThenQuiet),
+  answeredThenQuiet);
+ok("and it names both readings of that quiet, so neither is asserted",
+  /a queue/.test(answeredThenQuiet) && /producing its first token/.test(answeredThenQuiet));
+
+const measuredSilence = turnCutShortMessageFor(
+  "NVIDIA test",
+  "silent",
+  live({ events: 0 }),
+  90_000,
+  90_000,
+  { requestedAt: 0, headersAt: 0 },
+);
+ok("the failure line carries the measurement, not just the elapsed time",
+  /did not respond within 90s/.test(measuredSilence) &&
+    /no response headers have come back/.test(measuredSilence),
+  measuredSilence);
+ok("and it is still a non-retryable reading of an unproven endpoint",
+  retryPolicyFor(live({ ended: "silent", events: 0, endedAfterMs: 90_000 }), measuredSilence).retry === false);
+ok("a message built with no timings is unchanged (the clock alone still works)",
+  /^The planner \(NVIDIA test\) did not respond within 90s\. The provider/.test(silentMessage),
+  silentMessage);
+
+// Wiring. The ticker is an inline closure inside runTask and what the user
+// stares at during the wait, so it is asserted on the source the way the rest of
+// the loop is; the adapters are asserted by the milestone call they must make.
+ok("the wait ticker prints the measured cause rather than a bare \"no tokens yet\"",
+  /plannerWaitCause\(turnTiming, performance\.now\(\)\)/.test(agentBudgetSource));
+ok("the run records the milestones the adapters report",
+  /onMilestone: \(milestone, at\) => \{/.test(agentBudgetSource) &&
+    /turnTiming\.headersAt = at/.test(agentBudgetSource));
+ok("and a retry does not inherit the previous attempt's headers",
+  /turnTiming = \{ requestedAt: performance\.now\(\), headersAt: 0 \};/.test(agentBudgetSource));
+const transportAdapters = await Promise.all(
+  ["openai", "ollama", "anthropic"].map((name) =>
+    readFile(`src/background/providers/${name}.ts`, "utf8"),
+  ),
+);
+ok("every adapter that sits on a transport reports when headers arrived",
+  transportAdapters.every((src) => /onMilestone\?\.\("headers", performance\.now\(\)\)/.test(src)),
+  transportAdapters.map((src, i) => `${["openai", "ollama", "anthropic"][i]}=${/onMilestone\?\.\("headers"/.test(src)}`).join(" "));
+// …and the model's first byte of ANY kind, which is not the same measurement.
+// A turn that goes straight to a tool call streams no prose at all, so a
+// first-token measurement taken only from onText/onThought recorded NOTHING for
+// the turns a run is mostly made of — and the speed-up decision, which exists to
+// notice a queueing endpoint, could not see the queue in the one reproduced with
+// a real socket (the harness's queueing-endpoint scenario).
+ok("every adapter also reports the model's first byte, whatever channel it is on",
+  transportAdapters.every((src) => /onMilestone\?\.\("output", performance\.now\(\)\)/.test(src)),
+  transportAdapters.map((src, i) => `${["openai", "ollama", "anthropic"][i]}=${/onMilestone\?\.\("output"/.test(src)}`).join(" "));
+ok("the run reads that milestone as time to first token",
+  /milestone === "output"[\s\S]{0,400}?liveness\.firstOutputAt = at/.test(agentBudgetSource));
+ok("and the milestone is part of the adapter contract, so a new adapter must report it",
+  /PlannerMilestone = "requested" \| "headers" \| "output"/.test(
+    await readFile("src/background/providers/types.ts", "utf8"),
+  ));
+
+// ── A connection that dies mid-answer ───────────────────────────────────────
+// The harness reproduces this by destroying the socket after two deltas. The
+// socket layer's own words (`terminated`, `fetch failed`) used to reach the
+// transcript verbatim and matched no keyword `isRetryablePlannerError` reads, so a
+// dropped answer — the one failure where the prompt DID reach the model — got no
+// retry at all.
+const dropError = describeOpenAIError(new TypeError("terminated"), "NVIDIA");
+ok("a transport failure is described as the connection, not in the socket's own word",
+  /connection dropped mid-answer/.test(dropError.message) && !/\bterminated\b/.test(dropError.message),
+  dropError.message);
+ok("and it is retryable, because the model had already seen the prompt",
+  isRetryablePlannerError(dropError.message), dropError.message);
+ok("the run's own abort is never reported as a network fault",
+  transportFailure("This operation was aborted", "AbortError") === null);
+ok("and an endpoint that ANSWERED with a status is not read as a transport failure",
+  transportFailure("503 Service Unavailable") === null &&
+    !/connection dropped/.test(describeOpenAIError({ status: 503, message: "Service Unavailable" }, "Groq").message));
+
+// ── A request nobody acknowledged is not a slow model ───────────────────────
+// The silence budget bounds the wait for a MODEL. It cannot tell a model
+// thinking from a request no endpoint accepted, and spending all of it on the
+// second proves only that the endpoint still has not answered — while the model
+// has not seen the prompt, so its speed was never in question. The adapters
+// report headers; this is what the guard does with them.
+const headersBoundOpts = (over = {}) => ({
+  firstOutputMs: 30_000,
+  idleMs: 30_000,
+  maxMs: 60_000,
+  onTimeout() {},
+  headersMs: 60,
+  messageFor: (reason, liv, waited) =>
+    reason === "unanswered"
+      ? unansweredTurnMessageFor("NVIDIA test", waited, { requestedAt: 0, headersAt: 0 })
+      : turnCutShortMessageFor("NVIDIA test", reason, liv, waited, 30_000),
+  ...over,
+});
+
+const unacked = newTurnLiveness();
+let unackedMessage = "";
+await withTurnBudget(new Promise(() => {}), unacked, headersBoundOpts()).then(
+  () => { unackedMessage = "settled"; },
+  (err) => { unackedMessage = err.message; },
+);
+ok("a request the endpoint never acknowledges is cut as 'unanswered'",
+  unacked.ended === "unanswered", `${unacked.ended} after ${Math.round(unacked.endedAfterMs)}ms`);
+ok("and it is cut at the headers bound, not after the full silence budget",
+  unacked.endedAfterMs < 30_000, `${Math.round(unacked.endedAfterMs)}ms of a 30s silence budget`);
+ok("the model is not blamed for a prompt it never received",
+  /has not acknowledged the request/.test(unackedMessage) &&
+    /model has not seen the prompt/.test(unackedMessage),
+  unackedMessage);
+ok("and the text is not retryable, because a retry re-sends to the same endpoint",
+  !isRetryablePlannerError(unackedMessage), unackedMessage);
+ok("the retry policy refuses it and states why",
+  retryPolicyFor(live({ ended: "unanswered", events: 0, endedAfterMs: 25_000 }), unackedMessage).retry === false &&
+    /never acknowledged/.test(retryPolicyFor(live({ ended: "unanswered", events: 0, endedAfterMs: 25_000 }), unackedMessage).because),
+  retryPolicyFor(live({ ended: "unanswered", events: 0, endedAfterMs: 25_000 }), unackedMessage).because);
+
+// Teeth: an endpoint that DID acknowledge the request must still get the whole
+// silence budget. The guard reads one fact — headers — and must not fire without it.
+const acked = newTurnLiveness();
+acked.headersAt = performance.now();
+await withTurnBudget(new Promise(() => {}), acked, headersBoundOpts({ firstOutputMs: 300 })).then(
+  () => {},
+  () => {},
+);
+ok("an endpoint that has acknowledged the request is never cut for not acknowledging it",
+  acked.ended === "silent", `ended=${acked.ended}`);
+
+// …and the bound is off for a caller with no milestones at all (every pure test
+// above, and any planner that reports none), so nothing is cut on evidence it
+// does not have.
+const noMilestones = newTurnLiveness();
+await withTurnBudget(new Promise(() => {}), noMilestones, {
+  firstOutputMs: 300, idleMs: 300, maxMs: 60_000, onTimeout() {},
+  messageFor: (reason, liv, waited) => turnCutShortMessageFor("NVIDIA test", reason, liv, waited, 300),
+}).then(() => {}, () => {});
+ok("without adapter milestones the cut is the silence one, as before",
+  noMilestones.ended === "silent", `ended=${noMilestones.ended}`);
+ok("the run passes the bound on the first attempt and not on the retry",
+  /const unansweredHeadersMs = deps\.unansweredHeadersMs \?\? UNANSWERED_HEADERS_MS/.test(agentBudgetSource) &&
+    /headersMs: isRetry \? Infinity : unansweredHeadersMs/.test(agentBudgetSource) &&
+    UNANSWERED_HEADERS_MS > 0 && UNANSWERED_HEADERS_MS < 90_000,
+  `${Math.round(UNANSWERED_HEADERS_MS / 1000)}s`);
+ok("the headers milestone reaches the guard from the adapter's report",
+  /liveness\.headersAt = at;[\s\S]{0,400}?endpointAnsweredThisRun = true;/.test(agentBudgetSource),
+  "the same report is what tells the retry policy the request was accepted — see below");
+
+// The re-route: what a cut turn DOES, rather than failing. A different endpoint
+// is the only thing left that can answer, so the same turn goes to the fast
+// model and reuses the single retry attempt — not a third kind of wait.
+ok("a cut for an unacknowledged request re-routes the same turn to the fast model",
+  /firstTurnLiveness\.ended === "unanswered"[\s\S]{0,300}?settings\.autoFastPlannerOnSlowProvider !== false;/.test(agentBudgetSource) &&
+    // A generous window on purpose: this is a claim about ORDER inside one
+    // branch, and a comment added between the two statements is not a behaviour
+    // change. (The harness asserts the behaviour itself, against a real socket.)
+    /else if \(canReroute && rerouteModel\)[\s\S]{0,1500}?planner = createPlanner\(\{ \.\.\.settings, fastPlanner: true \}\)/.test(agentBudgetSource),
+  "the catch must switch the planner before the retry attempt, not instead of it");
+ok("and it is not offered when the user pinned the model or there is nothing to switch to",
+  /settings\.fastPlanner !== true/.test(agentBudgetSource) &&
+    /rerouteModel !== null/.test(agentBudgetSource));
+
+// ── The report a stalled run can be copied from ─────────────────────────────
+// "It hung for 90 seconds" is not a reproducible report. The live lines are
+// patched and collapsed as the run goes, so the run ends by emitting one block
+// with the timings in it — the facts that make the difference between "the
+// provider queued the request" and "the model was slow", neither of which the
+// reader can infer from the elapsed time they watched.
+const stalledReport = plannerDiagnosticsReport({
+  planner: "NVIDIA nvidia/nemotron-3.5-lightning-30b-a3b",
+  fastModel: "nvidia/llama-3.1-nemotron-51b-instruct",
+  turns: [
+    { planner: "NVIDIA nvidia/nemotron-3.5-lightning-30b-a3b", headersMs: null, firstOutputMs: null, ended: "unanswered", streamed: false, ranMs: 25_100, localWork: true },
+    { planner: "nvidia/llama-3.1-nemotron-51b-instruct", headersMs: 400, firstOutputMs: 1_300, ended: "settled", streamed: true, ranMs: 2_100, localWork: false },
+  ],
+  vision: true,
+  outcome: "not a success · 0 action(s) · 1 cut planner wait(s) · 1 error(s) · egress 26 KB",
+});
+ok("the block opens with what it is and what to do with it",
+  stalledReport.split("\n")[0] === "- planner diagnostics, copy this into a bug report -",
+  stalledReport.split("\n")[0]);
+ok("it names the failure the elapsed time cannot show",
+  /no response headers/.test(stalledReport) &&
+    /cut: the endpoint never acknowledged the request/.test(stalledReport),
+  stalledReport.split("\n").slice(4, 6).join(" | "));
+ok("and separates the endpoint's latency from the model's, second by second",
+  /headers after 0\.4s, first token after 1\.3s/.test(stalledReport));
+ok("it names the local pipeline that could equally have starved the request",
+  /local frame pipeline running/.test(stalledReport) &&
+    /running during 1 of 2 attempt\(s\)/.test(stalledReport) &&
+    /vision on/.test(stalledReport));
+ok("it carries the budgets the cut was measured against",
+  /first output 90s/.test(stalledReport) && /unanswered 25s/.test(stalledReport) &&
+    /turn ceiling 210s/.test(stalledReport));
+ok("and it is a block, not prose: one line per fact, one attempt per line",
+  stalledReport.split("\n").length === 8,
+  `${stalledReport.split("\n").length} lines`);
+ok("a run whose first attempt settled reports no cut at all",
+  !/cut:/.test(plannerDiagnosticsReport({
+    planner: "Groq x", fastModel: null,
+    turns: [{ planner: "Groq x", headersMs: 200, firstOutputMs: 300, ended: "settled", streamed: true, ranMs: 900, localWork: false }],
+    vision: false, outcome: "success",
+  })));
+// Read the panel here rather than reusing the variable the ledger section
+// declares below this point: an assertion that reaches forward is one reorder
+// away from a ReferenceError instead of a failing check.
+const diagnosticsPanelSource = await readFile("src/sidepanel/sidepanel.ts", "utf8");
+ok("the run emits the block as its own entry, and the panel can copy it",
+  /role: "diagnostics"/.test(agentBudgetSource) &&
+    /entry\.role === "diagnostics"/.test(diagnosticsPanelSource) &&
+    /navigator\.clipboard\.writeText\(rawTexts\.get\(entry\.id\)/.test(diagnosticsPanelSource),
+  `run=${/role: "diagnostics"/.test(agentBudgetSource)} panel=${/entry\.role === "diagnostics"/.test(diagnosticsPanelSource)} copy=${/navigator\.clipboard\.writeText\(rawTexts\.get\(entry\.id\)/.test(diagnosticsPanelSource)}`);
+// The retry's liveness is a named binding, not an inline literal: the slow-endpoint
+// speed-up needs the retry turn's own time-to-first-token, and an inline
+// `newTurnLiveness()` inside the call cannot be measured at settle time.
+ok("the retry's liveness is named so its first-token time can be measured",
+  /const retryLiveness = newTurnLiveness\(\);/.test(agentBudgetSource) &&
+    /settleWait\("responded", retryLiveness\)/.test(agentBudgetSource) &&
+    /settleWait\("responded", firstTurnLiveness\)/.test(agentBudgetSource));
 ok("a status-coded transport failure is still retried once",
   retryPolicyFor(live({ ended: "settled" }), "Groq returned 503 — the service is overloaded, try again.").retry === true,
   "the one case a retry genuinely resolves");
@@ -3713,8 +4031,12 @@ ok("a non-transient failure is never retried",
 ok("the retry's own budget is short, because a hiccup answers in seconds",
   RETRY_FIRST_OUTPUT_MS <= 30_000, `${RETRY_FIRST_OUTPUT_MS}ms`);
 const agentRetrySource = await readFile("src/background/agent.ts", "utf8");
-ok("and the loop actually gives the retry that budget instead of the cold 90s",
-  /runPlannerTurn\(new AbortController\(\), newTurnLiveness\(\), true\)/.test(agentRetrySource) &&
+// The retry of a DROPPED connection passes isRetry=false deliberately: the
+// model already saw the prompt, so it gets the full first-output window
+// (budgetFor(false) === firstOutputMs) while the unanswered-headers cut still
+// applies (headersMs is only Infinity for isRetry=true). Pin both halves.
+ok("and the loop gives a dropped-connection retry the full window, not the short one",
+  /runPlannerTurn\(new AbortController\(\), retryLiveness, false\)/.test(agentRetrySource) &&
   /firstOutputMs: budgetFor\(isRetry\)/.test(agentRetrySource));
 ok("the cut records how long the turn ran, which is the signal the policy needs",
   /liveness\.endedAfterMs = waitedMs/.test(agentRetrySource));
@@ -3787,7 +4109,12 @@ ok("an ordinary narration delta still appends in both",
 // that (measured live: one gpt-oss-20b turn streamed 3 478 chars of reasoning
 // through onText and returned an empty turn.text), so the split is asserted for
 // every adapter that parses a reasoning field, not just the one that was wrong.
-const providerFiles = ["groq", "nvidia", "openai", "anthropic", "ollama"];
+// There is one adapter for every OpenAI-compatible endpoint now (openai.ts),
+// so the channel split has exactly one place to be right. The alternative — an
+// adapter per endpoint — is how the same reasoning-field bug reached a second
+// file: Groq's file was fixed, NVIDIA's was a copy of it, and the next endpoint
+// would have been a third copy.
+const providerFiles = ["openai", "anthropic", "ollama"];
 for (const name of providerFiles) {
   const source = await readFile(`src/background/providers/${name}.ts`, "utf8");
   // The bug class is a streamed reasoning FIELD routed to the wrong channel; a
@@ -3803,6 +4130,29 @@ for (const name of providerFiles) {
     /onThought\?\.\(/.test(source) && !toAnswer,
     toAnswer ? "reasoning is passed to onText" : "ok");
 }
+
+const goneAdapters = await Promise.all(
+  ["groq", "nvidia"].map(async (name) => {
+    try {
+      await readFile(`src/background/providers/${name}.ts`, "utf8");
+      return false;
+    } catch {
+      return true;
+    }
+  }),
+);
+ok("the duplicated Groq and NVIDIA adapters are gone", goneAdapters.every(Boolean),
+  goneAdapters.map((gone, i) => `${["groq", "nvidia"][i]}=${gone ? "gone" : "present"}`).join(" "));
+ok("and all four OpenAI-compatible providers resolve through the one implementation",
+  ["openai", "openrouter", "groq", "nvidia"].every((p) => {
+    const planner = createPlanner({
+      provider: p,
+      apiKeys: { [p]: "test-key" },
+      models: { [p]: DEFAULT_SETTINGS.models[p] },
+    });
+    return /^(OpenAI|OpenRouter|Groq|NVIDIA) /.test(planner.label) &&
+      planner.label.includes(DEFAULT_SETTINGS.models[p]);
+  }));
 
 const degenerateMessage = turnCutShortMessageFor("NVIDIA test", "degenerate", degenerateLiveness, 12_000, 60_000);
 ok("the degeneration message names the real cause (produced text, nothing new)",
@@ -4533,6 +4883,69 @@ ok("with the search case named explicitly, since that is the one that went wrong
 ok("and the instruction that invited copying the length is gone",
   !/Copy the route, never the values/.test(routeText));
 
+// ─── Scenario AU: earlier chats must not poison a fresh task ───────────────
+// Reported run: task "open yt and play the first video", previous chat
+// "open yt and search for harkirat singh". The model reasoned "Need to search
+// 'harkirat singh'" — the old search term rode raw into the new prompt via
+// the history block (search terms are instruction parameters, deliberately
+// un-tokenized, so replay carries them verbatim). Fresh tasks now get NO
+// history; follow-ups keep it, with quarantine framing.
+const { isFollowUpTask } = await import("../src/background/agent.ts");
+ok("the reported task is fresh, not a follow-up",
+  isFollowUpTask("open yt and play the first video") === false);
+ok("bare nouns never count as follow-ups",
+  isFollowUpTask("open yt") === false &&
+  isFollowUpTask("open mail and open the first email i received") === false &&
+  isFollowUpTask("open the first video") === false &&
+  isFollowUpTask("") === false);
+ok("continuation markers do",
+  isFollowUpTask("continue") === true &&
+  isFollowUpTask("also book a cab") === true &&
+  isFollowUpTask("and then click submit") === true &&
+  isFollowUpTask("do that again") === true);
+ok("backward references do",
+  isFollowUpTask("reply to it") === true &&
+  isFollowUpTask("summarize that email") === true &&
+  isFollowUpTask("open them") === true);
+const agentHistorySource = await readFile("src/background/agent.ts", "utf8");
+ok("the history block is gated on the follow-up check",
+  /history\.length > 0 && isFollowUpTask\(task\)/.test(agentHistorySource));
+ok("and the replayed block says it is not the current task",
+  /NOT your task/.test(agentHistorySource) &&
+  /Never carry search terms, names, or targets/.test(agentHistorySource));
+
+// ─── Scenario AV: page-introduced tokens get a legend; stalls get steered ──
+// Reported run ("open gmail and open the first email"): the page introduced
+// <PII_1> (the Gmail address) while the legend covered task tokens only, so
+// the model invented meanings for it ("Suppose <PII_1> is something like
+// example.com?"); then read_page → wait → read_page burned ~50 s for zero
+// new evidence; and a Gmail-send route surfaced in reasoning on a run that
+// started on YouTube (trajectories keyed by start-tab domain).
+const { pageSignature, STAGNATION_STEPS, STAGNATION_DIRECTIVE } = await import("../src/background/agent.ts");
+ok("the legend scope covers the opening page read, not just the task",
+  /tokenizedTask\.includes\(e\.token\) \|\| openingPageRead\.includes\(e\.token\)/.test(agentHistorySource));
+ok("page signatures are stable for the same page",
+  pageSignature("https://mail.google.com/mail/u/0/#inbox", 30, "Inbox Compose") ===
+  pageSignature("https://mail.google.com/mail/u/0/#inbox", 30, "Inbox Compose"));
+ok("and they move with content or element count, never with scroll alone",
+  pageSignature("https://x.com/", 10, "a") !== pageSignature("https://x.com/", 10, "b") &&
+  pageSignature("https://x.com/", 10, "a") !== pageSignature("https://x.com/", 11, "a") &&
+  pageSignature("https://x.com/?a=1&b=2", 10, "a") === pageSignature("https://x.com/?a=1", 10, "a"));
+ok("the stagnation budget is two repeats (three identical steps fire)",
+  STAGNATION_STEPS === 2);
+ok("and the directive forbids the stalling pair by name",
+  /Do not call read_page, find_text,\s*\n?\s*or wait again/.test(STAGNATION_DIRECTIVE));
+const agentStagnationSource = await readFile("src/background/agent.ts", "utf8");
+ok("the loop computes the signature through the shared helper",
+  /pageSignature\(snapshot\.url, snapshot\.elements\.length, snapshot\.text\)/.test(agentStagnationSource));
+ok("a stagnated run is steered through the planner's own channel",
+  /messages\.push\(\{ role: "user", content: STAGNATION_DIRECTIVE \}\)/.test(agentStagnationSource));
+ok("and a repeat after steering stops the run instead of billing forever",
+  /Page still unchanged after the steering advice/.test(agentStagnationSource));
+ok("recorded experience is keyed by where the run worked, not where it started",
+  /domain: snapshot\?\.url \? extractDomain\(snapshot\.url\) : domain/.test(agentStagnationSource) &&
+  /pageType: snapshot\s*\n?\s*\? classifyPageType\(snapshot\.url/.test(agentStagnationSource));
+
 console.log("\n=== Scenario AT: what task text is redacted, and what must not be ===\n");
 
 // An audit of the whole task path against realistic inputs, kept as the
@@ -4741,12 +5154,15 @@ const loopUsesHelper = (await readFile("src/background/agent.ts", "utf8"))
 ok("the loop delegates that decision instead of re-deriving it", loopUsesHelper);
 
 // Tesseract's cold start must be paid off the critical path. The service worker
-// warms it when it creates the offscreen document, and the offscreen document
+// warms it when it creates the offscreen document — directly on the worker side
+// (so the warm-up starts even if the document's message handler has not
+// registered yet) AND via the warm-ocr message — and the offscreen document
 // must accept that message.
 const workerSource = await readFile("src/background/service-worker.ts", "utf8");
 const offscreenDocSource = await readFile("src/offscreen/offscreen.ts", "utf8");
 ok("the worker warms OCR when it creates the offscreen document",
-  /ensureOffscreenDocument\(\)[\s\S]{0,600}warm-ocr/.test(workerSource));
+  /async function warmOffscreen[\s\S]{0,2000}warmOcrWorker\(\)/.test(workerSource) &&
+  /ensureOffscreenDocument\(\)[\s\S]{0,2000}warm-ocr/.test(workerSource));
 ok("and the offscreen document handles that message",
   /message\.type === "warm-ocr"/.test(offscreenDocSource));
 
@@ -5483,5 +5899,450 @@ ok("and it reports the failure instead of naming a result",
   loopNarrationAt > 0 &&
     /rather than a result, so it is not shown as this task's/.test(complaintSource.slice(loopNarrationAt, loopNarrationAt + 1400)) &&
     /role: "error"/.test(complaintSource.slice(loopNarrationAt, loopNarrationAt + 1400)));
+
+// ─── Scenario BG: a weak tier cannot erase a strong mask ───────────────────
+console.log("\n=== Scenario BG: paint order — weak tiers cannot erase a strong mask ===\n");
+
+// The reported bug: on Gmail every frame escalated with 7 PIXEL findings saying a
+// "Sender/contact" span was "not opaque (only 45% of the interior covered)". The
+// regions overlap, and the plan was painted in the page's own order — so the
+// later blur read a rectangle that already held the black mask and wrote the
+// average back, turning the mask grey. Rebuilt-and-re-verified then paid a second
+// OCR pass over the strip on every frame.
+const { planRegionPaints } = await import("../src/shared/region-paint.ts");
+
+const paintPolicy = { destroyFaces: true, maskCredentials: true };
+const paintGeo = { scale: 1, offsetY: 0, imageWidth: 80, imageHeight: 70 };
+
+// Page order is the trigger: the STRONG region is reported FIRST, the weak one
+// that overlaps it second. The weak region has to stick OUT past the mask, or a
+// blur of an already-black rectangle averages to black and nothing goes wrong —
+// it is the light pixels the blur pulls in that grey the overlap.
+const overlappingRegions = [
+  { x: 20, y: 20, width: 40, height: 24, kind: "email_text", label: "Email address in text" },
+  { x: 30, y: 16, width: 32, height: 32, kind: "input_field", label: "Sender/contact" },
+];
+const paintOps = planRegionPaints(overlappingRegions, paintGeo, paintPolicy);
+ok("the plan paints the weak tier first and the opaque mask LAST despite the page's order",
+  paintOps.length === 2 && paintOps[0].tier === "blur" && paintOps[1].tier === "opaque",
+  JSON.stringify(paintOps.map((o) => o.tier)));
+ok("tier order is monotonic (no strong-then-weak pair can survive the sort)",
+  paintOps.every((op, i) => i === 0 ||
+    ({ skip: 0, blur: 1, surrogate: 2, opaque: 3 })[paintOps[i - 1].tier] <=
+    ({ skip: 0, blur: 1, surrogate: 2, opaque: 3 })[op.tier]));
+
+// Paint the plan into real pixels and verify with the REAL verifier. The blur
+// simulator reproduces the mechanism that caused the finding: it reads the
+// rectangle's CURRENT contents and writes their mean back, so a rect that already
+// holds the opaque mask comes out grey.
+function meanFill(image, rect) {
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let y = rect.y; y < rect.y + rect.height; y++) {
+    for (let x = rect.x; x < rect.x + rect.width; x++) {
+      const i = (y * image.width + x) * 4;
+      if (i < 0 || i + 3 >= image.data.length) continue;
+      r += image.data[i]; g += image.data[i + 1]; b += image.data[i + 2]; n++;
+    }
+  }
+  if (!n) return;
+  const mean = [Math.round(r / n), Math.round(g / n), Math.round(b / n)];
+  for (let y = rect.y; y < rect.y + rect.height; y++) {
+    for (let x = rect.x; x < rect.x + rect.width; x++) {
+      const i = (y * image.width + x) * 4;
+      if (i < 0 || i + 3 >= image.data.length) continue;
+      image.data[i] = mean[0]; image.data[i + 1] = mean[1]; image.data[i + 2] = mean[2];
+    }
+  }
+}
+function fillRect(image, rect, colour) {
+  for (let y = rect.y; y < rect.y + rect.height; y++) {
+    for (let x = rect.x; x < rect.x + rect.width; x++) {
+      const i = (y * image.width + x) * 4;
+      if (i < 0 || i + 3 >= image.data.length) continue;
+      image.data[i] = colour[0]; image.data[i + 1] = colour[1]; image.data[i + 2] = colour[2];
+    }
+  }
+}
+function copyImage(image) {
+  return { width: image.width, height: image.height, data: new Uint8ClampedArray(image.data) };
+}
+function applyPlan(image, ops, order) {
+  for (const index of order) {
+    const op = ops[index];
+    if (!op.painted || !op.rect) continue;
+    if (op.tier === "opaque") fillRect(image, op.rect, [0, 0, 0]);
+    else if (op.tier === "blur") meanFill(image, op.rect);
+    else fillRect(image, op.rect, [255, 255, 255]);
+  }
+}
+
+const paintOriginal = makeImage(80, 70, (x, y) =>
+  x >= 20 && x < 60 && y >= 20 && y < 44
+    ? ((x + y) % 2 ? [40, 40, 40] : [90, 90, 90]) // readable-looking glyph pixels
+    : [255, 255, 255]);
+const opaqueOp = paintOps.find((o) => o.tier === "opaque");
+const opaqueRegion = {
+  x: opaqueOp.rect.x, y: opaqueOp.rect.y,
+  width: opaqueOp.rect.width, height: opaqueOp.rect.height,
+  kind: "email_text", label: "Email address in text",
+};
+
+const fixedImage = copyImage(paintOriginal);
+applyPlan(fixedImage, paintOps, paintOps.map((_, i) => i));
+const fixedVerdict = verifyRegions(paintOriginal, fixedImage, [opaqueRegion], Date.now(), paintPolicy);
+ok("the fix's order leaves the opaque mask intact (frame verifies)",
+  fixedVerdict.verified === true, JSON.stringify(fixedVerdict.leakedRegions ?? fixedVerdict));
+
+// Teeth: the SAME plan painted in the page's order — which is what shipped before
+// this fix — must FAIL, or the assertion above proves nothing.
+const pageOrderImage = copyImage(paintOriginal);
+// The order the region list was written in — i.e. what shipped before the sort.
+const pageOrder = overlappingRegions
+  .map((region) => paintOps.findIndex((op) => op.kind === region.kind))
+  .filter((index) => index >= 0);
+applyPlan(pageOrderImage, paintOps, pageOrder);
+const pageOrderVerdict = verifyRegions(paintOriginal, pageOrderImage, [opaqueRegion], Date.now(), paintPolicy);
+ok("painting the same plan in page order re-creates the reported failure (only partly covered)",
+  pageOrderVerdict.verified === false,
+  JSON.stringify(pageOrderVerdict.leakedRegions ?? pageOrderVerdict));
+
+// ─── Scenario BH: ledger digests survive a key-reordering storage ──────────
+console.log("\n=== Scenario BH: the ledger chain survives a key-reordering storage ===\n");
+
+// The reported symptom was the panel's badge reading "TAMPERED — Hash mismatch:
+// entry 1823 (redact) does not match its recorded digest" on an untouched ledger.
+// Every digest covered a JSON serialization whose key order came from the write
+// path, and browser storage is not obliged to hand that order back — so a
+// reordered object re-hashed to a different digest and accused the user of
+// tampering. The digest now covers a canonical (recursively key-sorted) encoding.
+const { canonicalJson, LEDGER_HASH_SCHEME } = await import("../src/background/privacy-ledger.ts");
+
+const LEDGER_KEY = "pry-privacy-ledger";
+const reorderKeys = (value) => {
+  if (Array.isArray(value)) return value.map(reorderKeys);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const k of Object.keys(value).sort()) out[k] = reorderKeys(value[k]);
+    return out;
+  }
+  return value;
+};
+/** Emulate a storage round trip that does not preserve the writer's key order. */
+const reorderStoredLedger = () => {
+  const before = JSON.stringify(mem.get(LEDGER_KEY));
+  mem.set(LEDGER_KEY, reorderKeys(mem.get(LEDGER_KEY)));
+  return before !== JSON.stringify(mem.get(LEDGER_KEY));
+};
+
+ok("canonicalJson is indifferent to key order (nested and through arrays)",
+  canonicalJson({ b: 1, a: { d: 2, c: [ { f: 3, e: 4 } ] } }) ===
+    canonicalJson({ a: { c: [ { e: 4, f: 3 } ], d: 2 }, b: 1 }));
+ok("canonicalJson still distinguishes different values",
+  canonicalJson({ a: 1 }) !== canonicalJson({ a: 2 }));
+
+await clearLedger();
+await recordAction("navigate", true, 3);
+await recordRedaction(6, "opaque");
+await recordAction("click", true);
+const ledgerCleanSummary = await getLedgerSummary();
+ok("a fresh chain verifies before any reordering",
+  ledgerCleanSummary.chainValid === true && ledgerCleanSummary.chainHashesIntact === true,
+  JSON.stringify(ledgerCleanSummary.chainReasons));
+ok("every new entry carries the canonical digest scheme",
+  mem.get(LEDGER_KEY).entries.every((e) => e.scheme === LEDGER_HASH_SCHEME));
+
+const reorderChangedSomething = reorderStoredLedger();
+ok("the simulated storage round trip really did reorder the stored keys",
+  reorderChangedSomething === true);
+const reorderedSummary = await getLedgerSummary();
+ok("the chain still verifies after storage hands the keys back in another order",
+  reorderedSummary.chainValid === true && reorderedSummary.chainHashesIntact === true,
+  JSON.stringify(reorderedSummary.chainReasons));
+ok("and it is reported as INTACT rather than unverifiable",
+  reorderedSummary.chainHashesIntact === true && reorderedSummary.chainLegacyUnverifiable === 0);
+
+// Teeth: a reorder-tolerant digest must still catch a real edit.
+const tamperStore = mem.get(LEDGER_KEY);
+tamperStore.entries[1].data.redactedCount = 999;
+mem.set(LEDGER_KEY, reorderKeys(tamperStore));
+const tamperedSummary = await getLedgerSummary();
+ok("a genuinely edited entry is still reported as TAMPERED",
+  tamperedSummary.chainValid === false && tamperedSummary.chainHashesIntact === false,
+  JSON.stringify(tamperedSummary.chainReasons));
+ok("and the reason names the entry's sequence and write type",
+  /entry \d+ \(redact\)/.test(tamperedSummary.chainReasons[0] ?? ""),
+  tamperedSummary.chainReasons[0]);
+
+// Legacy entries cannot be re-derived at all. They must say so instead of
+// accusing anyone — the distinction the panel's four-state badge rests on.
+await clearLedger();
+await recordAction("navigate", true);
+await recordRedaction(2, "opaque");
+const legacyStore = mem.get(LEDGER_KEY);
+const lastLegacy = legacyStore.entries[legacyStore.entries.length - 1];
+delete lastLegacy.scheme;                       // written before the canonical scheme
+lastLegacy.hash = "0".repeat(64);               // and its digest cannot be re-derived
+mem.set(LEDGER_KEY, reorderKeys(legacyStore));
+const legacySummary = await getLedgerSummary();
+
+// An entry tagged with an OLDER scheme is the case that produced a live false
+// "TAMPERED" while this scheme was being iterated on: the digest was written by
+// a rule the newer build no longer implements, so it cannot be re-derived — which
+// is not evidence that anyone edited it.
+await clearLedger();
+await recordAction("navigate", true);
+await recordRedaction(2, "opaque");
+const priorSchemeStore = mem.get(LEDGER_KEY);
+for (const entry of priorSchemeStore.entries) {
+  entry.scheme = 2;
+  entry.hash = "f".repeat(64);                  // underivable by THIS build
+}
+// Keep the LINKS consistent with those mangled hashes. An untouched ledger
+// written by an older build has underivable digests and INTACT links — storage
+// key reordering does not touch the recorded hash strings — so a fixture that
+// left entry 2 pointing at a hash entry 1 no longer carries would be asserting
+// the reason for a broken link and calling it the reason for the scheme.
+for (let i = 1; i < priorSchemeStore.entries.length; i++) {
+  priorSchemeStore.entries[i].prevHash = priorSchemeStore.entries[i - 1].hash;
+}
+mem.set(LEDGER_KEY, priorSchemeStore);
+const priorSchemeSummary = await getLedgerSummary();
+ok("an entry stamped with an older digest scheme is not reported as TAMPERED",
+  priorSchemeSummary.chainHashesIntact === true &&
+    priorSchemeSummary.chainLegacyUnverifiable >= 2,
+  JSON.stringify(priorSchemeSummary.chainReasons));
+ok("and its reason names the scheme it was written under",
+  /written under digest scheme 2; this build derives scheme \d+/.test(
+    priorSchemeSummary.chainReasons[0] ?? ""),
+  priorSchemeSummary.chainReasons[0]);
+ok("a legacy entry with an underivable digest is NOT reported as tampering",
+  legacySummary.chainHashesIntact === true && legacySummary.chainValid === true,
+  JSON.stringify(legacySummary.chainReasons));
+ok("it is counted as unverifiable, which is what the panel renders as INTACT*",
+  legacySummary.chainLegacyUnverifiable >= 1 &&
+    /unverifiable, not evidence of tampering/.test(legacySummary.chainReasons[0] ?? ""),
+  legacySummary.chainReasons[0]);
+
+// An unverifiable entry is the OLDEST in the window, so the one reason slot
+// used to be taken before the loop could reach a later, genuine edit — and the
+// panel's TAMPERED line printed "...unverifiable, not evidence of tampering",
+// an accusation whose stated reason denied that anything had been altered.
+await clearLedger();
+await recordAction("navigate", true);
+await recordRedaction(2, "opaque");
+const mixedStore = mem.get(LEDGER_KEY);
+mixedStore.entries[0].scheme = 2;                 // oldest: an underivable rule
+mixedStore.entries[1].data.redactedCount = 999;   // later: genuinely edited
+mem.set(LEDGER_KEY, mixedStore);
+const mixedSummary = await getLedgerSummary();
+ok("a real edit after an unverifiable entry is still the reason reported",
+  mixedSummary.chainHashesIntact === false &&
+    /entry \d+ \(redact\) does not match its recorded digest/.test(mixedSummary.chainReasons[0] ?? ""),
+  JSON.stringify(mixedSummary.chainReasons));
+ok("and the unverifiable entry is still counted, not swallowed",
+  mixedSummary.chainLegacyUnverifiable >= 1,
+  String(mixedSummary.chainLegacyUnverifiable));
+// The same slot, a different finding: a link that no longer joins. It is
+// reachable without a digest mismatch only when the entry it points FROM is
+// unverifiable (an entry whose own digest fails always reports the mismatch
+// first), which is precisely the case the unverifiable note used to shadow.
+await clearLedger();
+await recordAction("navigate", true);
+await recordRedaction(2, "opaque");
+const linkStore = mem.get(LEDGER_KEY);
+linkStore.entries[0].scheme = 2;                  // oldest: an underivable rule
+linkStore.entries[0].hash = "f".repeat(64);       // so its hash cannot be checked
+mem.set(LEDGER_KEY, linkStore);
+// Entry 1 was written against the ORIGINAL head hash and is untouched, so its
+// own digest still matches and only the link between them is broken.
+const relinkSummary = await getLedgerSummary();
+ok("a link that no longer joins is the reason reported, not the unverifiable note",
+  relinkSummary.chainValid === false && relinkSummary.chainHashesIntact === true &&
+    /does not link to entry/.test(relinkSummary.chainReasons[0] ?? ""),
+  JSON.stringify(relinkSummary.chainReasons));
+await clearLedger();
+
+const ledgerPanelSource = await readFile("src/sidepanel/sidepanel.ts", "utf8");
+const { chainBadge } = await import("../src/shared/chain-badge.ts");
+
+// The verdict is driven by the REAL summaries the verifier above produced, not
+// by a regex over the panel. The link-only case is the one that was wrong: an
+// entry whose predecessor predates the canonical scheme has its own digest
+// skipped, so every digest that COULD be re-derived matched (`chainHashesIntact`
+// true) while the verifier still reported the chain invalid — and the old
+// three-ternary badge, which read only the digest field, rendered that as
+// INTACT*. A badge that asserts the opposite of what the check computed is worse
+// than no badge, because this is the artefact the whole privacy claim rests on.
+const linkBadge = chainBadge(relinkSummary);
+ok("a chain whose links do not join does NOT render as intact",
+  linkBadge.label === "TAMPERED" && linkBadge.className === "tampered" &&
+    /does not link to entry/.test(linkBadge.note),
+  `${linkBadge.label}: ${linkBadge.note}`);
+ok("and that is exactly the case it used to call intact (digests fine, chain invalid)",
+  relinkSummary.chainHashesIntact === true && relinkSummary.chainValid === false);
+ok("the note names the kind of finding, so the reason is readable",
+  /^Link mismatch: /.test(linkBadge.note), linkBadge.note);
+
+const hashBadge = chainBadge(tamperedSummary);
+ok("a digest that was recomputed and did not match is TAMPERED, and names the entry",
+  hashBadge.label === "TAMPERED" && /^Hash mismatch: entry \d+ \(redact\)/.test(hashBadge.note),
+  hashBadge.note);
+ok("a chain that cannot be checked is NOT reported as tampered",
+  chainBadge(legacySummary).label === "INTACT*" &&
+    chainBadge(priorSchemeSummary).label === "INTACT*" &&
+    /unverifiable, not evidence of tampering/.test(chainBadge(legacySummary).note),
+  chainBadge(legacySummary).note);
+ok("a clean chain is INTACT with nothing to explain",
+  chainBadge(ledgerCleanSummary).label === "INTACT" &&
+    chainBadge(ledgerCleanSummary).className === "verified" &&
+    chainBadge(ledgerCleanSummary).note.length > 0);
+ok("a summary that says nothing is not read as tampering either",
+  chainBadge(undefined).label === "INTACT" && chainBadge({}).label === "INTACT" &&
+    chainBadge({ chainValid: undefined, chainHashesIntact: undefined }).label === "INTACT");
+
+// The renderer keeps only the job it can do (escaping), so the policy cannot
+// drift back into the panel as inline ternaries over one field.
+ok("the panel renders the verdict instead of computing it from one field",
+  /const badge = chainBadge\(ls\);/.test(ledgerPanelSource) &&
+    /const chainLabel = badge\.label;/.test(ledgerPanelSource) &&
+    !/chainLabel = !hashesOk/.test(ledgerPanelSource));
+
+const ledgerSource = await readFile("src/background/privacy-ledger.ts", "utf8");
+ok("the digest scheme is a version tag with the versions written down",
+  /export const LEDGER_HASH_SCHEME = 3;/.test(ledgerSource) &&
+    /BUMP THIS WHENEVER THE HASHED CONTENT SHAPE CHANGES/.test(ledgerSource));
+ok("the verifier has three branches: current, untagged, and an older tagged scheme",
+  /if \(entry\.scheme === LEDGER_HASH_SCHEME\)/.test(ledgerSource) &&
+    /\} else if \(entry\.scheme === undefined\) \{/.test(ledgerSource) &&
+    /was written under digest scheme \$\{entry\.scheme\}/.test(ledgerSource));
+
+// The gallery used to keep the LAST five frames, so a six-frame run showed no
+// comparison for its first frame — the page the run started on — while the
+// rollup above it counted six.
+const auditSummarySource = await readFile("src/background/service-worker.ts", "utf8");
+ok("the audit keeps the run's FIRST frame when the gallery cap has to drop one",
+  /\[withPixels\[0\], \.\.\.withPixels\.slice\(-\(SCREENSHOT_CAP - 1\)\)\]/.test(auditSummarySource));
+ok("and reports how many frames had pixels, so the panel can say what it shows",
+  /framesWithPixels: withPixels\.length,/.test(auditSummarySource));
+ok("the panel states which frames the gallery is showing when any are omitted",
+  /const omitted = Math\.max\(0, framesShown - audit\.screenshots\.length\)/.test(ledgerPanelSource) &&
+    /not shown, to keep the panel light/.test(ledgerPanelSource));
+
+// ─── Scenario BI: the page's same-site verdict reaches the panel ────────────
+console.log("\n=== Scenario BI: a same-site send is not reported as a third-party leak ===\n");
+
+// Reported: a Gmail run said "5 third-party PII leaks observed — not blocked ·
+// EMAIL ×5" for the address the user had asked PRY to email, while the
+// tripwire's own console line called the same request same-site. The verdict is
+// computed where the page's origin is visible (MAIN world) and then crossed a
+// message hop whose relay rebuilt the detail without it; a missing verdict means
+// "third-party" to the aggregator on purpose, so every alert alarmed.
+const { normalizeTripwireAlert } = await import("../src/shared/tripwire-alert.ts");
+
+const producerAlert = {
+  url: "https://mail.google.com/sync/u/0/i/s",
+  method: "POST",
+  piiType: "email",
+  sample: "sh•••@gmail.com",
+  thirdParty: false,          // the tripwire's own verdict: the site's own API
+  timestamp: 1_700_000_000_000,
+};
+const relayed = normalizeTripwireAlert(producerAlert);
+ok("the relay keeps the producer's same-site verdict", relayed?.thirdParty === false);
+ok("and keeps the rest of the alert intact",
+  relayed?.url === producerAlert.url && relayed?.method === "POST" &&
+    relayed?.piiType === "email" && relayed?.sample === producerAlert.sample &&
+    relayed?.timestamp === producerAlert.timestamp,
+  JSON.stringify(relayed));
+
+const chainAggregator = createTripwireAggregator();
+const chainSummary = chainAggregator.bump(relayed);
+ok("end to end: Gmail's own autosave no longer raises a third-party alarm",
+  chainAggregator.thirdPartyTotal() === 0 &&
+    chainSummary.startsWith("No third-party PII egress observed") &&
+    /1 same-site send \(the site you are using\)/.test(chainSummary),
+  chainSummary);
+
+// A producer that could NOT classify must keep its louder reading: the downgrade
+// has to be earned by the tripwire, which can see the page's origin.
+const relayUnclassified = normalizeTripwireAlert({ url: "https://unknown.example/x", piiType: "email" });
+ok("an unclassified destination travels as unclassified, not as same-site",
+  relayUnclassified !== null && relayUnclassified.thirdParty === undefined,
+  JSON.stringify(relayUnclassified));
+const unknownAggregator = createTripwireAggregator();
+ok("and the aggregator still alarms on it rather than downgrading",
+  unknownAggregator.bump(relayUnclassified).includes("third-party PII leak") &&
+    unknownAggregator.thirdPartyTotal() === 1,
+  unknownAggregator.summary());
+
+const trueThirdParty = normalizeTripwireAlert({
+  url: "https://analytics.example/collect",
+  method: "POST",
+  piiType: "email",
+  sample: "ra•••@gmail.com",
+  thirdParty: true,
+});
+const tpAggregator = createTripwireAggregator();
+const tpSummary = tpAggregator.bump(trueThirdParty);
+ok("a genuine third-party send is still named as one",
+  tpAggregator.thirdPartyTotal() === 1 &&
+    /^1 third-party PII leak observed — not blocked · EMAIL ×1$/.test(tpSummary),
+  tpSummary);
+ok("the two channels are counted apart, never summed into one number",
+  tpAggregator.sameSiteTotal() === 0 && tpAggregator.total() === 1);
+ok("garbage on the wire yields no alert at all",
+  normalizeTripwireAlert(null) === null && normalizeTripwireAlert("nope") === null);
+
+// One field list, one place: if the relay ever rebuilds the detail inline again,
+// dropping a field is a silent regression the tests above cannot see.
+const relaySource = await readFile("src/background/service-worker.ts", "utf8");
+ok("the relay uses the shared normalizer instead of an inline field list",
+  /normalizeTripwireAlert\(detail\)/.test(relaySource) &&
+    !/handleTripwireAlert\(\{\s*\n\s*url: String\(detail\.url/.test(relaySource));
+const tripwireSource = await readFile("src/content/tripwire.ts", "utf8");
+ok("the producer still computes and sends the verdict it is the only one who can",
+  /const thirdParty = isThirdParty\(url\);/.test(tripwireSource) &&
+    /window\.dispatchEvent\(new CustomEvent\("__PRY_TRIPWIRE_ALERT__", \{ detail \}\)\)/.test(tripwireSource));
+
+// ─── Scenario BJ: which model a run resolves to, fast mode or not ──────────
+console.log("\n=== Scenario BJ: fast-model resolution and the latency line ===\n");
+
+// The slow-endpoint speed-up re-creates the planner with fast mode on, so what
+// "fast" RESOLVES to has to be one function both paths share — otherwise the
+// switch could name one model while running another.
+const { fastModelFor, configuredModel } = await import("../src/background/providers/index.ts");
+
+const nvidiaSettings = {
+  ...DEFAULT_SETTINGS,
+  provider: "nvidia",
+  models: { ...DEFAULT_SETTINGS.models, nvidia: "nvidia/nemotron-3.5-lightning-30b-a3b" },
+  apiKeys: { ...DEFAULT_SETTINGS.apiKeys, nvidia: "test" },
+};
+ok("the configured model is what the provider's default resolves to",
+  configuredModel(nvidiaSettings) === "nvidia/nemotron-3.5-lightning-30b-a3b",
+  configuredModel(nvidiaSettings));
+ok("a reasoning default has a distinct fast model to switch to",
+  fastModelFor(nvidiaSettings) === "openai/gpt-oss-20b",
+  String(fastModelFor(nvidiaSettings)));
+ok("a model that is ALREADY the fast one reports nothing to switch to",
+  fastModelFor({ ...nvidiaSettings, models: { ...nvidiaSettings.models, nvidia: "openai/gpt-oss-20b" } }) === null);
+ok("an unconfigured provider still resolves to a real model, never to a blank",
+  configuredModel({ ...nvidiaSettings, models: { ...nvidiaSettings.models, nvidia: "   " } }) ===
+    DEFAULT_SETTINGS.models.nvidia);
+
+const speedUpSource = await readFile("src/background/agent.ts", "utf8");
+ok("the responded line names how much of the wait preceded any output",
+  /first token after \$\{Math\.round\(ttft \/ 1000\)\}s of that/.test(speedUpSource) &&
+    /ttft >= 2_000 && ttft >= seconds \* 1_000 \* 0\.4/.test(speedUpSource));
+ok("and the measurement is taken on every completed turn, not only on slow ones",
+  speedUpSource.indexOf("turnFirstOutputMs.push(ttft)") <
+    speedUpSource.indexOf("if (!waitEntryId || outcome === \"cancelled\") return;",
+      speedUpSource.indexOf("const ttft =")),
+  "the push must precede the wait-line early return, or only ticker-slow turns are measured");
+ok("the switch re-creates the planner without writing the user's settings",
+  /planner = createPlanner\(\{ \.\.\.settings, fastPlanner: true \}\)/.test(speedUpSource));
+ok("a switch that cannot be built leaves the run on its current planner",
+  /plannerSwitched = true;\s*\n\s*\}\s*\n\s*\}/.test(speedUpSource.slice(speedUpSource.indexOf("planner = createPlanner({ ...settings, fastPlanner: true })"), speedUpSource.indexOf("Join the previous action's audit-only frame pipeline"))),
+  "the catch must not rethrow");
 
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

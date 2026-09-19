@@ -109,16 +109,26 @@ export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
     suggested: [
       "nvidia/nemotron-3.5-lightning-30b-a3b",
       "nvidia/nemotron-3-super-120b-a12b",
-      "nvidia/nemotron-3-nano-30b-a3b",
-      "deepseek-ai/deepseek-v4-pro-0813",
-      "qwen/qwq-32b",
-      "meta/llama-3.1-8b-instruct",
+      "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+      "nvidia/llama-3.1-nemotron-70b-instruct",
+      "nvidia/llama-3.1-nemotron-51b-instruct",
+      "openai/gpt-oss-20b",
+      "deepseek-ai/deepseek-v4-flash-0731",
     ],
     defaultModel: "nvidia/nemotron-3.5-lightning-30b-a3b",
     // A plain instruction model, and a real trade: it will plan worse than the
     // 30B reasoning default, in exchange for a first token that arrives now
     // instead of after a chain-of-thought.
-    fastModel: "meta/llama-3.1-8b-instruct",
+    //
+    // WHY gpt-oss-20b AND NOT THE 51B NEMOTRON: the unanswered-request re-route
+    // (agent.ts) sends a stalled turn to this model, so it must be answerable
+    // on a plain free-tier key. Verified live: gpt-oss-20b on NIM answered a
+    // plain prompt in ~4 s, while llama-3.1-nemotron-51b-instruct returned 404
+    // ("Function ... Not found for account") on the same key — a run that
+    // re-routed to it died with zero actions. The 51b entry stays in
+    // `suggested` for keys that can reach it; it is just no longer the
+    // automatic fallback.
+    fastModel: "openai/gpt-oss-20b",
   },
 };
 
@@ -176,7 +186,7 @@ export async function listModels(
       .map((m) => m.id)
       .filter((id): id is string => Boolean(id))
       // Only include chat/text models, not embedding or safety models.
-      .filter((id) => /^(meta|deepseek|qwen|nvidia\/(nemotron|llama|deepseek)|mistralai|openai\/gpt)/.test(id))
+      .filter((id) => /^(meta|deepseek|qwen|nvidia\/(nemotron|llama|deepseek)|mistralai|openai\/gpt|deepseek-ai)/.test(id))
       .sort();
   }
 

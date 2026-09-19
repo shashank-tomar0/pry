@@ -17,42 +17,23 @@
  *     that must not be recoverable belong on the opaque path.
  */
 
-// Verhoeff multiplication and permutation tables
-const dTable = [
-  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-  [1, 2, 3, 4, 0, 6, 7, 8, 9, 5],
-  [2, 3, 4, 0, 1, 7, 8, 9, 5, 6],
-  [3, 4, 0, 1, 2, 8, 9, 5, 6, 7],
-  [4, 0, 1, 2, 3, 9, 5, 6, 7, 8],
-  [5, 9, 8, 7, 6, 0, 4, 3, 2, 1],
-  [6, 5, 9, 8, 7, 1, 0, 4, 3, 2],
-  [7, 6, 5, 9, 8, 2, 1, 0, 4, 3],
-  [8, 7, 6, 5, 9, 3, 2, 1, 0, 4],
-  [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
-];
+// The two checksum algorithms this file needs — Verhoeff for Aadhaar, Luhn for
+// cards — live in shared/checksums.ts, beside the validators that judge their
+// output. They used to be carried here as a second copy of the same tables and
+// the same arithmetic, which is two chances for a generated value to fail the
+// check that the rest of the pipeline runs on it.
+import { luhnCheckDigit, verhoeffCheckDigit } from "../shared/checksums";
+import { fnv1a } from "../shared/primitives";
 
-const pTable = [
-  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-  [1, 5, 7, 6, 2, 8, 3, 0, 9, 4],
-  [5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
-  [8, 9, 1, 6, 0, 4, 3, 5, 2, 7],
-  [9, 4, 5, 3, 1, 2, 6, 8, 7, 0],
-  [4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
-  [2, 7, 9, 3, 8, 0, 6, 4, 1, 5],
-  [7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
-];
-
-const invTable = [0, 4, 3, 2, 1, 5, 6, 7, 8, 9];
-
-export function computeVerhoeffCheckDigit(numStr: string): number {
-  let c = 0;
-  const digits = numStr.replace(/\D/g, "").split("").reverse();
-  for (let i = 0; i < digits.length; i++) {
-    const digit = parseInt(digits[i], 10);
-    c = dTable[c][pTable[(i + 1) % 8][digit]];
-  }
-  return invTable[c];
-}
+/**
+ * Re-exported under the names this module has always used for them.
+ *
+ * Kept because the verification harness pins the surrogate generator through
+ * these two names, and a rename is not worth churning a pinned check — the
+ * point of the change is that there is now ONE implementation behind each.
+ */
+export const computeVerhoeffCheckDigit = verhoeffCheckDigit;
+export const computeLuhnCheckDigit = luhnCheckDigit;
 
 export function generateVerhoeffAadhaarSurrogate(): string {
   // Use 9999 as synthetic leading block
@@ -60,22 +41,6 @@ export function generateVerhoeffAadhaarSurrogate(): string {
   const check = computeVerhoeffCheckDigit(prefix);
   const full = prefix + String(check);
   return full.slice(0, 4) + " " + full.slice(4, 8) + " " + full.slice(8, 12);
-}
-
-export function computeLuhnCheckDigit(partialCard: string): number {
-  const digits = partialCard.replace(/\D/g, "");
-  let sum = 0;
-  let alternate = true;
-  for (let i = digits.length - 1; i >= 0; i--) {
-    let n = parseInt(digits[i], 10);
-    if (alternate) {
-      n *= 2;
-      if (n > 9) n -= 9;
-    }
-    sum += n;
-    alternate = !alternate;
-  }
-  return (10 - (sum % 10)) % 10;
 }
 
 export function generateLuhnCardSurrogate(): string {
@@ -113,14 +78,6 @@ export function generatePhoneSurrogate(): string {
  * remaining digit space. See the module header.
  */
 
-function simpleHash(str: string, seed: number = 0x811c9dc5): number {
-  let h = seed;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return h >>> 0;
-}
 
 /**
  * FPE-encrypted card number:
@@ -133,7 +90,7 @@ export function fpeEncryptCard(rawCard: string): string {
   
   const bin = digits.slice(0, 4); // Keep card network identification
   const bodyLen = digits.length - 5;
-  const hashVal = simpleHash(digits);
+  const hashVal = fnv1a(digits);
   
   let syntheticBody = "";
   for (let i = 0; i < bodyLen; i++) {
@@ -158,7 +115,7 @@ export function fpeEncryptAadhaar(rawAadhaar: string): string {
   const digits = rawAadhaar.replace(/\D/g, "");
   if (digits.length !== 12) return generateVerhoeffAadhaarSurrogate();
 
-  const hashVal = simpleHash(digits);
+  const hashVal = fnv1a(digits);
   let prefix = "99"; // Designates synthetic test space
   for (let i = 2; i < 11; i++) {
     const d = (Math.floor(hashVal / Math.pow(10, i % 8)) + i * 7) % 10;

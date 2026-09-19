@@ -238,12 +238,50 @@ export interface PaintPlanOptions {
 }
 
 /**
+ * Paint order by tier: weakest first, STRONGEST LAST.
+ *
+ * WHY ORDER IS PART OF THE GUARANTEE
+ *
+ * The plan is built in the page's own region order and the caller paints it in
+ * that order, so a soft or surrogate region that overlaps an opaque mask used to
+ * erase part of it:
+ *
+ *   - a `surrogate` op fills its whole rectangle with the clean field colour
+ *     (#ffffff) before drawing its synthetic value, so an overlapping opaque span
+ *     turned white;
+ *   - a `blur` op reads its own rectangle — which by then contains the black mask
+ *     — and writes the average back, so the overlap turned grey.
+ *
+ * The verifier then measures each opaque region's interior and finds it only
+ * partly black ("only 45% of the interior covered"), reports a reversible
+ * redaction, and the frame is rebuilt opaque and re-verified — the reported storm
+ * of seven such findings per Gmail frame, each one paying a second OCR pass over
+ * the whole strip. Painting strongest-last makes the property structural instead
+ * of dependent on the order the page happened to report its regions in: a weaker
+ * tier can no longer weaken a stronger one.
+ *
+ * The trade, stated rather than hidden: where an opaque span overlaps a
+ * credential field, the field ends up black instead of showing its synthetic
+ * stand-in. That is strictly the safer outcome, and the panel still reports both
+ * detections.
+ */
+const TIER_PAINT_ORDER: Record<RegionTier, number> = {
+  skip: 0,
+  blur: 1,
+  surrogate: 2,
+  opaque: 3,
+};
+
+/**
  * Plan the paint for every DOM-detected region.
  *
- * Returns one op per region in input order, including `skip` ops, so the caller
- * can report what was detected-but-not-painted instead of silently dropping it.
- * Regions that fall entirely outside the captured image produce no op at all —
- * nothing was painted and nothing can be reported honestly.
+ * Returns one op per region, including `skip` ops, so the caller can report what
+ * was detected-but-not-painted instead of silently dropping it. Regions that fall
+ * entirely outside the captured image produce no op at all — nothing was painted
+ * and nothing can be reported honestly.
+ *
+ * The order is by TIER (see TIER_PAINT_ORDER) rather than by region order, and
+ * the sort is stable, so regions within a tier keep the page's own order.
  */
 export function planRegionPaints(
   regions: readonly PaintRegion[] | undefined,
@@ -284,5 +322,7 @@ export function planRegionPaints(
     ops.push(op);
   }
 
-  return ops;
+  // Stable sort by tier strength — `Array.prototype.sort` is stable, so detections
+  // inside one tier keep the order the page reported them in.
+  return ops.sort((a, b) => TIER_PAINT_ORDER[a.tier] - TIER_PAINT_ORDER[b.tier]);
 }

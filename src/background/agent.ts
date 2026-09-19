@@ -27,11 +27,12 @@ import { SYSTEM_PROMPT, SYSTEM_PROMPT_LOCAL, taskPrompt } from "./prompt";
 import { TOOLS, actionChangesFrame, actionLoopFinding, LOOP_THRESHOLD, LOOP_WINDOW, type ActionStamp } from "./tools";
 import { TabController, execute, isRestricted } from "./executor";
 import { detectInjection, gate } from "./safety";
+import { estimateUtf8Bytes, fnv1a, formatBytes } from "../shared/primitives";
 import { detectAllPIIDetailed } from "./pii-detector";
 import { redactSnapshot } from "./redaction";
 import { tokenizer, repairTokenConcatenation, buildTokenLegend } from "./tokenizer";
 import { tryDeterministic, bareNavigationGoal, hostSatisfiesBareGoal } from "./deterministic";
-import { createPlanner } from "./providers";
+import { createPlanner, fastModelFor } from "./providers";
 import type { ConvMessage, ToolOutcome } from "./providers/types";
 import type { ActionExperience, PIIExperience, RunExperience } from "./experience-memory";
 import { extractDomain, classifyPageType } from "./experience-memory";
@@ -65,20 +66,6 @@ let counter = 0;
 const nextId = () => `e${++counter}`;
 
 // ─── Privacy-Aware Snapshot Rendering ───────────────────────────────────────
-
-/**
- * Cheap 32-bit FNV-1a. Used only as a "did this page text change" signature,
- * so the per-page Tier-0 models are not re-run on a page that did not move.
- * Not cryptographic and never used as one.
- */
-function fnv1a(text: string): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < text.length; i++) {
-    h ^= text.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return h >>> 0;
-}
 
 /**
  * Strips sensitive query parameters, auth tokens, and session fragments from
@@ -180,6 +167,38 @@ interface SanitizeCtx {
 }
 
 const EMPTY_SANITIZE_CTX: SanitizeCtx = { fpKeys: new Set(), llmOnly: false, ruleCount: 0, tokenize: true };
+
+/**
+ * Whether a task reads as a FOLLOW-UP to earlier runs rather than a fresh,
+ * self-contained task.
+ *
+ * WHY THIS EXISTS
+ *
+ * A live run was told "open yt and play the first video" and reasoned "Need
+ * to search 'harkirat singh'" — a search term from a PREVIOUS chat, replayed
+ * verbatim into this run's opening prompt by the history block. Search terms
+ * deliberately ride raw (they are instruction parameters, not secrets), so a
+ * replayed task carries its names and targets unredacted, and a small model
+ * latches onto the salient entity over the actual task. Gating the history on
+ * this check means a fresh task never sees an older one at all.
+ *
+ * The shape is deliberately tiny, in the same spirit as bareNavigationGoal:
+ * a leading continuation marker ("continue", "also", "then", ...) or a
+ * reference to something said before (it, that, them, ...). A false negative
+ * only restores the old behaviour (history shown); a false positive hides
+ * context a follow-up needed, so bare nouns ("open yt", "the first video")
+ * never count — only words that point BACKWARDS.
+ */
+const FOLLOW_UP_LEAD =
+  /^(continue|continuing|also|and then|then|next|now|after that|same|again|follow[\s-]?up|do that)\b/i;
+const FOLLOW_UP_REFERENCE =
+  /\b(that|this|it|its|they|them|those|these|the same|another one)\b/i;
+
+export function isFollowUpTask(task: string): boolean {
+  const t = String(task ?? "").trim();
+  if (t.length === 0) return false;
+  return FOLLOW_UP_LEAD.test(t) || FOLLOW_UP_REFERENCE.test(t);
+}
 
 /** Readable audit label per PII kind (visual detections already carry theirs). */
 const AUDIT_KIND_LABELS: Record<string, string> = {
@@ -402,6 +421,26 @@ export interface AgentDeps {
    * assert that the run gives up rather than hanging.
    */
   frameAuditWaitMs?: number;
+  /**
+   * Time-to-first-token thresholds for the slow-endpoint speed-up, in ms.
+   *
+   * Defaults are the shipped policy constants (8 s to count as slow, 20 s to
+   * read as queueing outright). Injected small by the harness so a mid-run model
+   * switch can be driven from a stub planner without a 20-second test.
+   */
+  slowFirstTokenMs?: number;
+  queuedFirstTokenMs?: number;
+  /**
+   * The three planner-wait budgets, overridable for the same reason
+   * `frameAuditWaitMs` is: they ship as minutes (90 s of silence, 25 s for an
+   * unacknowledged request), and a harness that wants to prove what a run DOES
+   * with an endpoint that accepts a request and then sends nothing cannot spend
+   * 90 s proving it. Only the numbers move — the policy reading them, and the
+   * prose it produces, are the shipped ones.
+   */
+  firstOutputMs?: number;
+  retryFirstOutputMs?: number;
+  unansweredHeadersMs?: number;
 }
 
 // ─── Main Loop ──────────────────────────────────────────────────────────────
@@ -435,6 +474,20 @@ export async function runTask(
    */
   const FRAME_AUDIT_WAIT_MS = deps.frameAuditWaitMs ?? 15_000;
 
+  /**
+   * Thresholds for the slow-endpoint speed-up, overridable by the harness.
+   *
+   * Same convention as `frameAuditWaitMs`: the shipped defaults are exported
+   * policy constants, and a test can inject small ones so a mid-run model switch
+   * can be proven in milliseconds instead of by waiting 20 real seconds. The
+   * policy itself is still the shipped function — only its inputs change.
+   */
+  const speedUpSlowMs = deps.slowFirstTokenMs ?? SLOW_FIRST_TOKEN_MS;
+  const speedUpQueuedMs = deps.queuedFirstTokenMs ?? QUEUED_FIRST_TOKEN_MS;
+  const firstOutputMs = deps.firstOutputMs ?? FIRST_OUTPUT_TIMEOUT_MS;
+  const retryFirstOutputMs = deps.retryFirstOutputMs ?? RETRY_FIRST_OUTPUT_MS;
+  const unansweredHeadersMs = deps.unansweredHeadersMs ?? UNANSWERED_HEADERS_MS;
+
   // Use a shorter system prompt for small local models to avoid context overflow.
   const isLocalModel = settings.provider === "ollama";
   const isFreeTier = settings.provider === "groq" || settings.provider === "nvidia";
@@ -442,7 +495,29 @@ export async function runTask(
   // Cap snapshot elements: free-tier providers need smaller snapshots for speed.
   const maxSnapshotElements = isLocalModel ? 15 : isFreeTier ? 30 : 50;
 
-  const planner = createPlanner(settings);
+  // `let`, not `const`: a run that measures a queueing provider switches itself
+  // to the provider's fast model and continues — see plannerSpeedUpDecision.
+  let planner = createPlanner(settings);
+
+  /**
+   * Time to first streamed token, per completed turn, oldest first.
+   *
+   * The run's own evidence that the ENDPOINT is slow rather than the model being
+   * thorough, and the input to the speed-up decision below. Recorded per turn so
+   * one bad sample cannot trigger a model change on its own.
+   */
+  const turnFirstOutputMs: number[] = [];
+  let plannerSwitched = false;
+  /**
+   * One record per planner attempt, for the run's closing diagnostics block.
+   *
+   * Declared here, above `finishTask`, because that is what emits it and a run
+   * that ends early (an abort before the loop) must find an empty list rather
+   * than trip over a declaration that has not executed yet.
+   */
+  const plannerTurns: PlannerTurnReport[] = [];
+  /** Whether local pixel work was still in flight while the current attempt waited. */
+  let localWorkDuringTurn = false;
 
   // ── Experience tracking for self-improvement ──
   const runStartTime = Date.now();
@@ -1184,12 +1259,13 @@ export async function runTask(
   // raw words to name in masked form.
   const { task: tokenizedTask } = tokenizer.tokenizeTask(task);
 
-  // Previous-task memory: a compact, re-tokenized recap of the last few runs
-  // so follow-ups ("continue", "also do X on that email") have context. It
-  // runs through the same vault as the page/task, so no raw values reach the
-  // model.
+  // Previous-task memory: a compact, re-tokenized recap of the last few runs,
+  // included ONLY when this task reads as a follow-up (see isFollowUpTask).
+  // A fresh task gets no history at all, so a previous chat's search terms
+  // can never ride along. It runs through the same vault as the page/task,
+  // so no raw values reach the model.
   let historyBlock = "";
-  if (history && history.length > 0) {
+  if (history && history.length > 0 && isFollowUpTask(task)) {
     const raw = history
       .map((h) => `You asked: ${h.task}\nYou answered: ${h.answer}`)
       .join("\n\n");
@@ -1204,7 +1280,16 @@ export async function runTask(
         },
       });
     }
-    historyBlock = `--- Previous conversation (earlier tasks) ---\n${sanitizedHistory}\n--- End previous conversation ---`;
+    // Quarantine framing: the replayed tasks below are OLDER and DIFFERENT.
+    // Without this a small model treats a salient old search term as part of
+    // the current task (observed: "Need to search 'harkirat singh'" on a run
+    // whose task never named it). The current task is the `Task:` line that
+    // follows these blocks — nothing above it is.
+    historyBlock =
+      `--- Earlier tasks (context only — NOT your task) ---\n${sanitizedHistory}\n--- End earlier tasks ---\n` +
+      `These are OLDER, different requests, shown only so follow-ups ("reply to it") have something to point at. ` +
+      `Your task is the \`Task:\` line below. Never carry search terms, names, or targets from an earlier task into this one; ` +
+      `if your task is complete without them, ignore everything above.`;
   }
 
   // Semantic memory: lessons and successful trajectories from past runs on
@@ -1245,6 +1330,9 @@ export async function runTask(
   // read is roughly 8-15 KB (up to 80 elements plus the snapshot text budget),
   // so a six-turn run pays ~50-90 KB of egress and the prefill latency that
   // comes with it for a page the planner has already moved past.
+  // Rendered once so the legend scope below and the message agree on the
+  // exact text the planner is about to read.
+  const openingPageRead = snapshot ? `\n\n--- Current page ---\n${renderSnapshot(snapshot)}` : "";
   const openingContext =
     (historyBlock ? `${historyBlock}\n\n` : "") +
     (lessonsBlock ? `${lessonsBlock}\n\n` : "") +
@@ -1254,13 +1342,19 @@ export async function runTask(
       sanitizeUrl(tab.url ?? ""),
       sanitizeTextPII(tab.title ?? ""),
       // Built from the live vault, filtered to the tokens that are actually
-      // IN this task, so it always matches what the planner is looking at
-      // and never contains a value — only the category. It used to be built
-      // from the entries THIS pass created, which is structurally empty
-      // (the worker already tokenized the task), so the legend the prompt
-      // promised the planner was silently blank.
+      // IN this opening message — the task AND the page read — so it always
+      // matches what the planner is looking at and never contains a value,
+      // only the category. Task-only filtering was the observed failure: the
+      // page introduced <PII_1> (the Gmail address), the legend was blank
+      // because the task held no tokens, and the model spent its reasoning
+      // inventing meanings ("Suppose <PII_1> is something like example.com?").
+      // It used to be built from the entries THIS pass created, which is
+      // structurally empty (the worker already tokenized the task), so the
+      // legend the prompt promised the planner was silently blank.
       buildTokenLegend(
-        tokenizer.getEntries().filter((e) => tokenizedTask.includes(e.token)),
+        tokenizer.getEntries().filter((e) =>
+          tokenizedTask.includes(e.token) || openingPageRead.includes(e.token),
+        ),
       ),
     );
 
@@ -1273,7 +1367,7 @@ export async function runTask(
       role: "user",
       content:
         openingContext +
-        (snapshot ? `\n\n--- Current page ---\n${renderSnapshot(snapshot)}` : "") +
+        openingPageRead +
         openingVisionNote,
     },
   ];
@@ -1297,6 +1391,29 @@ export async function runTask(
    * run. maxSteps still bounds the worst case independently.
    */
   let loopNudges = 0;
+  /**
+   * Page-stagnation state (see STAGNATION_STEPS).
+   *
+   * `lastPageSig` is the signature the previous step ended on; `stagnantSteps`
+   * counts consecutive steps that ended on the identical one with no
+   * frame-changing action in between (tracked via `stagnationActionMark`, so
+   * a scroll that loads nothing new still counts as acting, not staring).
+   * Separate counter from `loopNudges` (which counts action-pattern findings)
+   * so each diagnosis keeps its own one-nudge-then-stop semantics instead of
+   * spending the other's.
+   */
+  let lastPageSig = "";
+  let stagnantSteps = 0;
+  let stagnationNudges = 0;
+  /**
+   * `recentActions` watermark for the stagnation check below. A frame-changing
+   * action (scroll, click, navigate…) resets the count even when the resulting
+   * snapshot hashes identically — the page was acted on, not stared at. Only
+   * steps whose every recorded action was read-only (read_page, find_text,
+   * wait) can accumulate. Without this, ordinary scroll runs trip the guard
+   * in any harness that replays one static snapshot per scroll.
+   */
+  let stagnationActionMark = 0;
   /** How many times this run has told the planner to stop deliberating. */
   let deliberationSteers = 0;
   /**
@@ -1309,6 +1426,20 @@ export async function runTask(
    * a turn actually resolved, so it is evidence rather than an assumption.
    */
   let endpointServedThisRun = false;
+
+  /**
+   * True once any request of this run got response HEADERS back.
+   *
+   * A different fact from `endpointServedThisRun`, and the one a stall needs:
+   * "no tokens arrived" describes two requests that are not the same failure —
+   * one the provider never accepted, and one it accepted and then produced
+   * nothing for. `headersAt` is reported by the adapter, so this is the one place
+   * the run can learn which it was, and the retry policy needs it for the same
+   * reason it needs the other: re-sending a prompt nobody accepted buys nothing,
+   * while an accepted request that produced nothing is the shape a dropped
+   * connection has, which IS worth the one short retry.
+   */
+  let endpointAnsweredThisRun = false;
 
   function recordAction(name: string, input: Record<string, unknown>): void {
     // Sign click/type actions by the target's role+name, not the raw id:
@@ -1362,10 +1493,38 @@ export async function runTask(
           (sanitizeCtx.ruleCount > 0 || falsePositiveCount > 0
             ? `Learning: ${sanitizeCtx.ruleCount} rule(s) consulted, ${falsePositiveCount} false positive(s) filtered. `
             : "") +
-          (remotePlanner ? `Egress: ${formatEgress(sessionEgressBytes)}. ` : "Local planner: zero egress. ") +
+          (remotePlanner ? `Egress: ${formatBytes(sessionEgressBytes)}. ` : "Local planner: zero egress. ") +
           `Token vault cleared.`,
       },
     });
+
+    // ─── What the planner wait actually was ───
+    // The live lines above are patched and collapsed as the run goes; this is the
+    // record afterwards, in one copyable block, so a stalled run can be reported
+    // with its timings instead of as "it hung". Omitted when no planner turn was
+    // ever attempted (a task that ended before its first call has nothing to
+    // diagnose) and when the user cancelled (they know what they did).
+    if (plannerTurns.length > 0 && !signal.aborted) {
+      const failed = plannerTurns.filter(
+        (t) => t.ended === "unanswered" || t.ended === "silent" || t.ended === "dropped",
+      ).length;
+      emit({
+        kind: "entry",
+        entry: {
+          id: nextId(),
+          role: "diagnostics",
+          text: plannerDiagnosticsReport({
+            planner: planner.label,
+            fastModel: fastModelFor(settings),
+            turns: plannerTurns,
+            vision: visionEnabled && visionApiKey !== "",
+            outcome:
+              `${taskSuccess ? "success" : "not a success"} · ${trackedActions.length} action(s) · ` +
+              `${failed} cut planner wait(s) · ${errorCount} error(s) · egress ${formatBytes(sessionEgressBytes)}`,
+          }),
+        },
+      });
+    }
 
     const experience: RunExperience = {
       id: `exp-${runStartTime}`,
@@ -1374,8 +1533,18 @@ export async function runTask(
       // persist to chrome.storage and feed reflection/lessons, so raw PII
       // typed by the user must never land there.
       task: tokenizedTask,
-      domain,
-      pageType,
+      // Keyed by where the run WORKED, not where it started. `domain` is the
+      // start tab, but a run migrates: "open gmail..." asked from a YouTube
+      // tab navigates away in step one, and keying the trajectory at youtube.com
+      // replays Gmail routes (navigate → click → type → ...) into later
+      // YouTube runs — the observed ghost route ("The route hints earlier
+      // 'open g<PII_1> and sent a e<PII_1>...'"). The latest page read is what
+      // the actions actually touched; a run that never moved keeps its start
+      // key by construction.
+      domain: snapshot?.url ? extractDomain(snapshot.url) : domain,
+      pageType: snapshot
+        ? classifyPageType(snapshot.url ?? "", snapshot.title ?? "", snapshot.text ?? "")
+        : pageType,
       piiDetections: trackedPII,
       actions: trackedActions,
       taskSuccess,
@@ -1444,6 +1613,57 @@ export async function runTask(
     // with them.
     lastRenderedElements = snapshot?.elements ?? [];
     lastRenderedGeneration = snapshot?.generation;
+
+    // Page-stagnation check: consecutive steps ending on the identical page.
+    // The action loop detector counts read-only actions (window of 5); this
+    // fires sooner because the evidence is stronger — not "five looks" but
+    // "the page has not moved". The nudge is pushed into `messages` (same
+    // channel as ACT_NOW_DIRECTIVE) so the planner reasons WITH it on the
+    // very next turn; a panel-only note would bill another reasoning turn to
+    // learn nothing. A repeat after the advice stops the run, mirroring the
+    // loop guard: a page identical across six steps is not loading any more.
+    const pageSig = snapshot
+      ? pageSignature(snapshot.url, snapshot.elements.length, snapshot.text)
+      : "";
+    // Actions recorded since the last check: any frame-changing one means the
+    // step acted, whatever the hash says.
+    const actedSinceCheck = recentActions
+      .slice(stagnationActionMark)
+      .some((a) => actionChangesFrame(a.name));
+    stagnationActionMark = recentActions.length;
+    if (!pageSig || actedSinceCheck || pageSig !== lastPageSig) {
+      stagnantSteps = 0;
+      lastPageSig = pageSig;
+    } else {
+      stagnantSteps++;
+    }
+    if (stagnantSteps >= STAGNATION_STEPS) {
+      if (stagnationNudges === 0) {
+        stagnationNudges++;
+        stagnantSteps = 0;
+        messages.push({ role: "user", content: STAGNATION_DIRECTIVE });
+        emit({
+          kind: "entry",
+          entry: {
+            id: nextId(),
+            role: "system",
+            text: `Page unchanged for ${STAGNATION_STEPS + 1} steps in a row — steering the planner to act instead of re-reading.`,
+          },
+        });
+      } else {
+        errorCount++;
+        emit({
+          kind: "entry",
+          entry: {
+            id: nextId(),
+            role: "error",
+            text: `Page still unchanged after the steering advice — stopping to prevent a stall loop. The page may need manual interaction.`,
+          },
+        });
+        finishTask();
+        return;
+      }
+    }
 
     // Loop detection — a stuck planner gets one chance to act on advice before
     // the run is stopped, because "keep re-reading the page" is usually a
@@ -1769,39 +1989,37 @@ export async function runTask(
      * step 0.
      */
     const budgetFor = (retry: boolean): number =>
-      retry ? RETRY_FIRST_OUTPUT_MS : FIRST_OUTPUT_TIMEOUT_MS;
-
-    // ─── Live reasoning status ───
-    // The reasoning block is display-capped (MAX_THOUGHT_CHARS), so past that
-    // cap nothing on screen moves while the model keeps thinking — which is
-    // indistinguishable from a freeze, and was reported as one. This line keeps
-    // ticking for as long as reasoning streams: elapsed time, how much, and the
-    // fact that no action has been taken yet.
-    let reasoningStartedAt = 0;
-    let reasoningStatusId: string | null = null;
-    let statusStopped = false;
-    const statusTicker = setInterval(() => {
-      if (statusStopped || reasoningStartedAt === 0 || thoughtChars === 0) return;
-      const seconds = Math.round((performance.now() - reasoningStartedAt) / 1000);
-      const text = `Reasoning… ${seconds}s · ${thoughtChars.toLocaleString()} chars · no action yet`;
-      if (!reasoningStatusId) {
-        reasoningStatusId = nextId();
-        emit({ kind: "entry", entry: { id: reasoningStatusId, role: "system", text } });
-      } else {
-        emit({ kind: "patch", id: reasoningStatusId, text });
-      }
-    }, 2000);
+      retry ? retryFirstOutputMs : firstOutputMs;
 
     // ─── Planner-wait ticker ───
-    // A cold free-tier planner can legitimately take ~55-90s on its first turn
-    // while it streams chain-of-thought, and even warm turns can take tens of
-    // seconds. Silence for that long is indistinguishable from a frozen run,
-    // so after a short grace window a live status line appears and ticks every
-    // second. Once reasoning tokens actually arrive the live reasoning block
-    // takes over as the liveness indicator and this line hands off to it. A
-    // turn that starts producing output within the grace window never emits
+    // ONE status line for the whole wait, because there is one wait.
+    //
+    // A cold free-tier planner can legitimately take ~55-90 s on its first turn
+    // while it streams chain-of-thought, and silence for that long is
+    // indistinguishable from a frozen run — so after a short grace window a live
+    // line appears and ticks every second. This used to be TWO lines with a
+    // handoff between them: a wait ticker and a second "Reasoning…" ticker that
+    // took over once chain-of-thought started, each with its own interval, its
+    // own entry id and its own finalize step. Two lines for one wait meant two
+    // things to keep consistent for no fact the user did not already have — the
+    // reasoning block below is the display, and what it needs from a status line
+    // is the elapsed time and the boundary diagnosis, both of which fit on one.
+    // A turn that starts producing output within the grace window never emits
     // the line at all.
     let waitStart = performance.now();
+    /**
+     * Where the turn in flight has been, measured at the network boundary.
+     *
+     * `headersAt` is the one fact the run cannot obtain from outside the
+     * adapter, and it is the fact that decides which of two very different
+     * failures a silence is: the endpoint never answered (a stalled connection
+     * or a queue — the model has not seen the prompt), or it answered and then
+     * sent no body (the request was accepted, and the wait is on the provider's
+     * side). Both used to print "no tokens yet". Defaulted to `waitStart` rather
+     * than 0 so a planner that reports no milestones is described from an
+     * elapsed time that is real, not from page-load.
+     */
+    let turnTiming: PlannerTiming = { requestedAt: waitStart, headersAt: 0 };
     let waitEntryId: string | null = null;
     let waitSettled = false;
     const waitTimer = setInterval(() => {
@@ -1824,12 +2042,19 @@ export async function runTask(
       // grace window it says who is late and what the way out is. A turn that
       // has produced NOTHING gets cut at the first-output budget regardless
       // (see withTurnBudget), so this is not a hang the user has to sit out.
-      const thought = thoughtChars > 0
-        ? ` · model is reasoning (${thoughtChars.toLocaleString()} chars so far)`
+      //
+      // Past 30 s the line stops being a status and becomes a diagnosis, which
+      // is the point at which the user's next move depends on knowing it (the
+      // adapter's own boundary timings, via plannerWaitCause). Before that it
+      // stays terse: at 6 s there is nothing to act on yet. Once reasoning
+      // arrives, the model's own progress is the most useful thing on the line —
+      // the reasoning block below is display-capped, so past the cap this
+      // counter is the only thing on screen that moves.
+      const text = thoughtChars > 0
+        ? `Reasoning… ${seconds}s · ${thoughtChars.toLocaleString()} chars · no action yet`
         : seconds >= 30
-          ? ` · no tokens yet — the provider has not sent its first token (Stop cancels)`
-          : " · no tokens yet";
-      const text = `Waiting on the planner — ${seconds}s${thought}`;
+          ? `Waiting on the planner — ${seconds}s · no tokens yet · ${plannerWaitCause(turnTiming, performance.now())} (Stop cancels)`
+          : `Waiting on the planner — ${seconds}s · no tokens yet`;
       if (!waitEntryId) {
         waitEntryId = nextId();
         emit({ kind: "entry", entry: { id: waitEntryId, role: "system", text } });
@@ -1837,21 +2062,52 @@ export async function runTask(
         emit({ kind: "patch", id: waitEntryId, text });
       }
     }, 1000);
-    const settleWait = (outcome: "responded" | "failed" | "cancelled"): void => {
+
+    /**
+     * Record one planner attempt for the closing diagnostics block.
+     *
+     * Idempotent per attempt and separate from `settleWait`, because not every
+     * attempt ends a wait LINE: a cut turn that is retried, and one that is
+     * re-routed to another model, both keep the same line ticking (from the
+     * user's point of view it is still one wait) while remaining distinct
+     * attempts the report has to name. Recording only where the line settles is
+     * how the copyable block ended up able to say "attempts 1" about a run whose
+     * first two attempts were the interesting ones.
+     *
+     * The time to FIRST token is recorded here too: the wait line only exists
+     * once the 5 s ticker has fired, so measuring inside that branch measured
+     * only the turns that were already slow by the ticker's own threshold, while
+     * the speed-up decision has to see every turn, fast ones included.
+     */
+    let attemptRecorded = false;
+    const recordAttempt = (
+      outcome: "responded" | "failed" | "cancelled",
+      turnLiveness?: TurnLiveness,
+    ): void => {
+      if (attemptRecorded) return;
+      attemptRecorded = true;
+      const firstOutputAt = turnLiveness?.firstOutputAt ?? 0;
+      const ttft = firstOutputAt > 0 ? Math.round(firstOutputAt - waitStart) : 0;
+      if (outcome !== "cancelled" && ttft > 0) turnFirstOutputMs.push(ttft);
+      plannerTurns.push({
+        planner: planner.label,
+        headersMs: turnTiming.headersAt > 0 ? Math.round(turnTiming.headersAt - turnTiming.requestedAt) : null,
+        firstOutputMs: ttft > 0 ? ttft : null,
+        ended: outcome === "cancelled" ? "cancelled" : (turnLiveness?.ended ?? "settled"),
+        streamed: (turnLiveness?.events ?? 0) > 0,
+        ranMs: Math.max(0, Math.round(performance.now() - waitStart)),
+        localWork: localWorkDuringTurn,
+      });
+    };
+
+    const settleWait = (
+      outcome: "responded" | "failed" | "cancelled",
+      /** The turn's liveness, for its time-to-first-token measurement. */
+      turnLiveness?: TurnLiveness,
+    ): void => {
       waitSettled = true;
       clearInterval(waitTimer);
-      // Finalize the reasoning status line: it must stop ticking when the turn
-      // ends, and it must say how long the thinking actually took.
-      statusStopped = true;
-      clearInterval(statusTicker);
-      if (reasoningStatusId && reasoningStartedAt > 0) {
-        const seconds = Math.round((performance.now() - reasoningStartedAt) / 1000);
-        emit({
-          kind: "patch",
-          id: reasoningStatusId,
-          text: `Model reasoned for ${seconds}s (${thoughtChars.toLocaleString()} chars) before this turn ended.`,
-        });
-      }
+      recordAttempt(outcome, turnLiveness);
       // Final flush, then collapse the reasoning block — the turn is over and
       // the transcript should hand attention back to actions and answers.
       flushPending();
@@ -1860,27 +2116,88 @@ export async function runTask(
       }
       if (!waitEntryId || outcome === "cancelled") return;
       const seconds = Math.max(1, Math.round((performance.now() - waitStart) / 1000));
+      const firstOutputAt = turnLiveness?.firstOutputAt ?? 0;
+      const ttft = firstOutputAt > 0 ? Math.round(firstOutputAt - waitStart) : 0;
+      // Reasoning is reported on the SAME line the wait was reported on: one wait,
+      // one line. `reasoningStartedAt` comes from this turn's liveness rather than
+      // a run-scoped variable, so a retry's line cannot inherit the first
+      // attempt's clock.
+      const reasoned = turnLiveness?.reasoningStartedAt
+        ? ` Model reasoned for ${Math.max(1, Math.round((performance.now() - turnLiveness.reasoningStartedAt) / 1000))}s ` +
+          `(${thoughtChars.toLocaleString()} chars) before this turn ended.`
+        : "";
+      if (outcome === "responded") {
+        // Name how much of the wait happened BEFORE anything streamed. "Planner
+        // responded in 14s" alone cannot be acted on; "first token after 11s"
+        // says the endpoint was late, not that the model deliberated. Reported
+        // only when it is a real share of the turn, so a fast provider's line
+        // does not grow noise.
+        //
+        // …and split that wait in two when the ENDPOINT owned most of it: a
+        // first token at 11 s whose response headers arrived at 10.6 s is a
+        // provider queue, while the same 11 s with headers at 0.2 s is a model
+        // thinking. Those two have different fixes and used to read identically.
+        const queueMs = turnTiming.headersAt > 0 ? turnTiming.headersAt - turnTiming.requestedAt : 0;
+        const queueNote = ttft > 0 && queueMs >= 1_000 && queueMs >= ttft * 0.5
+          ? `, ${(queueMs / 1000).toFixed(1)}s of it the endpoint's own latency`
+          : "";
+        const ttftNote = ttft >= 2_000 && ttft >= seconds * 1_000 * 0.4
+          ? ` (first token after ${Math.round(ttft / 1000)}s of that${queueNote})`
+          : "";
+        emit({ kind: "patch", id: waitEntryId, text: `Planner responded in ${seconds}s${ttftNote}.${reasoned}` });
+        return;
+      }
       emit({
         kind: "patch",
         id: waitEntryId,
-        text: outcome === "responded"
-          ? `Planner responded in ${seconds}s.`
-          : `Planner gave no usable response in ${seconds}s.`,
+        text: `Planner gave no usable response in ${seconds}s.${reasoned}`,
       });
     };
 
-    const runPlannerTurn = async (turnAbort: AbortController, liveness: TurnLiveness, isRetry = false) =>
-      withTurnBudget(
+    const runPlannerTurn = async (turnAbort: AbortController, liveness: TurnLiveness, isRetry = false) => {
+      // A fresh boundary record per attempt: a retry must not inherit the
+      // previous attempt's headers, which would report "the endpoint answered"
+      // about a request it has not sent yet.
+      turnTiming = { requestedAt: performance.now(), headersAt: 0 };
+      // …and a fresh attempt to record: the diagnostics block names each one.
+      attemptRecorded = false;
+      // Sampled per attempt: whether the offscreen pipeline was still running
+      // while this attempt waited. See PlannerTurnReport.localWork.
+      localWorkDuringTurn = pendingFrameAudit !== null && !frameAuditDelivered;
+      return withTurnBudget(
         planner.run({
           system: systemPrompt,
           messages,
           tools: TOOLS,
           signal: mergeAbort(signal, turnAbort.signal),
+          onMilestone: (milestone, at) => {
+            if (milestone === "requested") {
+              turnTiming.requestedAt = at;
+            } else if (milestone === "output") {
+              // The model's first byte, whatever channel it arrived on. The
+              // streamed-text callbacks below see only prose, so a turn that went
+              // straight to a tool call used to record NO time to first token at
+              // all — and the turns a run is mostly made of are exactly those.
+              if (liveness.firstOutputAt === 0) liveness.firstOutputAt = at;
+            } else {
+              // `headers`: the endpoint answered. Also onto the turn's liveness,
+              // which is what withTurnBudget reads — the early "unanswered" cut
+              // needs the one fact only the adapter has, and reading it from the
+              // same record the guard already holds keeps the guard a pure
+              // function of its inputs.
+              turnTiming.headersAt = at;
+              liveness.headersAt = at;
+              // …and once here, the endpoint has proven it can at least accept a
+              // request from this run — see the retry policy.
+              endpointAnsweredThisRun = true;
+            }
+          },
           onText: (delta) => {
             // Any streamed output proves the turn is alive and resets the
             // silence window — a slow reasoner must not be killed for being
             // thorough, only for being dead.
             liveness.lastEventAt = performance.now();
+            if (liveness.firstOutputAt === 0) liveness.firstOutputAt = liveness.lastEventAt;
             liveness.events++;
             // …and it joins the degeneration tail. This channel is where the
             // reported runaway arrived: NIM/Llama models stream
@@ -1891,21 +2208,20 @@ export async function runTask(
           },
           onThought: (delta) => {
             liveness.lastEventAt = performance.now();
+            // Reasoning counts as output: the wait is over once ANYTHING streams.
+            if (liveness.firstOutputAt === 0) liveness.firstOutputAt = liveness.lastEventAt;
             liveness.events++;
             recordStreamedOutput(liveness, delta);
             liveness.reasoningChars += delta.length;
             if (liveness.reasoningStartedAt === 0) {
               liveness.reasoningStartedAt = performance.now();
-              reasoningStartedAt = liveness.reasoningStartedAt;
             }
             thoughtChars += delta.length;
-            // The first reasoning token ends the wait ticker's job: the live
-            // stream below is now the liveness indicator.
-            if (waitEntryId !== null && !waitSettled) {
-              waitSettled = true;
-              clearInterval(waitTimer);
-              emit({ kind: "patch", id: waitEntryId, text: "Planner is reasoning — streamed live below." });
-            }
+            // Reasoning does NOT end the wait line: the line keeps ticking and
+            // switches to the reasoning counter on its next tick, which is the
+            // one place a per-second elapsed time and a char count are shown
+            // together. (Ending it here is what needed a second ticker to
+            // replace it.)
             if (!thoughtTruncated) {
               thoughtPending += delta;
               ensureFlushTimer();
@@ -1915,15 +2231,30 @@ export async function runTask(
         liveness,
         {
           firstOutputMs: budgetFor(isRetry),
+          // A request nobody has acknowledged is cut well before the silence
+          // budget, and only on the FIRST attempt: a retry exists to ask whether
+          // the silence was a hiccup, and asking it twice buys nothing. See the
+          // catch below for what a cut turn does instead.
+          headersMs: isRetry ? Infinity : unansweredHeadersMs,
           idleMs: STREAM_IDLE_TIMEOUT_MS,
           maxMs: MAX_TURN_MS,
           maxReasoningChars: MAX_REASONING_CHARS,
           maxReasoningMs: MAX_REASONING_MS,
           onTimeout: () => turnAbort.abort(),
           messageFor: (reason, liveness, waitedMs) =>
-            turnCutShortMessageFor(planner.label, reason, liveness, waitedMs, budgetFor(isRetry)),
+            reason === "unanswered"
+              ? unansweredTurnMessageFor(planner.label, waitedMs, turnTiming)
+              : turnCutShortMessageFor(
+                  planner.label,
+                  reason,
+                  liveness,
+                  waitedMs,
+                  budgetFor(isRetry),
+                  turnTiming,
+                ),
         },
       );
+    };
 
     // ─── AGENT EGRESS GUARD ───
     // Before any message payload leaves for an external LLM endpoint,
@@ -1946,10 +2277,19 @@ export async function runTask(
     try {
       turn = await runPlannerTurn(new AbortController(), firstTurnLiveness);
       endpointServedThisRun = true;
-      settleWait("responded");
+      settleWait("responded", firstTurnLiveness);
     } catch (firstError) {
       if (signal.aborted) { settleWait("cancelled"); finishTask(); return; }
       const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
+      // A rejection with no cut recorded means the BUDGET never fired: the
+      // adapter itself threw, so the transport failed mid-turn. Named here
+      // because every other reading of this turn ("settled") would tell the
+      // diagnostics block that the turn completed — and the one thing the user
+      // needs to know about a dropped answer is that it was dropped.
+      if (firstTurnLiveness.ended === "settled") firstTurnLiveness.ended = "dropped";
+      // Recorded whether or not this attempt ends the run: a cut turn that is
+      // retried, or re-routed, is still an attempt the report must name.
+      recordAttempt("failed", firstTurnLiveness);
       // A ceiling cut is not a transient hiccup: the turn WAS streaming and we
       // stopped it for taking too long, so a retry re-sends the same prompt to
       // the same slow model and gets cut the same way. Retrying it is what
@@ -1960,8 +2300,25 @@ export async function runTask(
       // the same garbage. Only a genuine silence is worth one retry.
       const policy = retryPolicyFor(firstTurnLiveness, firstMessage, {
         endpointProvenThisRun: endpointServedThisRun,
+        endpointAnsweredThisRun,
       });
       const deliberated = firstTurnLiveness.ended === "deliberation";
+
+      // ─── The endpoint never acknowledged the request ───
+      // Not a model problem: the model has not seen the prompt. Waiting out the
+      // rest of the silence budget would only prove that again, and the one
+      // thing that can still answer is a different endpoint — so the run spends
+      // what is left of the wait on the provider's fast model instead. The re-route
+      // reuses the single retry attempt below (short budget) rather than adding a
+      // third kind of wait: worst case is now ~headers + 20 s instead of 90 s +
+      // 20 s, and the transcript says which model it moved to.
+      const rerouteModel = fastModelFor(settings);
+      const canReroute =
+        firstTurnLiveness.ended === "unanswered" &&
+        rerouteModel !== null &&
+        !plannerSwitched &&
+        settings.fastPlanner !== true &&
+        settings.autoFastPlannerOnSlowProvider !== false;
 
       // A deliberation cut is steered, not failed: the model has everything it
       // needs and is stuck analysing instead of acting, so the next turn is the
@@ -1982,8 +2339,34 @@ export async function runTask(
           },
         });
         messages.push({ role: "user", content: ACT_NOW_DIRECTIVE });
+      } else if (canReroute && rerouteModel) {
+        try {
+          // The label of the endpoint that FAILED, read before the swap: the
+          // planner variable is replaced below, and reporting the new planner's
+          // label here produced a note that said "No response from <the fast
+          // model> — re-sending this step to <the fast model>", which names the
+          // wrong endpoint and hides which one went quiet.
+          const unresponsive = planner.label;
+          planner = createPlanner({ ...settings, fastPlanner: true });
+          plannerSwitched = true;
+          emit({
+            kind: "entry",
+            entry: {
+              id: nextId(),
+              role: "system",
+              text:
+                `No response from ${unresponsive} — the endpoint never acknowledged the request, so ` +
+                `the model has not seen it. Re-sending this step to ${rerouteModel}, whose endpoint ` +
+                `answers faster. Options → Planner speed turns this off.`,
+            },
+          });
+        } catch {
+          // A provider whose fast planner cannot be built keeps the one it has,
+          // and the single retry below is spent on it.
+          plannerSwitched = true;
+        }
       } else if (!policy.retry) {
-        settleWait("failed");
+        settleWait("failed", firstTurnLiveness);
         errorCount++;
         // Say WHY the prompt was not re-sent. The failure text alone ("...the
         // network stalled or the connection dropped") invites exactly the wrong
@@ -2026,14 +2409,26 @@ export async function runTask(
       // that came after it.
       waitEntryId = null;
       waitStart = performance.now();
+      const retryLiveness = newTurnLiveness();
       try {
-        // The retry gets the short budget — see `runPlannerTurn`'s `isRetry`.
-        turn = await runPlannerTurn(new AbortController(), newTurnLiveness(), true);
+        // Retries of a DROPPED connection (adapter threw, no cut was recorded)
+        // get the full first-output budget, not the short retry budget. A
+        // dropped mid-answer means the model already saw the prompt, so the
+        // unanswered-headers cut does not apply — and the short retry budget
+        // (whose early headersMs=Infinity cut is designed for a silent-first
+        // attempt) would cut this retry at 90s on the first-output timer instead
+        // of giving the dropped model the full 90 s to resume streaming.
+        // The transport cut still applies: the retry can be aborted by the
+        // turn-level timeout, and the live tick still watches for silence after
+        // output resumes. The only difference is the first-output window is the
+        // full one, not the compressed retry one.
+        turn = await runPlannerTurn(new AbortController(), retryLiveness, false);
         endpointServedThisRun = true;
-        settleWait("responded");
+        settleWait("responded", retryLiveness);
       } catch (secondError) {
         if (signal.aborted) { settleWait("cancelled"); finishTask(); return; }
-        settleWait("failed");
+        if (retryLiveness.ended === "settled") retryLiveness.ended = "dropped";
+        settleWait("failed", retryLiveness);
         errorCount++;
         emit({
           kind: "entry",
@@ -2043,8 +2438,8 @@ export async function runTask(
             text:
               (secondError instanceof Error ? secondError.message : String(secondError)) +
               (steered
-                ? " It was told to act on what it already had and still did not converge — make the step smaller, or switch to a faster model (Groq openai/gpt-oss-20b)."
-                : " Retried once and failed again — switch to a faster provider/model (Groq openai/gpt-oss-20b) in the options and rerun."),
+                ? " It was told to act on what it already had and still did not converge — make the step smaller, or switch to a faster model (openai/gpt-oss-20b on Groq or NVIDIA)."
+                : " Retried once and failed again — switch to a faster provider/model (openai/gpt-oss-20b on Groq or NVIDIA) in the options and rerun."),
           },
         });
         finishTask();
@@ -2056,6 +2451,48 @@ export async function runTask(
       if (flushTimer !== null) {
         clearInterval(flushTimer);
         flushTimer = null;
+      }
+    }
+
+    // ─── Is the ENDPOINT the problem? Then stop waiting on it ───
+    //
+    // Placed here — after a turn has settled, before the next one is built — so
+    // the switch takes effect on the very next planner call and never mid-turn.
+    // The decision is pure policy (plannerSpeedUpDecision), and the reason it
+    // states is the reason printed, so a user who disagrees can point at what
+    // triggered it.
+    if (!plannerSwitched) {
+      const fastModel = fastModelFor(settings);
+      const decision = plannerSpeedUpDecision({
+        firstOutputMs: turnFirstOutputMs,
+        alreadyFast: settings.fastPlanner === true,
+        hasDistinctFastModel: fastModel !== null,
+        allowed: settings.autoFastPlannerOnSlowProvider !== false,
+        alreadySwitched: plannerSwitched,
+        slowMs: speedUpSlowMs,
+        queuedMs: speedUpQueuedMs,
+      });
+      if (decision.switch && fastModel) {
+        try {
+          planner = createPlanner({ ...settings, fastPlanner: true });
+          plannerSwitched = true;
+          emit({
+            kind: "entry",
+            entry: {
+              id: nextId(),
+              role: "system",
+              text:
+                `Slow endpoint: ${decision.reason}. Switching to ${fastModel} for the rest of this ` +
+                `run — a fast model plans worse than a reasoning one, and this run already spent ` +
+                `your time waiting. Options → Planner speed turns this off.`,
+            },
+          });
+        } catch {
+          // A provider that cannot build the fast planner keeps the one it has.
+          // The run continues on the slow model rather than failing a task the
+          // user never asked to interrupt.
+          plannerSwitched = true;
+        }
       }
     }
 
@@ -2112,7 +2549,7 @@ export async function runTask(
             `The planner (${planner.label}) answered with text that is not language — ` +
             `${nonLatinLetterScripts(turn.text).length} scripts mixed into punctuation fragments — ` +
             `so it is not shown as the task's result. No action was taken on the page this turn. ` +
-            `Rerun, or switch to a steadier model (Groq openai/gpt-oss-20b) in the options.`,
+            `Rerun, or switch to a steadier model (openai/gpt-oss-20b on Groq or NVIDIA) in the options.`,
         },
       });
       reportUndeliveredFrameNote();
@@ -2720,6 +3157,34 @@ function warnIfInjected(snapshot: PageSnapshot, emit: (e: AgentEvent) => void): 
 const FIRST_OUTPUT_TIMEOUT_MS = 90_000;
 
 /**
+ * How long a request may go with NO response headers before the ENDPOINT is
+ * judged unfit for this run.
+ *
+ * The silence budget above bounds how long to wait for the MODEL. It cannot tell
+ * a model thinking apart from a request nobody accepted, and spending the whole
+ * 90 s on the second buys no information at all: the model has not seen the
+ * prompt, so its speed is not in question. Response headers are the endpoint
+ * saying "I have it", and 25 s is several times the measured first-byte time of
+ * every provider PRY ships with (live: 1.3-1.9 s to a Groq tool call, and 27 s
+ * for Groq's slowest turn — which is a QUEUE, i.e. headers had already arrived).
+ *
+ * A cut for this reason is not reported as the model being slow, and the loop
+ * does not spend a retry on it: it re-routes the SAME turn to the provider's fast
+ * model when one is configured, because a different endpoint is the only thing
+ * left that can answer. With nothing to switch to, it says so and stops.
+ */
+export const UNANSWERED_HEADERS_MS = 25_000;
+
+/** Every reason one planner turn can be cut short; the message builder is keyed on it. */
+export type PlannerCutReason =
+  | "silent"
+  | "unanswered"
+  | "ceiling"
+  | "deliberation"
+  | "degenerate"
+  | "salad";
+
+/**
  * How long a turn that HAS started streaming may go quiet before we call it
  * dropped. Reasoning models emit deltas continuously, so 30 s of total silence
  * is a dead connection, however long the turn has legitimately been running.
@@ -3158,6 +3623,44 @@ export const ACT_NOW_DIRECTIVE =
   "cards, menu entries usually have none), call click_text with the exact visible text of the target.";
 
 /**
+ * What "the same page" means for the stagnation check: normalized URL plus
+ * element count plus a hash of the visible text. Scroll position is
+ * deliberately NOT part of it — a scroll that loads nothing new twice in a
+ * row is stuck, not exploring — and neither are volatile decorations (the
+ * title carries the signed-in address on some sites and is tokenized
+ * downstream, which would make every signature unique).
+ */
+export function pageSignature(url: string, elementCount: number, text: string): string {
+  return `${sanitizeUrl(url)}|${elementCount}|${fnv1a(String(text ?? ""))}`;
+}
+
+/**
+ * Consecutive steps on a byte-identical page before the run says so.
+ *
+ * The action loop detector counts read-only ACTIONS (window of 5); this
+ * counts an unchanged PAGE. The reported stall — read_page, wait 2000ms,
+ * read_page on a loaded login form, ~50 s and three reasoning bills for zero
+ * new evidence — never reaches that window, yet the second read was knowable
+ * in advance to be the read the run already had. Scroll is deliberately NOT
+ * part of the signature: a scroll that loads nothing new twice in a row is
+ * stuck, not exploring.
+ */
+export const STAGNATION_STEPS = 2;
+
+/**
+ * What a stagnated run is told. Pushed as a user message (same channel as
+ * ACT_NOW_DIRECTIVE) so the NEXT turn reasons with it, not around it. Names
+ * the forbidden pair explicitly — the stall is always read-again or
+ * wait-again — and the two exits, because "do something" without handles is
+ * how a nudge becomes another reasoning bill.
+ */
+export const STAGNATION_DIRECTIVE =
+  "The last three steps left the page unchanged: re-reading it or waiting again will return " +
+  "exactly what you already have. Act on the page as last read — click, click_text, type, scroll, " +
+  "or navigate — or give the final answer if the task is done. Do not call read_page, find_text, " +
+  "or wait again until an action has changed the page.";
+
+/**
  * Stall/transient failure classifiers — these warrant one automatic retry.
  * Everything else (bad model, rejected key, malformed request) is not retried.
  */
@@ -3192,6 +3695,28 @@ export function isRetryablePlannerError(message: string): boolean {
 interface TurnLiveness {
   /** Timestamp of the last streamed delta. */
   lastEventAt: number;
+  /**
+   * When this turn's FIRST byte arrived (0 while nothing has streamed).
+   *
+   * The single most useful latency number this side of the wire, and the one
+   * the transcript had no way to state: "Planner responded in 28s" cannot be
+   * acted on, while "first token after 24s" says the provider queued the
+   * request rather than that the model thought for 24 seconds. It is also the
+   * trigger for the fast-model switch below — see plannerSpeedUpDecision.
+   */
+  firstOutputAt: number;
+  /**
+   * When the endpoint's response HEADERS arrived; 0 while nothing has answered.
+   *
+   * Distinct from `firstOutputAt` and earlier than it by however long the
+   * provider took to accept the request: a streaming completion sends no body
+   * bytes at all until the model produces its first token, so until this lands a
+   * provider queue, a stalled socket and a thinking model are the same
+   * observation. It is what the early "unanswered" cut reads (see
+   * UNANSWERED_HEADERS_MS), and it is what plannerWaitCause explains a silence
+   * with. Reported by the adapter — only it sits on the transport.
+   */
+  headersAt: number;
   /** Number of deltas this turn has produced. */
   events: number;
   /** Reasoning characters streamed this turn (the deliberation signal). */
@@ -3205,7 +3730,21 @@ interface TurnLiveness {
    */
   outputTail: string;
   /** How the turn ended; the retry policy reads this. */
-  ended: "settled" | "silent" | "ceiling" | "deliberation" | "degenerate" | "salad";
+  ended:
+    | "settled"
+    | "silent"
+    | "unanswered"
+    | "ceiling"
+    | "deliberation"
+    | "degenerate"
+    | "salad"
+    /**
+     * The adapter threw: the transport failed mid-turn rather than the budget
+     * cutting it. Distinct from `settled` (the turn completed) and from every
+     * silence, because the prompt DID reach the model and the answer stopped
+     * arriving — the failure that is worth exactly one retry.
+     */
+    | "dropped";
   /**
    * How long the turn ran before it was cut, in ms (0 while it is still going).
    *
@@ -3219,6 +3758,8 @@ interface TurnLiveness {
 export function newTurnLiveness(): TurnLiveness {
   return {
     lastEventAt: performance.now(),
+    firstOutputAt: 0,
+    headersAt: 0,
     events: 0,
     reasoningChars: 0,
     reasoningStartedAt: 0,
@@ -3274,6 +3815,17 @@ export const RETRY_FIRST_OUTPUT_MS = 20_000;
  * reported run after a single action — step 0 navigated, step 1 was silent, and
  * the task stopped with "switch to a faster provider" while holding the evidence
  * that the provider was fine.
+ *
+ * `endpointAnsweredThisRun` is the third fact, and the second half of the same
+ * distinction: response HEADERS prove the endpoint accepted a request from this
+ * run even when no token ever streamed. Without it the two silences below were
+ * collapsed into one, and a turn that a provider accepted and then produced
+ * nothing for was refused a retry with the explanation that the endpoint "had not
+ * answered anything in this run" — a sentence the run had already disproved at
+ * the HTTP boundary, printed directly above a diagnostics block reading "headers
+ * after 0.1s". Reduced to nothing, a request that nobody accepted is not worth
+ * re-sending; one that WAS accepted and then produced nothing is exactly the
+ * shape a dropped connection has, which is what the one short retry is for.
  */
 export function retryPolicyFor(
   liveness: TurnLiveness,
@@ -3285,6 +3837,11 @@ export function retryPolicyFor(
      * rather than derived from `liveness`.
      */
     endpointProvenThisRun?: boolean;
+    /**
+     * True when any request of this run got response headers back — i.e. the
+     * endpoint ACCEPTED something, whether or not it ever produced a token.
+     */
+    endpointAnsweredThisRun?: boolean;
   } = {},
 ): { retry: boolean; because: string } {
   if (
@@ -3305,10 +3862,25 @@ export function retryPolicyFor(
         `throughput rather than a dropped connection, so the prompt is not re-sent`,
     };
   }
+  if (liveness.ended === "unanswered") {
+    // Not a dropped request (there may have been no connection to drop) and not a
+    // slow model: nothing acknowledged the prompt. The loop re-routes this turn to
+    // another endpoint when it has one; with none, re-sending to this one spends
+    // the rest of the budget to be told the same thing.
+    return {
+      retry: false,
+      because:
+        "the endpoint never acknowledged the request, so nothing about this model has been tested",
+    };
+  }
   if (liveness.ended === "silent" && liveness.events === 0) {
-    // Nothing streamed at all. Two cases, told apart by evidence the message
-    // cannot hold: has this endpoint answered anything in this run?
-    if (opts.endpointProvenThisRun) {
+    // Nothing streamed at all. Three cases, told apart by evidence the message
+    // cannot hold: did this endpoint answer anything in this run, and did it at
+    // least ACCEPT this request? A silence on an endpoint that has never said
+    // anything is the measured dead wait; a silence after the endpoint took the
+    // request is the shape a dropped connection has, and one short retry is how
+    // the two are told apart without spending the full budget on it.
+    if (opts.endpointProvenThisRun || opts.endpointAnsweredThisRun) {
       return {
         retry: true,
         because: "",
@@ -3341,12 +3913,88 @@ export function retryPolicyFor(
  *     prompt that caused the loop. Its wording therefore avoids every retry
  *     keyword too, and names the model choice as the fix.
  */
+/**
+ * A duration as a person would write it: to a tenth under 10 s, whole seconds
+ * above it. The tenth matters because the answer to "who is late" is 0.4 s or
+ * 9 s, and whole seconds cannot say which.
+ */
+function secondsLabel(ms: number): string {
+  return ms < 10_000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms / 1000)}s`;
+}
+
+/**
+ * Where one planner turn has been, measured at the network boundary.
+ *
+ * Time to first token is the number the whole wait policy runs on, and on its own
+ * it cannot be acted on: a first token 11 s after the request is a provider that
+ * queued it (fix: the fast-model switch) or a model that thought for 11 s (fix:
+ * nothing — that is what a reasoning model does). Splitting the wait at the
+ * response headers is what tells those apart, and headers are invisible from
+ * outside the adapter, which is why the adapters report them
+ * (PlannerMilestone) rather than the run guessing.
+ */
+export interface PlannerTiming {
+  /** When the request was handed to the transport (`performance.now()`). */
+  requestedAt: number;
+  /** When response headers arrived; 0 while nothing has answered at all. */
+  headersAt: number;
+}
+
+/**
+ * What a planner wait has been spent on, in words, from the boundary timings.
+ *
+ * The reported run could not tell these apart, and printed the same sentence —
+ * "no tokens yet" — for both:
+ *
+ *   1. NOTHING HAS ANSWERED. No response headers. The visible possibilities are
+ *      a stalled connection, a provider holding the request in a queue, or a
+ *      machine too busy to put it on the wire. The model has not seen the prompt,
+ *      so "the model is slow" is ruled out — which matters, because that is the
+ *      conclusion the user was reaching.
+ *   2. THE ENDPOINT ANSWERED and the body has been quiet since. The request was
+ *      accepted, so the wait is on the provider: queued behind other work, or the
+ *      model producing its first token.
+ *
+ * Returns a lowercase clause with no full stop, so the live ticker and the
+ * failure message can share one sentence. Kept pure and exported because this is
+ * the prose the user acts on, and prose buried inside a `setInterval` callback
+ * cannot be pinned by a test.
+ */
+export function plannerWaitCause(timing: PlannerTiming, now: number): string {
+  const seconds = secondsLabel;
+  if (timing.headersAt <= 0) {
+    return (
+      `the endpoint has not answered at all: the request left ${seconds(now - timing.requestedAt)} ` +
+      `ago and no response headers have come back — a stalled connection, a provider queue, or a ` +
+      `machine too busy to put the request on the wire (the model has not seen it yet)`
+    );
+  }
+  const queueMs = timing.headersAt - timing.requestedAt;
+  const quietMs = now - timing.headersAt;
+  return (
+    `the endpoint accepted the request ${seconds(queueMs)} after it left, then sent no body for ` +
+    `${seconds(quietMs)} — so the wait is on the provider's side: a queue, or the model still ` +
+    `producing its first token`
+  );
+}
+
+/** One capitalised sentence from a `plannerWaitCause` clause. */
+function asSentence(clause: string): string {
+  return `${clause.charAt(0).toUpperCase()}${clause.slice(1)}.`;
+}
+
 export function turnCutShortMessageFor(
   plannerLabel: string,
-  reason: "silent" | "ceiling" | "deliberation" | "degenerate" | "salad",
+  reason: PlannerCutReason,
   liveness: TurnLiveness,
   waitedMs: number,
   firstOutputBudgetMs: number,
+  /**
+   * The turn's boundary timings, when the caller has them. Optional so the
+   * message can still be built from the clock alone — and because a caller with
+   * no adapter milestones has nothing to add.
+   */
+  timing?: PlannerTiming,
 ): string {
   const waited = Math.round(waitedMs / 1000);
   if (reason === "salad") {
@@ -3358,7 +4006,7 @@ export function turnCutShortMessageFor(
       `punctuation and mixed-script fragments rather than sentences, so the turn was cut before the ` +
       `rest of the run inherited it. This is a model failure on a prompt this size, so the prompt is ` +
       `not re-sent and no action was taken. Rerun, or switch to a steadier model ` +
-      `(Groq openai/gpt-oss-20b) in the options.`
+      `(openai/gpt-oss-20b on Groq or NVIDIA) in the options.`
     );
   }
   if (reason === "degenerate") {
@@ -3367,7 +4015,7 @@ export function turnCutShortMessageFor(
       `producing text but nothing new, so the turn was stopped before the rest of the run ` +
       `inherited it. This is a model failure on a prompt this size, so the prompt is not ` +
       `re-sent and the loop is not carried into the next turn. Rerun, or switch to a ` +
-      `steadier model (Groq openai/gpt-oss-20b) in the options.`
+      `steadier model (openai/gpt-oss-20b on Groq or NVIDIA) in the options.`
     );
   }
   if (reason === "deliberation") {
@@ -3379,14 +4027,14 @@ export function turnCutShortMessageFor(
       `${liveness.reasoningChars.toLocaleString()} characters of analysis without taking a single action, ` +
       `so the turn was stopped. It is being told to act with what it already has. ` +
       `If it deliberates again, the honest read is that this prompt is too open for this model — ` +
-      `switch to a faster provider (Groq openai/gpt-oss-20b) or make the step smaller.`
+      `switch to a faster provider (openai/gpt-oss-20b on Groq or NVIDIA) or make the step smaller.`
     );
   }
   if (reason === "ceiling") {
     return (
       `The planner (${plannerLabel}) was still streaming after ${waited}s and was stopped. ` +
       `This model reasons slowly for a prompt this size — switch to a faster provider ` +
-      `(Groq openai/gpt-oss-20b) in the options, or break the task into smaller steps.`
+      `(openai/gpt-oss-20b on Groq or NVIDIA) in the options, or break the task into smaller steps.`
     );
   }
   if (liveness.events > 0) {
@@ -3403,9 +4051,118 @@ export function turnCutShortMessageFor(
       `went quiet for ${silent}s.`
     );
   }
+  const measured = timing ? ` ${asSentence(plannerWaitCause(timing, performance.now()))}` : "";
   return (
-    `The planner (${plannerLabel}) did not respond within ${Math.round(firstOutputBudgetMs / 1000)}s. ` +
-    `The provider may be overloaded or the network stalled.`
+    // `max(1, …)` for the same reason the unacknowledged message has it: a wait
+    // is never "within 0s", and a harness that injects sub-second budgets would
+    // otherwise print a number that reads as a bug in itself.
+    `The planner (${plannerLabel}) did not respond within ${Math.max(1, Math.round(firstOutputBudgetMs / 1000))}s.` +
+    `${measured} The provider may be overloaded or the network stalled.`
+  );
+}
+
+/** One planner attempt, as the run's closing diagnostics block reports it. */
+export interface PlannerTurnReport {
+  /** Which model this attempt actually called (the planner's own label). */
+  planner: string;
+  /** Request → response headers, in ms; null when nothing ever answered. */
+  headersMs: number | null;
+  /** Request → first streamed delta, in ms; null when none arrived. */
+  firstOutputMs: number | null;
+  /** How this attempt ended. */
+  ended: TurnLiveness["ended"] | "cancelled";
+  /** Whether any streamed deltas arrived (a cut with output is a different story). */
+  streamed: boolean;
+  /** Total time this attempt was allowed to run. */
+  ranMs: number;
+  /**
+   * True when local pixel work was still running while this attempt waited.
+   *
+   * The honest counterweight to "the provider was slow": the offscreen pipeline
+   * (BlazeFace tiles, NER, Tesseract) saturates the machine it runs on, and a
+   * starved thread is one of the things a request that never gets acknowledged
+   * can mean. Naming it in the report is what stops the reader concluding
+   * "the model is slow" from evidence that cannot see the model either way.
+   */
+  localWork: boolean;
+}
+
+/**
+ * The copyable half of the wait policy: what happened, in timings.
+ *
+ * The transcript's live lines are for reading during the run, and they are
+ * patched and collapsed as it goes. This is the record afterwards — the facts a
+ * stalled run has to be reported WITH, because "it hung for 90 seconds" is not a
+ * reproducible report and "the request left, no response headers arrived, the
+ * endpoint had not acknowledged it at 25 s" is. Pure and exported so the harness
+ * can pin the wording; the panel renders it verbatim as one copyable block.
+ */
+export function plannerDiagnosticsReport(input: {
+  /** The planner in use at the end of the run. */
+  planner: string;
+  /** The provider's fast model, or null when there is nothing to switch to. */
+  fastModel: string | null;
+  turns: readonly PlannerTurnReport[];
+  /** Whether the VLM pass was enabled for this run. */
+  vision: boolean;
+  /** How the run ended, in the run's own words. */
+  outcome: string;
+}): string {
+  const endedLabel = (turn: PlannerTurnReport): string => {
+    if (turn.ended === "unanswered") return "cut: the endpoint never acknowledged the request";
+    if (turn.ended === "dropped") return "the connection dropped mid-answer";
+    if (turn.ended === "silent") return turn.streamed ? "cut: the stream went quiet" : "cut: no response at all";
+    if (turn.ended === "ceiling") return "stopped at the turn ceiling";
+    if (turn.ended === "deliberation") return "stopped: reasoned without acting";
+    if (turn.ended === "degenerate" || turn.ended === "salad") return "stopped: output was not language";
+    if (turn.ended === "cancelled") return "cancelled by the user";
+    return "settled";
+  };
+
+  const attempts = input.turns.map((turn, i) => {
+    const headers = turn.headersMs === null
+      ? "no response headers"
+      : `headers after ${secondsLabel(turn.headersMs)}`;
+    const first = turn.firstOutputMs === null
+      ? "no tokens"
+      : `first token after ${secondsLabel(turn.firstOutputMs)}`;
+    const local = turn.localWork ? " · local frame pipeline running" : "";
+    return `  ${i + 1}. ${turn.planner} - ${headers}, ${first} - ${endedLabel(turn)} after ${secondsLabel(turn.ranMs)}${local}`;
+  });
+
+  const localTurns = input.turns.filter((t) => t.localWork).length;
+  return [
+    "- planner diagnostics, copy this into a bug report -",
+    `planner  ${input.planner}${input.fastModel ? ` · fast model: ${input.fastModel}` : " · no distinct fast model"}`,
+    `budgets  first output ${secondsLabel(FIRST_OUTPUT_TIMEOUT_MS)} · stream silence ${secondsLabel(STREAM_IDLE_TIMEOUT_MS)} · turn ceiling ${secondsLabel(MAX_TURN_MS)} · unanswered ${secondsLabel(UNANSWERED_HEADERS_MS)} · retry ${secondsLabel(RETRY_FIRST_OUTPUT_MS)}`,
+    `attempts ${input.turns.length}`,
+    ...attempts,
+    `local    vision ${input.vision ? "on" : "off"} · local frame pipeline running during ${localTurns} of ${input.turns.length} attempt(s)`,
+    `outcome  ${input.outcome}`,
+  ].join("\n");
+}
+
+/**
+ * The failure text for a request no endpoint acknowledged.
+ *
+ * Deliberately free of the retry keywords (`isRetryablePlannerError` reads
+ * "timed out", "overloaded", "stopped streaming"): re-sending this prompt to the
+ * same unacknowledged endpoint is the one move already measured to buy nothing.
+ * What the run does instead is re-route to a different ENDPOINT — the provider's
+ * fast model — which is a decision the loop makes, not one this sentence asks the
+ * user to make.
+ */
+export function unansweredTurnMessageFor(
+  plannerLabel: string,
+  waitedMs: number,
+  timing?: PlannerTiming,
+): string {
+  const seconds = Math.max(1, Math.round(waitedMs / 1000));
+  const measured = timing ? ` ${asSentence(plannerWaitCause(timing, performance.now()))}` : "";
+  return (
+    `The endpoint for the planner (${plannerLabel}) has not acknowledged the request: no response ` +
+    `headers within ${seconds}s.${measured} The model has not seen the prompt, so this is the ` +
+    `connection or the provider rather than the model, and the prompt is not re-sent to it.`
   );
 }
 
@@ -3439,6 +4196,78 @@ export function turnCutShortMessageFor(
  * direction is the load-bearing one: deferring an awaited frame would hand the
  * planner a description of a screen from before the action it just took.
  */
+/** A first token slower than this says the endpoint queued the request. */
+export const SLOW_FIRST_TOKEN_MS = 8_000;
+/** One turn this late is not variance — the provider is backlogged. */
+export const QUEUED_FIRST_TOKEN_MS = 20_000;
+
+/**
+ * Should this run switch itself to the provider's fast model?
+ *
+ * WHY THE RUN DECIDES, RATHER THAN THE SETTING ALONE
+ *
+ * The measured cost of a run is dominated by how long the endpoint takes to
+ * send its FIRST token, and that is a property of the provider's load at that
+ * moment — not of the user's configuration. A free tier that queues the first
+ * request of a session, or a reasoning model whose chain-of-thought is invisible
+ * but billed as latency, produces the reported "waiting for planner, no tokens
+ * yet" for tens of seconds while every knob in Options looks reasonable. The
+ * user should not have to diagnose that from a ticker and find a toggle.
+ *
+ * WHAT IT IS DELIBERATELY NOT
+ *
+ *   - Not a silent model change: the switch is announced in the transcript and
+ *     names the model, and the planner's own label carries it from then on.
+ *   - Not a guess: it needs TWO measured slow turns, or one turn so late that no
+ *     other reading fits. A single 8 s turn is variance and proves nothing.
+ *   - Not a downgrade of a fast provider: with no distinct fast model, or with
+ *     fast mode already on, this can never fire.
+ *   - Not a permanent change: it re-creates the planner for the rest of THIS
+ *     run and never writes settings.
+ *
+ * Stated plainly as the trade it is: the provider's fast model plans worse than
+ * its reasoning default. The run spends that judgement only when it has already
+ * spent the user's time, and says so where they can see it.
+ */
+export function plannerSpeedUpDecision(input: {
+  /** Time to first streamed output per turn, in ms, oldest first. */
+  firstOutputMs: readonly number[];
+  /** The run already uses the provider's fast model. */
+  alreadyFast: boolean;
+  /** The provider has a fast model that differs from the one in use. */
+  hasDistinctFastModel: boolean;
+  /** Setting `autoFastPlannerOnSlowProvider`. */
+  allowed: boolean;
+  /** The run already switched once. */
+  alreadySwitched: boolean;
+  /** Overridable for the harness — see AgentDeps.slowFirstTokenMs. */
+  slowMs?: number;
+  queuedMs?: number;
+}): { switch: boolean; reason: string } {
+  const slowMs = input.slowMs ?? SLOW_FIRST_TOKEN_MS;
+  const queuedMs = input.queuedMs ?? QUEUED_FIRST_TOKEN_MS;
+  if (input.alreadySwitched) return { switch: false, reason: "already switched once this run" };
+  if (!input.allowed) return { switch: false, reason: "switching is switched off in Options" };
+  if (input.alreadyFast) return { switch: false, reason: "already using the fast model" };
+  if (!input.hasDistinctFastModel) return { switch: false, reason: "this provider has no distinct fast model" };
+
+  const slowTurns = input.firstOutputMs.filter((ms) => ms >= slowMs);
+  const queuedTurn = input.firstOutputMs.find((ms) => ms >= queuedMs);
+  if (slowTurns.length >= 2) {
+    return {
+      switch: true,
+      reason: `${slowTurns.length} turns waited over ${Math.round(slowMs / 1000)}s for a first token`,
+    };
+  }
+  if (queuedTurn !== undefined) {
+    return {
+      switch: true,
+      reason: `the provider took ${Math.round(queuedTurn / 1000)}s to send its first token, which is queueing rather than thinking`,
+    };
+  }
+  return { switch: false, reason: "no turn waited long enough to blame the endpoint" };
+}
+
 export function frameNeedsPlannerWait(input: {
   visionEnabled: boolean;
   hasVisionKey: boolean;
@@ -3502,10 +4331,19 @@ export function withTurnBudget<T>(
     maxReasoningChars?: number;
     /** …or that reasons for this long, once it has said something substantial. */
     maxReasoningMs?: number;
+    /**
+     * Cut a turn whose request the endpoint has not even ACKNOWLEDGED within
+     * this long (no response headers) — see UNANSWERED_HEADERS_MS.
+     *
+     * Defaults to Infinity, i.e. off: a caller that has no adapter milestones
+     * (every pure test of this helper, and any planner that reports none) gets
+     * the silence budget it always had rather than a cut it cannot justify.
+     */
+    headersMs?: number;
     /** Set false to run a turn whose output is expected to repeat (tests). */
     detectDegeneration?: boolean;
     messageFor: (
-      reason: "silent" | "ceiling" | "deliberation" | "degenerate" | "salad",
+      reason: PlannerCutReason,
       liveness: TurnLiveness,
       waitedMs: number,
     ) => string;
@@ -3514,10 +4352,7 @@ export function withTurnBudget<T>(
   return new Promise<T>((resolve, reject) => {
     const startedAt = performance.now();
     let done = false;
-    const finish = (
-      reason: "silent" | "ceiling" | "deliberation" | "degenerate" | "salad",
-      waitedMs: number,
-    ): void => {
+    const finish = (reason: PlannerCutReason, waitedMs: number): void => {
       done = true;
       clearInterval(ticker);
       liveness.ended = reason;
@@ -3528,7 +4363,12 @@ export function withTurnBudget<T>(
     const ticker = setInterval(() => {
       const waited = performance.now() - startedAt;
       if (liveness.events === 0) {
-        if (waited > opts.firstOutputMs) finish("silent", waited);
+        // Nothing streamed. Checked FIRST: an unacknowledged request is the one
+        // failure the remaining budget cannot resolve — waiting another 65 s
+        // proves only that the endpoint still has not answered.
+        const headersMs = opts.headersMs ?? Infinity;
+        if (liveness.headersAt === 0 && waited > headersMs) finish("unanswered", waited);
+        else if (waited > opts.firstOutputMs) finish("silent", waited);
         return;
       }
       // A turn that has collapsed is not going to converge, and it is checked
@@ -3602,23 +4442,6 @@ export function withTurnBudget<T>(
  * user signal when AbortSignal.any is unavailable). */
 function mergeAbort(userSignal: AbortSignal, turnSignal: AbortSignal): AbortSignal {
   return typeof AbortSignal.any === "function" ? AbortSignal.any([userSignal, turnSignal]) : userSignal;
-}
-
-/** UTF-8 byte length of a string (TextEncoder; falls back to char count). */
-function estimateUtf8Bytes(value: string): number {
-  try {
-    return new TextEncoder().encode(value).length;
-  } catch {
-    return value.length;
-  }
-}
-
-/** Human-readable byte count for the egress badge. */
-function formatEgress(bytes: number): string {
-  if (bytes <= 0) return "0 KB";
-  if (bytes < 1024) return `${bytes} B`;
-  const kb = bytes / 1024;
-  return kb < 10 ? `${kb.toFixed(1)} KB` : `${Math.round(kb)} KB`;
 }
 
 /**

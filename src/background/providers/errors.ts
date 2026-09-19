@@ -37,6 +37,37 @@ export function modelUnavailableReason(
   return null;
 }
 
+/**
+ * Whether a failure is the TRANSPORT rather than the provider, and what to say
+ * about it.
+ *
+ * A connection that dies mid-answer arrives as whatever the socket layer threw —
+ * `terminated` with a `SocketError` cause in undici, `fetch failed`, `other side
+ * closed` — and before this mapping existed it reached the transcript as that
+ * bare word. Two things were wrong with that. The user was shown a word that
+ * names nothing they can act on, and `isRetryablePlannerError` saw no keyword it
+ * recognised, so a dropped answer got NO retry even though the model HAD seen the
+ * prompt — the opposite of the policy's intent for a genuine hiccup.
+ *
+ * Two deliberate exclusions: the run's own abort (a budget cut, or Stop) is not a
+ * network fault and the run already knows what it did; and anything carrying an
+ * HTTP status is the provider answering, not the transport failing.
+ */
+export function transportFailure(message: string, cause = ""): string | null {
+  if (/abort/i.test(message)) return null;
+  if (
+    !/terminated|socket|econn|epipe|fetch failed|network|other side closed|premature close|und_err|connection (error|closed|reset|dropped)/i.test(
+      `${message} ${cause}`,
+    )
+  ) {
+    return null;
+  }
+  return (
+    "network error: the connection dropped mid-answer — the request was accepted and the " +
+    "response stopped arriving, so this is the transport rather than the model"
+  );
+}
+
 /** Shorten a raw provider message so the transcript never floods with JSON. */
 function shorten(message: string, max = 220): string {
   const cleaned = message.replace(/\s+/g, " ").trim();
@@ -67,6 +98,12 @@ export function describeOpenAIError(error: unknown, label: string): Error {
       `${label}: ${modelUnavailableReason(status ?? 404, rawMessage) ?? "the model id was not found"}. ` +
         `Open the extension options, press "Test Providers", and pick an available model.`,
     );
+  }
+  if (status === undefined) {
+    // No HTTP status means no response ever described this failure — the socket
+    // did, not the provider.
+    const transport = transportFailure(rawMessage, (error as { cause?: { message?: string } })?.cause?.message ?? "");
+    if (transport) return new PlannerError(`${label} ${transport}.`);
   }
   if (error instanceof OpenAI.APIError) {
     const reason = modelUnavailableReason(status ?? 0, rawMessage);

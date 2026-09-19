@@ -34,6 +34,9 @@
  */
 
 import { matchPiiInText } from "./text-pii-patterns";
+// The same box geometry the face channels merge with: a region already covered
+// by another is not a second finding, whichever channel found it.
+import { overlapArea } from "./primitives";
 
 /** One recognized word with its box in image pixels. */
 export interface OcrWord {
@@ -147,18 +150,6 @@ function lineConfidence(words: OcrWord[]): number {
 
 function boxArea(box: { width: number; height: number }): number {
   return Math.max(0, box.width) * Math.max(0, box.height);
-}
-
-function overlapArea(
-  a: { x: number; y: number; width: number; height: number },
-  b: { x: number; y: number; width: number; height: number },
-): number {
-  const left = Math.max(a.x, b.x);
-  const top = Math.max(a.y, b.y);
-  const right = Math.min(a.x + a.width, b.x + b.width);
-  const bottom = Math.min(a.y + a.height, b.y + b.height);
-  if (right <= left || bottom <= top) return 0;
-  return (right - left) * (bottom - top);
 }
 
 /**

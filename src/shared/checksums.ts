@@ -109,6 +109,35 @@ export function luhnValid(value: string): boolean {
   return sum % 10 === 0;
 }
 
+/**
+ * Luhn check digit for a leading digit string — the digit which, appended,
+ * makes the whole number pass `luhnValid`.
+ *
+ * Lives here with the validator rather than with its one caller (the surrogate
+ * generator) so the digit and the check that judges it cannot drift apart: the
+ * generator used to carry a second copy of the algorithm beside this one, and two
+ * implementations of a checksum are two chances for the forged value to fail the
+ * real validator.
+ *
+ * The check digit sits in the rightmost position, where Luhn does NOT double, so
+ * the alternation starts doubled at the digit immediately left of it.
+ */
+export function luhnCheckDigit(partial: string): number {
+  const n = partial.replace(/\D/g, "");
+  let sum = 0;
+  let double = true;
+  for (let i = n.length - 1; i >= 0; i--) {
+    let d = n.charCodeAt(i) - 48;
+    if (double) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    sum += d;
+    double = !double;
+  }
+  return (10 - (sum % 10)) % 10;
+}
+
 /** True when `value` is a card-shaped number that passes Luhn. */
 export function isCardNumber(value: string): boolean {
   return luhnValid(value);

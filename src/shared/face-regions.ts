@@ -31,8 +31,10 @@
  *   - The number of skin-box additions is capped so a photo (skin-like pixels
  *     everywhere) cannot turn a whole page into one opaque wall.
  */
+import { overlapArea } from "./primitives";
+import type { Box } from "./primitives";
 
-export interface FaceBox {
+export interface FaceBox extends Box {
   x: number;
   y: number;
   width: number;
@@ -48,15 +50,14 @@ export const FACE_DUPLICATE_COVERAGE = 0.3;
 /** How many skin-colour additions are allowed on top of the model's boxes. */
 export const MAX_SKIN_FACE_ADDITIONS = 16;
 
-/** Intersection area of two rectangles (0 when they do not overlap). */
-export function overlapArea(a: FaceBox, b: FaceBox): number {
-  const left = Math.max(a.x, b.x);
-  const top = Math.max(a.y, b.y);
-  const right = Math.min(a.x + a.width, b.x + b.width);
-  const bottom = Math.min(a.y + a.height, b.y + b.height);
-  if (right <= left || bottom <= top) return 0;
-  return (right - left) * (bottom - top);
-}
+/**
+ * Intersection area of two rectangles (0 when they do not overlap).
+ *
+ * Re-exported from `primitives` rather than implemented here: the OCR triage has
+ * the same geometry, and a second copy of it is one fix away from disagreeing
+ * about which regions are already covered.
+ */
+export { overlapArea };
 
 /**
  * True when `candidate` covers enough of any box in `accepted` to be the same

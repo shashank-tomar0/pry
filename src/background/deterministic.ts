@@ -173,10 +173,14 @@ export function tryDeterministic(
     const hasMultiStep = /\b(and|then|after|before|next|search|find|click|type|fill|read|play|watch|submit|send|post)\b/.test(raw);
     if (hasMultiStep) return { resolved: false };
 
-    // Validate: must look like a URL or domain name.
+    // Validate: must look like a URL or domain name, or a single-token site
+    // alias ("yt", "mail", "gh" — the way people speak, see SITE_ALIASES).
+    // Without the alias lookup "open yt" falls through to the planner, costing
+    // a full reasoning turn for a navigation with a checkable answer.
     const isUrl = /^(https?:\/\/|www\.|[\w-]+\.[\w.-]+(?:\/\S*)?$)/.test(raw);
     const canonical = canonicalHost(raw);
-    if (!isUrl && !canonical) return { resolved: false };
+    const aliasHosts = SITE_ALIASES[raw.toLowerCase()];
+    if (!isUrl && !canonical && !aliasHosts) return { resolved: false };
 
     // Normalize: add https:// if no protocol. Bare known names get their
     // canonical TLD appended (gmail → https://gmail.com, never https://gmail).
@@ -195,9 +199,11 @@ export function tryDeterministic(
       } catch {
         url = raw;
       }
-    } else if (canonical) {
+    } else if (canonical || aliasHosts) {
       // canonicalHost strips a leading www., so "www.gmail" also lands here.
-      url = `https://${canonical}`;
+      // An alias resolves to its first satisfying host ("yt" → youtube.com),
+      // mirroring what bareNavigationGoal checks the tab against.
+      url = `https://${canonical ?? aliasHosts![0]}`;
     } else if (/^www\./.test(raw)) {
       url = `https://${raw}`;
     } else {

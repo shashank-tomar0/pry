@@ -35,6 +35,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 // here through a real `runTask`. One fixture, so the two suites cannot end up
 // reasoning about two different observations.
 import { GLITCH_OUTPUT } from "./fixtures/glitch-output.mjs";
+// A real HTTP endpoint that can queue, stall, drop mid-answer or never answer at
+// all — the four failures a stub planner cannot produce, because each one is a
+// fact about the TRANSPORT. See the scenarios at the end.
+import { startFakeProvider } from "./fixtures/fake-provider.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 /** Bundled to disk (and deleted on exit) so a stack trace shows the real file
@@ -68,7 +72,25 @@ const STUBS = {
     }
   `,
   "./providers": `
-    export function createPlanner() { return globalThis.__pry.planner; }
+    // Older scenarios in this file set only \`__pry.planner\`; they keep working,
+    // and their default \`fastModelFor\` is null (no distinct fast model), so the
+    // slow-endpoint switch cannot fire in a scenario that never asked for it.
+    //
+    // \`realProvider\` is the third case: the scenarios that drive the REAL
+    // OpenAI-compatible adapter against a fake endpoint build the planner through
+    // the harness, which is the only way to exercise what the adapter does with
+    // headers that never arrive, a body that never comes, and a socket that dies
+    // mid-answer.
+    export function createPlanner(settings) {
+      if (globalThis.__pry.realProvider) return globalThis.__pry.realProvider(settings);
+      return globalThis.__pry.plannerFor
+        ? globalThis.__pry.plannerFor(settings)
+        : globalThis.__pry.planner;
+    }
+    export function fastModelFor(settings) {
+      return globalThis.__pry.fastModelFor ? globalThis.__pry.fastModelFor(settings) : null;
+    }
+    export function configuredModel() { return "stub/planner"; }
   `,
   "./vision": `
     export const VISION_SUPPORTED = new Proxy({}, { get: () => true });
@@ -137,7 +159,10 @@ async function bundle(entryContents) {
 }
 
 const bundleText = await bundle(`
-  export { runTask, frameNeedsPlannerWait, finalAnswerComplaint } from "./src/background/agent.ts";
+  export {
+    runTask, frameNeedsPlannerWait, finalAnswerComplaint,
+    plannerSpeedUpDecision, SLOW_FIRST_TOKEN_MS, QUEUED_FIRST_TOKEN_MS,
+  } from "./src/background/agent.ts";
   export { DEFAULT_SETTINGS } from "./src/shared/types.ts";
   // The real goal check, for the scenarios that supply it to the stubbed module.
   export { bareNavigationGoal, hostSatisfiesBareGoal } from "./src/background/deterministic.ts";
@@ -145,6 +170,10 @@ const bundleText = await bundle(`
   // scenario below can measure a real request rather than just the conversation.
   export { SYSTEM_PROMPT } from "./src/background/prompt.ts";
   export { TOOLS } from "./src/background/tools.ts";
+  // The REAL OpenAI-compatible adapter, for the fake-endpoint scenarios: they
+  // hand it a base URL and let it speak to a real socket, so what is asserted is
+  // the adapter's own reading of the transport rather than a stub's claim.
+  export { createOpenAIPlanner } from "./src/background/providers/openai.ts";
 `);
 await writeFile(bundlePath, bundleText, "utf8");
 const mod = await import(pathToFileURL(bundlePath).href);
@@ -229,7 +258,7 @@ function makeProcessedFrame(redactedCount, extra = {}) {
 }
 
 /** Build a scripted planner that records everything it was shown. */
-function makePlanner(script, { plannerMs, onTurn }) {
+function makePlanner(script, { plannerMs, onTurn, firstTokenMs = 0 }) {
   const seen = [];
   return {
     label: "Stub planner",
@@ -239,6 +268,14 @@ function makePlanner(script, { plannerMs, onTurn }) {
       // planner SAW is the whole question here.
       seen.push(JSON.parse(JSON.stringify(messages)));
       if (onTurn) onTurn(seen.length);
+      // Time to first token: a provider that queues sends NOTHING for this long,
+      // which is the measurement the slow-endpoint switch reads. Streaming is
+      // what makes it a first-token measurement at all — a planner that returns
+      // text without ever calling onText has no first token to time.
+      if (firstTokenMs > 0) {
+        await sleep(firstTokenMs);
+        onText?.("working");
+      }
       const step = script.shift() ?? { text: "Done.", toolCalls: [] };
       if (step.stream) {
         // A turn that STREAMS, so the liveness guards (which read the rolling
@@ -327,6 +364,29 @@ async function runScenario({
   frame = undefined,
   /** Shortened wait budget, so a slow frame crosses it without a 15 s test. */
   frameAuditWaitMs = undefined,
+  /** Injected so the slow-endpoint switch fires without a 20 s wait. */
+  slowFirstTokenMs = undefined,
+  queuedFirstTokenMs = undefined,
+  /** Per-turn delay before the first streamed token. */
+  firstTokenMs = 0,
+  /** What the provider's fast model resolves to; null = nothing to switch to. */
+  fastModel = "fast-stub-model",
+  /** Extra top-level settings for this scenario. */
+  settingsExtra = {},
+  /**
+   * A running fake endpoint the REAL adapter is pointed at.
+   *
+   * `{ url, baseModel, fastModel }`. When set, the planner is
+   * `createOpenAIPlanner` talking to `url` over a real socket — so the transport
+   * failures the run reports are produced by a socket rather than described by a
+   * stub. The stub planner is still built (harmless) and `plannerModels` stays
+   * empty; the endpoint's own request log says which model was asked for.
+   */
+  endpoint = undefined,
+  /** The wait budgets, injected small so a 90 s silence is a 300 ms test. */
+  firstOutputMs = undefined,
+  retryFirstOutputMs = undefined,
+  unansweredHeadersMs = undefined,
 }) {
   globalThis.chrome = chromeStub;
   const emitted = [];
@@ -340,10 +400,40 @@ async function runScenario({
   let inFlight = 0;
   let peakInFlight = 0;
 
-  const planner = makePlanner(script, { plannerMs });
+  const planner = makePlanner(script, { plannerMs, firstTokenMs });
+  // Which model each planner turn actually ran on — the whole point of the
+  // switch is that later turns are a different model, not a different label.
+  const plannerModels = [];
 
   globalThis.__pry = {
     planner,
+    // Mirrors the real createPlanner: the label carries the model, so a run can
+    // never claim one model while using another.
+    plannerFor: (runSettings) => {
+      const model = runSettings?.fastPlanner ? (fastModel ?? "fast-stub-model") : "stub/planner";
+      const built = {
+        label: `Stub planner ${model}`,
+        model,
+        seen: planner.seen,
+        run: (args) => {
+          plannerModels.push(model);
+          return planner.run(args);
+        },
+      };
+      return built;
+    },
+    fastModelFor: () => fastModel,
+    ...(endpoint
+      ? {
+          realProvider: (runSettings) =>
+            mod.createOpenAIPlanner(
+              "nvidia",
+              "fake-key",
+              runSettings?.fastPlanner ? endpoint.fastModel : endpoint.baseModel,
+              endpoint.url,
+            ),
+        }
+      : {}),
     ledger,
     snapshot: () => (snapshotFactory ?? makeSnapshot)(),
     execute: async (controller, action) => {
@@ -361,7 +451,7 @@ async function runScenario({
     },
   };
 
-  const settings = baseSettings({ vision: { enabled: vision } });
+  const settings = baseSettings({ vision: { enabled: vision }, ...settingsExtra });
   const t0 = Date.now();
   await mod.runTask(task, 1, {
     settings,
@@ -369,6 +459,11 @@ async function runScenario({
     askConfirm: async () => true,
     signal: new AbortController().signal,
     ...(frameAuditWaitMs === undefined ? {} : { frameAuditWaitMs }),
+    ...(slowFirstTokenMs === undefined ? {} : { slowFirstTokenMs }),
+    ...(queuedFirstTokenMs === undefined ? {} : { queuedFirstTokenMs }),
+    ...(firstOutputMs === undefined ? {} : { firstOutputMs }),
+    ...(retryFirstOutputMs === undefined ? {} : { retryFirstOutputMs }),
+    ...(unansweredHeadersMs === undefined ? {} : { unansweredHeadersMs }),
     captureScreenshot: async () => {
       inFlight++;
       peakInFlight = Math.max(peakInFlight, inFlight);
@@ -385,7 +480,7 @@ async function runScenario({
   });
   const elapsed = Date.now() - t0;
 
-  return { name, emitted, ledger, planner, captures, elapsed, settings, peakInFlight, auditEntries, tallies };
+  return { name, emitted, ledger, planner, plannerModels, captures, elapsed, settings, peakInFlight, auditEntries, tallies };
 }
 
 /** The run's end-of-run line, which carries the run's totals. */
@@ -1239,6 +1334,37 @@ ok(
   `${requestBytes.map((b) => Math.round(b / 1024) + "K").join(" → ")}`,
 );
 
+// ─── Page stagnation steers, then stops ─────────────────────────────────────
+// Reported run ("open gmail and open the first email"): read_page → wait →
+// read_page on an unchanged page, ~50 s of reasoning bills for zero new
+// evidence, under the action loop detector's 5-window. Three steps on the
+// identical page now steer the planner through its own channel; three more
+// identical steps stop the run. Scrolls reset the count even against a static
+// stub snapshot (acting is not staring) — the payload scenario above is the
+// standing proof of that half.
+console.log("\n=== Page stagnation steers, then stops ===\n");
+
+const readTurn = { text: "Reading.", toolCalls: [{ id: "c1", name: "read_page", input: {} }] };
+const waitTurn = { text: "Waiting.", toolCalls: [{ id: "c1", name: "wait", input: { ms: 500 } }] };
+const stall = await runScenario({
+  name: "stagnation",
+  vision: false,
+  captureMs: 0,
+  plannerMs: 0,
+  steps: 10,
+  task: "open https://example.com and read the page",
+  script: [readTurn, waitTurn, readTurn, waitTurn, readTurn, waitTurn, readTurn, waitTurn],
+});
+const stallSeen = stall.planner.seen;
+const stallEntries = transcriptAfter(stall.emitted);
+ok("a read/wait stall is steered on the third identical step, through the planner's channel",
+  stallSeen.length >= 3 && textOf(stallSeen[2]).includes("will return exactly what you already have"),
+  `${stallSeen.length} turns`);
+ok("and the run stops instead of billing identical steps forever",
+  stallSeen.length < 8 &&
+  stallEntries.some((e) => e.role === "error" && /still unchanged after the steering advice/.test(e.text ?? "")),
+  `${stallSeen.length} turns`);
+
 // ─── A bare navigation goal that is already satisfied ───────────────────────
 // The reported run: task "open yt", the tab on YouTube, and the agent went on to
 // click a video and spend more turns looking for work. The check is at the TOP of
@@ -1401,5 +1527,355 @@ ok(
   narratedEntries.map((e) => `${e.role}: ${e.text}`).join(" | "),
 );
 
-console.log(`\n${passed} agent-loop assertions passed (real runTask, stubbed browser + models).`);
+// ─── A queueing endpoint: the run switches itself to the fast model ────────
+{
+  // The reported shape: "Planner responded in 28s" / "waiting on the planner,
+  // no tokens yet" while every option looks reasonable. What the run can see
+  // that the user cannot is its own time to FIRST token, so it measures that and
+  // switches on evidence rather than on a hunch.
+  const slowTurn = (text) => ({ text, toolCalls: [{ id: "s1", name: "scroll", input: { direction: "down" } }] });
+
+  // Two slow turns (the evidence the policy needs) then a plain finish.
+  const switched = await runScenario({
+    name: "slow endpoint",
+    vision: false,
+    plannerMs: 1,
+    captureMs: 1,
+    firstTokenMs: 60,
+    slowFirstTokenMs: 40,          // injected: 60ms counts as "slow"
+    queuedFirstTokenMs: 5_000,     // and not as "queueing outright"
+    script: [slowTurn("one"), slowTurn("two"), { text: "Finished.", toolCalls: [] }],
+    task: "scroll the page twice",
+  });
+  const switchNotes = systemTexts(switched).filter((t) => t.startsWith("Slow endpoint:"));
+  ok("two slow turns make the run switch to the provider's fast model",
+    switchNotes.length === 1 && /Switching to fast-stub-model/.test(switchNotes[0]),
+    switchNotes.join(" | ") || "no switch note");
+  ok("the note says what triggered it, so a user can disagree with the exact reason",
+    /2 turns waited over 0s for a first token/.test(switchNotes[0] ?? "") &&
+      /Options → Planner speed turns this off/.test(switchNotes[0] ?? ""),
+    switchNotes[0]);
+  // The evidence is the first two turns; every turn AFTER the decision must be
+  // the fast model, or the note is a claim rather than a change.
+  ok("later turns really run on the fast model, not just claim to",
+    switched.plannerModels.slice(0, 2).every((m) => m === "stub/planner") &&
+      switched.plannerModels.slice(2).length > 0 &&
+      switched.plannerModels.slice(2).every((m) => m === "fast-stub-model"),
+    switched.plannerModels.join(" → "));
+  ok("it switches once, not on every later turn",
+    switched.plannerModels.filter((m) => m === "fast-stub-model").length === 1,
+    switched.plannerModels.join(" → "));
+  ok("the task still finishes after the switch",
+    tallyLineOf(switched.emitted) !== undefined ||
+      systemTexts(switched).some((t) => t.includes("Finished")));
+
+  // One slow turn is variance and must not move the model.
+  const single = await runScenario({
+    name: "one slow turn",
+    vision: false,
+    plannerMs: 1,
+    captureMs: 1,
+    firstTokenMs: 60,
+    slowFirstTokenMs: 40,
+    queuedFirstTokenMs: 5_000,
+    script: [{ text: "Finished.", toolCalls: [] }],
+    task: "read the page",
+  });
+  ok("a single slow turn does not change the model",
+    systemTexts(single).every((t) => !t.startsWith("Slow endpoint:")) &&
+      single.plannerModels.every((m) => m === "stub/planner"),
+    single.plannerModels.join(" → "));
+
+  // One turn late enough to be a queue, though.
+  const queued = await runScenario({
+    name: "queued turn",
+    vision: false,
+    plannerMs: 1,
+    captureMs: 1,
+    firstTokenMs: 90,
+    slowFirstTokenMs: 1_000,
+    queuedFirstTokenMs: 50,
+    script: [slowTurn("one"), { text: "Finished.", toolCalls: [] }],
+    task: "scroll the page",
+  });
+  const queuedNotes = systemTexts(queued).filter((t) => t.startsWith("Slow endpoint:"));
+  ok("one turn late enough to be a queue switches on its own",
+    queuedNotes.length === 1 && /queueing rather than thinking/.test(queuedNotes[0]),
+    queuedNotes.join(" | ") || "no switch note");
+
+  // The user's opt-out, and the provider with nothing faster to offer.
+  for (const [label, overrides, expectation] of [
+    ["switching turned off in Options never fires", { slowFirstTokenMs: 40, queuedFirstTokenMs: 5_000 }, "off"],
+    ["a provider with no distinct fast model never fires", { slowFirstTokenMs: 40, queuedFirstTokenMs: 5_000, fastModel: null }, "none"],
+  ]) {
+    const guard = await runScenario({
+      name: label,
+      vision: false,
+      plannerMs: 1,
+      captureMs: 1,
+      firstTokenMs: 60,
+      script: [slowTurn("one"), slowTurn("two"), { text: "Finished.", toolCalls: [] }],
+      task: "scroll the page twice",
+      ...overrides,
+      ...(expectation === "off" ? { settingsExtra: { autoFastPlannerOnSlowProvider: false } } : {}),
+    });
+    ok(label,
+      systemTexts(guard).every((t) => !t.startsWith("Slow endpoint:")) &&
+        guard.plannerModels.every((m) => m === "stub/planner"),
+      guard.plannerModels.join(" → "));
+  }
+}
+
+// The policy itself, exercised directly — the thresholds are the SHIPPED ones
+// here, so a change to them shows up as a failing expectation.
+{
+  const decide = mod.plannerSpeedUpDecision;
+  const base = { alreadyFast: false, hasDistinctFastModel: true, allowed: true, alreadySwitched: false };
+  ok("no measurement, no switch", !decide({ ...base, firstOutputMs: [] }).switch);
+  ok("one turn at 9s is variance, not evidence",
+    !decide({ ...base, firstOutputMs: [9_000] }).switch &&
+      !decide({ ...base, firstOutputMs: [4_000, 5_000, 7_000] }).switch);
+  ok("two turns past the shipped 8s threshold do switch",
+    decide({ ...base, firstOutputMs: [9_000, 12_000] }).switch);
+  ok("one turn past the shipped 20s threshold switches on its own",
+    decide({ ...base, firstOutputMs: [21_000] }).switch &&
+      /queueing rather than thinking/.test(decide({ ...base, firstOutputMs: [21_000] }).reason));
+  ok("it never fires twice, nor when fast mode is already on, nor without a target model",
+    !decide({ ...base, firstOutputMs: [30_000, 30_000], alreadySwitched: true }).switch &&
+      !decide({ ...base, firstOutputMs: [30_000, 30_000], alreadyFast: true }).switch &&
+      !decide({ ...base, firstOutputMs: [30_000, 30_000], hasDistinctFastModel: false }).switch &&
+      !decide({ ...base, firstOutputMs: [30_000, 30_000], allowed: false }).switch);
+}
+
+// ─── A REAL endpoint that queues, stalls, drops, or never answers ───────────
+//
+// Everything above drives the loop through a stub planner, which is enough for
+// every fault that is a property of the MODEL or of the run's own bookkeeping.
+// The four failures below are not: "no response headers", "headers and then no
+// body" and "the socket died mid-answer" are facts about a TRANSPORT, and the run
+// learns them from two places a stub cannot be — the `fetch` boundary inside the
+// adapter (which is what reports PlannerMilestone) and the throws that come out
+// of it. So these scenarios run the REAL OpenAI-compatible adapter against a real
+// HTTP endpoint that has been told to misbehave, and assert what the whole run
+// does about it: what the transcript says, which model it re-sent to, how long it
+// waited, and what the copyable diagnostics block records.
+console.log("\n=== agent loop: a provider that queues, stalls, drops or never answers ===\n");
+{
+  /** The copyable diagnostics block the run emitted, verbatim. */
+  const diagnosticsOf = (r) =>
+    r.emitted
+      .filter((e) => e.kind === "entry" && e.entry?.role === "diagnostics")
+      .map((e) => e.entry.text ?? "")
+      .join("\n");
+  const errorTexts = (r) =>
+    r.emitted.filter((e) => e.kind === "entry" && e.entry?.role === "error").map((e) => e.entry.text ?? "");
+  /** System NOTES only: the diagnostics block is an entry too, and it quotes
+   * these phrases when it names the cuts, so a text-only filter double-counts. */
+  const notesWith = (r, re) =>
+    r.emitted
+      .filter((e) => e.kind === "entry" && e.entry?.role === "system")
+      .map((e) => e.entry.text ?? "")
+      .filter((t) => re.test(t));
+  const retryNotes = (r) => notesWith(r, /retrying once/);
+  const rerouteNotes = (r) => notesWith(r, /never acknowledged the request/);
+
+  // ── A queue: accepted instantly, first token much later ──
+  // The shape that reads to a user as "the model is slow". The endpoint is not
+  // slow, it QUEUED the request — and the run can now say which, because it
+  // times the headers separately from the first token.
+  {
+    const endpoint = await startFakeProvider({
+      modes: { "fake-slow": "queue", "fake-fast": "ok" },
+      queueMs: 1_500,
+    });
+    try {
+      const queued = await runScenario({
+        name: "queueing endpoint",
+        vision: false,
+        plannerMs: 1,
+        captureMs: 1,
+        endpoint: { url: endpoint.url, baseModel: "fake-slow", fastModel: "fake-fast" },
+        fastModel: "fake-fast",
+        slowFirstTokenMs: 400,
+        queuedFirstTokenMs: 1_000,
+        task: "read the page",
+      });
+      ok("a queued first token is named as queueing, not as a slow model",
+        systemTexts(queued).some((t) => t.startsWith("Slow endpoint:") && /queueing rather than thinking/.test(t)),
+        systemTexts(queued).join(" | "));
+      ok("the rest of the run really goes to the fast model",
+        endpoint.models()[0] === "fake-slow" &&
+          endpoint.models().slice(1).length > 0 &&
+          endpoint.models().slice(1).every((m) => m === "fake-fast"),
+        endpoint.models().join(" → "));
+      ok("and the run still finishes the task",
+        tallyLineOf(queued.emitted) !== undefined && errorTexts(queued).length === 0,
+        errorTexts(queued).join(" | ") || "no tally line");
+      ok("the diagnostics split the wait at the boundary instead of reporting one number",
+        /headers after 0\.\ds, first token after 1\.\ds/.test(diagnosticsOf(queued)),
+        diagnosticsOf(queued));
+    } finally {
+      await endpoint.close();
+    }
+  }
+
+  // ── A stall: accepted, then no body at all ──
+  // The endpoint acknowledged the request and produced nothing. That is not the
+  // "the provider never sent a token" case the retry policy refuses to re-send:
+  // this endpoint DID answer, at the HTTP boundary, and the run has to say so
+  // rather than print a refusal claiming it "had not answered anything".
+  {
+    const endpoint = await startFakeProvider({ modes: { "fake-slow": "stall" } });
+    try {
+      const stalled = await runScenario({
+        name: "stalled body",
+        vision: false,
+        plannerMs: 1,
+        captureMs: 1,
+        endpoint: { url: endpoint.url, baseModel: "fake-slow", fastModel: "fake-fast" },
+        fastModel: "fake-fast",
+        firstOutputMs: 400,
+        retryFirstOutputMs: 300,
+        unansweredHeadersMs: 5_000,
+        task: "read the page",
+      });
+      const failure = errorTexts(stalled).join(" | ");
+      ok("a body that never arrives is cut and the prompt is re-sent exactly once",
+        retryNotes(stalled).length === 1 && endpoint.requests.length === 2,
+        `${retryNotes(stalled).join(" | ")} · ${endpoint.requests.length} request(s)`);
+      ok("the failure names the boundary: the request WAS accepted, then went quiet",
+        /endpoint accepted the request/i.test(failure) && /sent no body for/.test(failure),
+        failure);
+      ok("and it never claims the endpoint had not answered anything",
+        !/had not answered anything/.test(failure), failure);
+      ok("the diagnostics record both attempts as header-acknowledged no-token cuts",
+        /attempts 2/.test(diagnosticsOf(stalled)) &&
+          (diagnosticsOf(stalled).match(/headers after 0\.\ds, no tokens/g) ?? []).length === 2,
+        diagnosticsOf(stalled));
+      ok("a stalled run ends in one retry budget, not the full silence budget",
+        stalled.elapsed < 3_000, `${stalled.elapsed}ms`);
+    } finally {
+      await endpoint.close();
+    }
+  }
+
+  // ── A mid-stream drop: the answer stops arriving ──
+  // Two deltas, then the socket dies. The adapter sees it, so what the run does
+  // about it is observable end to end — including the wording, which used to be
+  // the bare word "terminated" and carried no keyword the retry policy reads, so
+  // a dropped answer got no retry at all.
+  {
+    const endpoint = await startFakeProvider({ modes: { "fake-slow": "drop" } });
+    try {
+      const dropped = await runScenario({
+        name: "dropped socket",
+        vision: false,
+        plannerMs: 1,
+        captureMs: 1,
+        endpoint: { url: endpoint.url, baseModel: "fake-slow", fastModel: "fake-fast" },
+        fastModel: "fake-fast",
+        firstOutputMs: 2_000,
+        retryFirstOutputMs: 2_000,
+        unansweredHeadersMs: 5_000,
+        task: "read the page",
+      });
+      const failure = errorTexts(dropped).join(" | ");
+      ok("a connection that dies mid-answer is retried once, like the hiccup it is",
+        retryNotes(dropped).length === 1 && endpoint.requests.length === 2,
+        `${retryNotes(dropped).join(" | ")} · ${endpoint.requests.length} request(s)`);
+      ok("and the user is told the connection dropped, not shown a bare socket word",
+        /connection dropped mid-answer/.test(failure) && !/\bterminated\b/.test(failure),
+        failure);
+      ok("the diagnostics name it as a drop rather than a turn that settled",
+        /the connection dropped mid-answer/.test(diagnosticsOf(dropped)),
+        diagnosticsOf(dropped));
+    } finally {
+      await endpoint.close();
+    }
+  }
+
+  // ── Never acknowledged: abandon it and re-route the SAME turn ──
+  // No response headers ever. The model has not seen the prompt, so its speed is
+  // not in question and waiting out the silence budget buys no information — the
+  // run spends the wait on the provider's other endpoint instead.
+  {
+    const endpoint = await startFakeProvider({
+      modes: { "fake-slow": "deaf", "fake-fast": "ok" },
+    });
+    try {
+      const unacked = await runScenario({
+        name: "unacknowledged request",
+        vision: false,
+        plannerMs: 1,
+        captureMs: 1,
+        endpoint: { url: endpoint.url, baseModel: "fake-slow", fastModel: "fake-fast" },
+        fastModel: "fake-fast",
+        unansweredHeadersMs: 300,
+        firstOutputMs: 20_000,
+        retryFirstOutputMs: 2_000,
+        task: "read the page",
+      });
+      ok("an endpoint that never acknowledges is abandoned and told why",
+        rerouteNotes(unacked).length === 1 &&
+          // The note must name the endpoint that went quiet AND the one it moved
+          // to; naming the new model as the unresponsive one is a sentence that
+          // contradicts itself.
+          /No response from NVIDIA fake-slow/.test(rerouteNotes(unacked)[0] ?? "") &&
+          /Re-sending this step to fake-fast/.test(rerouteNotes(unacked)[0] ?? ""),
+        rerouteNotes(unacked).join(" | ") || "no reroute note");
+      ok("the SAME turn is re-sent to the fast model",
+        endpoint.models()[0] === "fake-slow" &&
+          endpoint.models().slice(1).every((m) => m === "fake-fast") &&
+          endpoint.models().length >= 2,
+        endpoint.models().join(" → "));
+      ok("the run finishes rather than reporting a provider failure",
+        tallyLineOf(unacked.emitted) !== undefined && errorTexts(unacked).length === 0,
+        errorTexts(unacked).join(" | ") || "no tally line");
+      ok("it did not spend the model's silence budget first",
+        unacked.elapsed < 2_500, `${unacked.elapsed}ms`);
+      ok("the diagnostics keep the abandoned attempt, with no headers to show",
+        // Three attempts: the abandoned one, then the two the fast model did the
+        // work in. The abandoned one is the whole reason the block is copied.
+        /attempts 3/.test(diagnosticsOf(unacked)) &&
+          /fake-slow - no response headers, no tokens - cut: the endpoint never acknowledged the request/.test(
+            diagnosticsOf(unacked),
+          ),
+        diagnosticsOf(unacked));
+    } finally {
+      await endpoint.close();
+    }
+  }
+
+  // With nothing faster to re-route to, the same endpoint is not waited on
+  // either: the run fails in the acknowledgement budget, with the message that
+  // says the model never saw the prompt.
+  {
+    const endpoint = await startFakeProvider({ modes: { "fake-slow": "deaf" } });
+    try {
+      const stuck = await runScenario({
+        name: "unacknowledged, nothing to switch to",
+        vision: false,
+        plannerMs: 1,
+        captureMs: 1,
+        endpoint: { url: endpoint.url, baseModel: "fake-slow", fastModel: "fake-fast" },
+        fastModel: null,
+        unansweredHeadersMs: 300,
+        firstOutputMs: 20_000,
+        task: "read the page",
+      });
+      ok("with no fast model, an unacknowledged request fails in the acknowledgement budget",
+        stuck.elapsed < 2_500 && endpoint.requests.length === 1, `${stuck.elapsed}ms`);
+      ok("and the error says the model never saw the prompt",
+        errorTexts(stuck).some((t) => /has not acknowledged the request/.test(t) && /has not seen the prompt/.test(t)),
+        errorTexts(stuck).join(" | "));
+    } finally {
+      await endpoint.close();
+    }
+  }
+}
+
+console.log(
+  `\n${passed} agent-loop assertions passed (real runTask and real planner ` +
+    `adapters; stubbed browser, stub planners, plus a real HTTP endpoint for the transport faults).`,
+);
 assert.ok(passed >= 15);

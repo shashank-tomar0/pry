@@ -37,6 +37,36 @@ export type ConvMessage =
 
 export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "refusal";
 
+/**
+ * A boundary a planner request has crossed, measured where it is crossed.
+ *
+ * The run can already see when the first streamed delta arrives. It cannot see
+ * the two moments BEFORE that from outside the adapter, and the distance between
+ * them is the whole answer to "was that silence the network, or the model":
+ *
+ *   - `requested` — the request was handed to the transport;
+ *   - `headers`   — the endpoint's response headers arrived, i.e. something
+ *                   answered. A provider queue, a stalled socket and a model
+ *                   thinking look IDENTICAL from here until this lands, because
+ *                   a streaming request sends no body bytes until the model
+ *                   produces its first token;
+ *   - `output`    — the model's first byte of ANY kind arrived: prose, a
+ *                   chain-of-thought delta, or a tool call.
+ *
+ * `output` is separate from the `onText`/`onThought` callbacks for a reason that
+ * cost the wait policy its most common case: a turn that goes straight to a tool
+ * call streams NO prose at all, so a first-token measurement taken from those
+ * callbacks records nothing for exactly the turns a run is mostly made of. The
+ * reported run's queueing endpoint was invisible to the speed-up decision for
+ * that reason — the queue was measured on the one turn that happened to answer in
+ * words, by which time the run was over.
+ *
+ * Reported by the adapters because only they sit on the transport. A planner
+ * that reports none is simply described with the bound the run does have (time
+ * to first streamed delta).
+ */
+export type PlannerMilestone = "requested" | "headers" | "output";
+
 export interface PlannerTurn {
   text: string;
   toolCalls: ToolCall[];
@@ -59,6 +89,12 @@ export interface PlannerRequest {
    * reads as "the model is reasoning", not as a frozen panel.
    */
   onThought?: (delta: string) => void;
+  /**
+   * Called when the request crosses a boundary the run cannot observe from
+   * outside the adapter — see PlannerMilestone. `at` is a `performance.now()`
+   * reading, so the caller can subtract it from its own clock readings.
+   */
+  onMilestone?: (milestone: PlannerMilestone, at: number) => void;
 }
 
 export interface Planner {

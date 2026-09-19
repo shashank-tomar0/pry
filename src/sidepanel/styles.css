@@ -2038,6 +2038,42 @@ body::after {
   overflow-wrap: anywhere;
 }
 
+/* ─── Planner diagnostics (the copyable timings of a stalled run) ───────── */
+.entry.diagnostics {
+  border: 1px solid var(--color-ink);
+  background: var(--color-paper-2);
+  box-shadow: 2px 2px 0px var(--color-ink);
+  padding: 8px 10px;
+  margin: 8px 0;
+}
+.entry.diagnostics .diagnostics-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px dashed var(--color-hairline);
+}
+.entry.diagnostics .diagnostics-tag {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--color-teal);
+}
+/* pre-wrap so the block's columns line up as written AND wrap on a narrow
+   panel, and `user-select: text` so it can also be selected by hand. */
+.entry.diagnostics .diagnostics-block {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0;
+  color: var(--color-ink);
+  user-select: text;
+}
+
 /* ─── Reasoning stream (model chain-of-thought, dimmed + collapsible) ─────── */
 .entry.thought { margin: 2px 0; }
 .entry.thought .thought-box {

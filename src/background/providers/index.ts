@@ -4,8 +4,6 @@ import { PROVIDERS } from "../../shared/models";
 import { createAnthropicPlanner } from "./anthropic";
 import { createOpenAIPlanner } from "./openai";
 import { createOllamaPlanner } from "./ollama";
-import { createGroqPlanner } from "./groq";
-import { createNvidiaPlanner } from "./nvidia";
 import type { Planner } from "./types";
 import { PlannerError } from "./types";
 
@@ -19,17 +17,42 @@ import { PlannerError } from "./types";
  * "Fast planner mode" substitutes the provider's `fastModel` HERE, in the one
  * place a model is chosen, so every consumer gets it — the run, the lesson
  * generator, the vision pass — instead of each call site deciding for itself.
- * Nothing has to be re-labelled either: the planner's own label carries the
- * model string, and the panel prints it (`Using NVIDIA meta/llama-3.1-8b-instruct`),
+  * Nothing has to be re-labelled either: the planner's own label carries the  * model string, and the panel prints it (`Using NVIDIA openai/gpt-oss-20b`),
  * so a run can never quietly use a model other than the one it announced.
+ *
+ * Which adapter each provider gets is the whole of the routing below: Ollama has
+ * its own native API, Anthropic its own SDK, and every OpenAI-compatible
+ * endpoint (OpenAI, OpenRouter, Groq, NVIDIA) shares one implementation.
  */
+/** The model a run would use for `provider` as configured, before fast mode. */
+export function configuredModel(settings: Settings): string {
+  const provider = settings.provider;
+  return (
+    (settings.models[provider] ?? "").trim() || DEFAULT_SETTINGS.models[provider] || ""
+  );
+}
+
+/**
+ * The provider's fast model, or null when it would not change anything.
+ *
+ * Null means "nothing to switch to": either the provider declares no fast model
+ * or the configured model IS it. The run's automatic speed-up reads this instead
+ * of assuming every provider has a faster option, and `createPlanner` uses the
+ * same function, so the two can never disagree about what "fast" resolves to.
+ */
+export function fastModelFor(settings: Settings): string | null {
+  const provider = settings.provider;
+  const fast = PROVIDERS[provider]?.fastModel ?? "";
+  if (!fast) return null;
+  return fast === configuredModel(settings) ? null : fast;
+}
+
 export function createPlanner(settings: Settings): Planner {
   const provider = settings.provider;
   const apiKey = settings.apiKeys[provider] ?? "";
-  const configured =
-    (settings.models[provider] ?? "").trim() || DEFAULT_SETTINGS.models[provider] || "";
+  const configured = configuredModel(settings);
   const model = settings.fastPlanner
-    ? PROVIDERS[provider]?.fastModel || configured
+    ? fastModelFor(settings) ?? configured
     : configured;
 
   if (!model) {
@@ -47,17 +70,13 @@ export function createPlanner(settings: Settings): Planner {
     );
   }
 
-  if (provider === "groq") {
-    return createGroqPlanner(apiKey, model);
+  if (provider === "anthropic") {
+    return createAnthropicPlanner(apiKey, model);
   }
 
-  if (provider === "nvidia") {
-    return createNvidiaPlanner(apiKey, model);
-  }
-
-  return provider === "anthropic"
-    ? createAnthropicPlanner(apiKey, model)
-    : createOpenAIPlanner(provider, apiKey, model);
+  // OpenAI, OpenRouter, Groq and NVIDIA are one adapter with a per-provider
+  // spec table — see providers/openai.ts for why they are no longer four files.
+  return createOpenAIPlanner(provider, apiKey, model);
 }
 
 export type { Planner };

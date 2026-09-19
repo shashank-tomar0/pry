@@ -411,6 +411,13 @@
             <input type="checkbox" class="toggle" id="fastPlanner" />
           </div>
         </div>
+        <div class="field-group">
+          <label class="field-label">Speed up when the provider is queueing</label>
+          <p class="field-hint">Measures how long each turn waits for its first token. If the endpoint is holding requests — a free tier queueing the session's first call, or a reasoning model that streams nothing while it thinks — the run switches to the provider's fast model for the rest of that run, says which model it moved to, and resets next run. Turn this off to stay on your configured model however late it answers.</p>
+          <div style="padding-top: 6px;">
+            <input type="checkbox" class="toggle" id="autoFastPlannerOnSlowProvider" />
+          </div>
+        </div>
       </div>
     </div>
 

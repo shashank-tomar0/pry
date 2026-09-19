@@ -1,6 +1,8 @@
 import type { AgentEvent, PanelCommand, PrivacyAuditPayload, TranscriptEntry, TripwireAlertDetail } from "../shared/types";
 import { accuracyMetrics, describeRedactionTally, type AuditVerificationRollup } from "../shared/metrics";
 import { tierBadge } from "../shared/region-paint";
+import { chainBadge } from "../shared/chain-badge";
+import { formatBytes } from "../shared/primitives";
 
 // ─── DOM References ────────────────────────────────────────────────────────
 
@@ -181,10 +183,14 @@ function emitLocalStatus(text: string): void {
     : text;
   if (status === lastVoiceStatus) return;
   lastVoiceStatus = status;
+  // Some callers already label their message (the voice controller's "Voice:
+  // spoke 1 vault token(s) as \"redacted\""), and prefixing those again shipped
+  // the visible "Voice: Voice: spoke 1 vault token(s)" line.
+  const label = /^\s*voice:/i.test(status) ? "" : "Voice: ";
   render({
     id: `voice-${Date.now()}`,
     role: "system",
-    text: `Voice: ${status}`,
+    text: `${label}${status}`,
   });
 }
 
@@ -387,13 +393,6 @@ function setActivePanel(panelId: PanelId | null): void {
   }
 }
 
-function formatEgress(bytes: number): string {
-  if (bytes <= 0) return "0 KB";
-  if (bytes < 1024) return `${bytes} B`;
-  const kb = bytes / 1024;
-  return kb < 10 ? `${kb.toFixed(1)} KB` : `${Math.round(kb)} KB`;
-}
-
 function atBottom(): boolean {
   return (
     transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 60
@@ -469,6 +468,31 @@ function render(entry: TranscriptEntry): void {
           <div class="thought-body"></div>
         </details>
       `;
+    } else if (entry.role === "diagnostics") {
+      // The one thing a stalled run must be able to produce: a report with the
+      // timings in it. Rendered as its own block with a Copy button because the
+      // text is preformatted and multi-line — selecting it by hand in a chat
+      // transcript is how a bug report ends up as "it hung for 90 seconds".
+      node.innerHTML = `
+        <div class="diagnostics-header">
+          <span class="diagnostics-tag">PLANNER DIAGNOSTICS</span>
+          <button class="btn-copy-chat" type="button" title="Copy these timings">
+            <span class="copy-icon">📋</span>
+            <span class="copy-label">Copy</span>
+          </button>
+        </div>
+        <pre class="diagnostics-block"></pre>
+      `;
+      const copyBtn = node.querySelector<HTMLButtonElement>(".btn-copy-chat");
+      copyBtn?.addEventListener("click", () => {
+        if (!navigator.clipboard) return;
+        void navigator.clipboard.writeText(rawTexts.get(entry.id) ?? "");
+        const label = copyBtn.querySelector(".copy-label");
+        if (label) {
+          label.textContent = "✓ Copied";
+          setTimeout(() => { label.textContent = "Copy"; }, 1600);
+        }
+      });
     } else if (entry.role === "user") {
       node.innerHTML = `
         <div class="user-bubble">
@@ -516,6 +540,9 @@ function render(entry: TranscriptEntry): void {
   } else if (entry.role === "egress") {
     const body = node.querySelector(".egress-body");
     if (body) body.textContent = entry.text;
+  } else if (entry.role === "diagnostics") {
+    const body = node.querySelector(".diagnostics-block");
+    if (body) body.textContent = entry.text;
   } else {
     node.textContent = entry.text;
   }
@@ -556,6 +583,8 @@ function renderPrivacyAudit(audit: {
   allTokens: Array<{ token: string; kind: string }>;
   totalRedacted: number;
   totalScreenshots: number;
+  /** Frames that had pixels before the gallery's size cap — see the type. */
+  framesWithPixels?: number;
   totalPIIDetections: number;
   durationMs: number;
   /** True when a redacted frame actually left the browser (VLM vision on). */
@@ -679,7 +708,17 @@ function renderPrivacyAudit(audit: {
   // carries box overlays so the exact redacted regions are visible proof.
   const screenshotsEl = $("audit-screenshots");
   if (audit.screenshots.length > 0) {
-    screenshotsEl.innerHTML = `<h4>Before / After Redaction <span class="detection-hint">— click any image to zoom</span></h4>`;
+    // Which frames this gallery is showing, when the cap had to drop any: the
+    // section used to list fewer pairs than the rollup counted with nothing
+    // saying so, which reads as "this frame has no comparison" for the run's
+    // first frame (the page the run started on). That frame is now always kept,
+    // and any reduction says so.
+    const framesShown = audit.framesWithPixels ?? audit.screenshots.length;
+    const omitted = Math.max(0, framesShown - audit.screenshots.length);
+    const scopeNote = omitted > 0
+      ? ` <span class="detection-hint">— run's first frame + most recent ${audit.screenshots.length - 1} of ${framesShown} (${omitted} middle frame${omitted === 1 ? "" : "s"} not shown, to keep the panel light)</span>`
+      : " <span class=\"detection-hint\">— click any image to zoom</span>";
+    screenshotsEl.innerHTML = `<h4>Before / After Redaction${scopeNote}</h4>`;
     for (const shot of audit.screenshots) {
       const pair = document.createElement("div");
       pair.className = "screenshot-pair";
@@ -746,7 +785,16 @@ function renderPrivacyAudit(audit: {
   if (audit.allTokens.length > 0) {
     tokensEl.innerHTML = `<h4>Token Vault</h4><div class="token-list"></div>`;
     const list = tokensEl.querySelector(".token-list")!;
+    // One chip per TOKEN, not per frame. `allTokens` accumulates the vault as it
+    // stood at every capture, so a seven-frame Gmail run listed `<CRED_1>` and
+    // `<CRED_2>` seven times each — directly under a header that said "2 vault
+    // tokens". The list is the evidence for that count, so it has to be the same
+    // set: deduped here, first sighting wins, which keeps the sample it arrived
+    // with.
+    const seenTokens = new Set<string>();
     for (const tok of audit.allTokens as Array<{ token: string; kind: string; sample?: string }>) {
+      if (seenTokens.has(tok.token)) continue;
+      seenTokens.add(tok.token);
       const chip = document.createElement("div");
       chip.className = "token-chip";
       const kind = tok.kind === "pii_text" ? "PII text" : tok.kind === "id_number" ? "ID number" : tok.kind === "api_key" ? "API key" : tok.kind;
@@ -823,11 +871,20 @@ function rollupClass(rollup: AuditVerificationRollup): "ok" | "warn" | "neutral"
  */
 function auditChipSignature(audit: {
   totalScreenshots: number;
+  screenshots?: Array<{ timestamp: number }>;
   verificationRollup?: AuditVerificationRollup;
   tally?: { pageItems: number; frameRegions: number; tokens: number; total: number };
 }): string {
   const rollup = audit.verificationRollup;
+  // The newest frame's timestamp identifies the RUN, so two runs that happen to
+  // produce the same counts still get a card each — the counting fields alone
+  // would merge them, and "open yt" twice produces identical numbers.
+  const lastFrame =
+    audit.screenshots && audit.screenshots.length > 0
+      ? audit.screenshots[audit.screenshots.length - 1]?.timestamp ?? audit.screenshots.length
+      : audit.totalScreenshots;
   return [
+    lastFrame,
     audit.totalScreenshots,
     audit.tally?.total ?? "-",
     audit.tally?.tokens ?? "-",
@@ -840,16 +897,24 @@ function appendAuditVerificationChip(audit: {
   totalScreenshots: number;
   totalPIIDetections: number;
   allTokens: Array<{ token: string; kind: string }>;
+  screenshots?: Array<{ timestamp: number }>;
   verificationRollup?: AuditVerificationRollup;
   tally?: { pageItems: number; frameRegions: number; tokens: number; total: number };
 }): void {
   // Idempotent by evidence, not by timing: the same payload rendered twice is
   // one card. A later run whose numbers differ still gets its own card, so this
   // dedupes a re-render without hiding a new result.
+  //
+  // Look for the LAST chip in the transcript, not merely the last ELEMENT. The
+  // audit is rendered from two sources (the live `privacy-audit` event and the
+  // `get-audit` pull that INSPECT PROOF triggers), and anything appended after
+  // the chip in between — the voice note that reports a spoken vault token is
+  // one — pushed the chip off the end and made this check miss, putting the
+  // reported second identical card in the transcript.
   const signature = auditChipSignature(audit);
-  const lastChip = transcriptEl.lastElementChild;
-  if (lastChip instanceof HTMLElement && lastChip.classList.contains("audit-chip") &&
-      lastChip.dataset.auditSignature === signature) {
+  const chips = transcriptEl.querySelectorAll(".audit-chip");
+  const lastChip = chips.length > 0 ? chips[chips.length - 1] : null;
+  if (lastChip instanceof HTMLElement && lastChip.dataset.auditSignature === signature) {
     return;
   }
   const chip = document.createElement("div");
@@ -1129,7 +1194,7 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
       break;
 
     case "egress":
-      if (egressBadge) egressBadge.textContent = `${formatEgress(event.bytes)} EGRESS`;
+      if (egressBadge) egressBadge.textContent = `${formatBytes(event.bytes)} EGRESS`;
       break;
 
     case "confirm":
@@ -1454,19 +1519,15 @@ async function loadLedger(): Promise<void> {
   }
   const ls = response.ledgerSummary;
 
-  // Three states, not two. "Every digest verified" and "the head's link cannot
-  // be checked because older entries were trimmed" are different facts, and a
-  // badge that renders the second as INTACT is asserting something the check
-  // did not compute (which is what the previous link-only version did).
-  const hashesOk = ls.chainHashesIntact !== false;
-  const headUnknown = ls.chainHeadUnverifiable === true;
-  const chainClass = !hashesOk ? "tampered" : headUnknown ? "partial" : "verified";
-  const chainLabel = !hashesOk ? "TAMPERED" : headUnknown ? "INTACT*" : "INTACT";
-  const chainNote = !hashesOk
-    ? `Hash mismatch: ${escapeHtml((ls.chainReasons ?? [])[0] ?? "an entry does not match its recorded digest")}`
-    : headUnknown
-      ? "Every retained digest verified. Entries past the 500-entry cap were trimmed, so the oldest surviving link cannot be checked."
-      : "Every retained entry re-hashed and matched its recorded digest.";
+  // The verdict is pure policy in shared/chain-badge.ts, and it reads
+  // `chainValid` — the field the verifier computes from BOTH halves of the chain.
+  // Deciding it here from `chainHashesIntact` alone is what let a ledger whose
+  // links did not join render as INTACT, and the renderer keeps only the job it
+  // can do: escape the sentence for HTML.
+  const badge = chainBadge(ls);
+  const chainClass = badge.className;
+  const chainLabel = badge.label;
+  const chainNote = escapeHtml(badge.note);
 
   const sessionEntries = typeof ls.sessionEntries === "number" ? ls.sessionEntries : 0;
 

@@ -6,6 +6,7 @@
  */
 
 import type { PageMetrics } from "../shared/types";
+import { blobToDataUrl } from "../shared/primitives";
 
 /**
  * Settle time between scroll and capture.
@@ -31,15 +32,6 @@ async function sendTab<T>(tabId: number, msg: unknown): Promise<T | null> {
   } catch {
     return null;
   }
-}
-
-async function blobToDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
 }
 
 export interface StitchResult {

@@ -10,6 +10,7 @@
 import type {
   ConvMessage,
   Planner,
+  PlannerMilestone,
   PlannerRequest,
   PlannerTurn,
   ToolSpec,
@@ -111,6 +112,7 @@ async function streamChat(
   body: OllamaChatRequest,
   signal: AbortSignal,
   onText: (delta: string) => void,
+  onMilestone?: (milestone: PlannerMilestone, at: number) => void,
 ): Promise<{ text: string; toolCalls: Array<{ id: string; name: string; input: Record<string, unknown> }> }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -120,12 +122,18 @@ async function streamChat(
   signal.addEventListener("abort", onAbort);
 
   try {
+    onMilestone?.("requested", performance.now());
     const response = await fetch(`${baseUrl}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
       signal: controller.signal,
     });
+    // `fetch` resolving is response HEADERS arriving — Ollama answered. The body
+    // is still empty until the local model produces its first token, so this is
+    // the measurement that tells "Ollama is queued behind another model" apart
+    // from "the model is thinking".
+    onMilestone?.("headers", performance.now());
 
     if (!response.ok) {
       const text = await response.text().catch(() => "");
@@ -140,6 +148,8 @@ async function streamChat(
     let text = "";
     const partials = new Map<number, { id: string; name: string; args: string }>();
     let done = false;
+    /** Reported once, on the first byte of any kind — see PlannerMilestone. */
+    let outputReported = false;
 
     const decoder = new TextDecoder();
     let buffer = "";
@@ -186,6 +196,13 @@ async function streamChat(
 
           const delta = parsed.message;
           if (!delta) continue;
+
+          // First byte of ANY kind: a tool-call fragment is output too, and a
+          // turn made only of one has no content to time — see PlannerMilestone.
+          if (!outputReported && (delta.content || delta.tool_calls?.length)) {
+            outputReported = true;
+            onMilestone?.("output", performance.now());
+          }
 
           if (delta.content) {
             text += delta.content;
@@ -244,6 +261,7 @@ export function createOllamaPlanner(model: string): Planner {
       tools,
       signal,
       onText,
+      onMilestone,
     }: PlannerRequest): Promise<PlannerTurn> {
       const ollamaMessages = toOllamaMessages(system, messages);
 
@@ -256,7 +274,7 @@ export function createOllamaPlanner(model: string): Planner {
       };
 
       try {
-        const result = await streamChat(baseUrl, body, signal, onText);
+        const result = await streamChat(baseUrl, body, signal, onText, onMilestone);
         return {
           text: result.text,
           toolCalls: result.toolCalls,
@@ -275,7 +293,7 @@ export function createOllamaPlanner(model: string): Planner {
             console.warn("[PRY] Ollama 403 with tools, retrying without tools.");
             try {
               const bodyNoTools: OllamaChatRequest = { ...body, tools: undefined };
-              const result = await streamChat(baseUrl, bodyNoTools, signal, onText);
+              const result = await streamChat(baseUrl, bodyNoTools, signal, onText, onMilestone);
               return {
                 text: result.text,
                 toolCalls: result.toolCalls,

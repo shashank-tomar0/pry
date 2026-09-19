@@ -255,7 +255,7 @@ export type ContentRequest =
 /** A rendered entry in the side panel transcript. */
 export interface TranscriptEntry {
   id: string;
-  role: "user" | "assistant" | "step" | "error" | "system" | "egress" | "thought";
+  role: "user" | "assistant" | "step" | "error" | "system" | "egress" | "thought" | "diagnostics";
   text: string;
   /** Set on "step" entries so the UI can show an icon per action type. */
   action?: ActionName;
@@ -312,6 +312,14 @@ export interface PrivacyAuditPayload {
   allTokens: Array<{ token: string; kind: string; sample?: string }>;
   totalRedacted: number;
   totalScreenshots: number;
+  /**
+   * Frames that have pixels to display, before the gallery's size cap. The
+   * panel compares this with `screenshots.length` so it can say which frames it
+   * is showing rather than presenting a capped gallery as the whole run — the
+   * cap keeps the run's FIRST frame now, because the frames it used to drop
+   * were the oldest, and the oldest is the page the run started from.
+   */
+  framesWithPixels?: number;
   totalPIIDetections: number;
   durationMs: number;
   /**
@@ -484,6 +492,21 @@ export interface Settings {
    */
   fastPlanner?: boolean;
   /**
+   * Let a run switch to the provider's fast model when the ENDPOINT is slow.
+   *
+   * Distinct from `fastPlanner`, which is a standing preference the user sets.
+   * This answers the case neither the user nor a fixed setting can see: the
+   * provider is queueing right now (a free tier holding the session's first
+   * request, or a reasoning model whose chain-of-thought arrives as "no tokens
+   * yet"). The run measures its own time-to-first-token per turn and switches
+   * itself only on evidence — two slow turns, or one turn late enough that no
+   * other reading fits — announces the model it moved to, and never writes
+   * settings. Default on: the alternative is a user sitting through 20-30s turns
+   * with every option looking reasonable. Set false to pin the run to the
+   * configured model no matter how late it answers.
+   */
+  autoFastPlannerOnSlowProvider?: boolean;
+  /**
    * Optional VLM vision: after each page change, the REDACTED screenshot is
    * sent to a vision-capable model (same provider key as the planner) and its
    * description is appended to the tool result. Only redacted pixels leave
@@ -580,6 +603,7 @@ export const DEFAULT_SETTINGS: Settings = {
   confirmRisky: true,
   fullPageCapture: false,
   fastPlanner: false,
+  autoFastPlannerOnSlowProvider: true,
   vision: {
     enabled: false,
     model: "",
@@ -639,6 +663,8 @@ export function normaliseSettings(stored: unknown): Settings {
     ...raw,
     fullPageCapture: raw.fullPageCapture ?? DEFAULT_SETTINGS.fullPageCapture,
     fastPlanner: raw.fastPlanner ?? DEFAULT_SETTINGS.fastPlanner,
+    autoFastPlannerOnSlowProvider:
+      raw.autoFastPlannerOnSlowProvider ?? DEFAULT_SETTINGS.autoFastPlannerOnSlowProvider,
     apiKeys: { ...DEFAULT_SETTINGS.apiKeys, ...(raw.apiKeys ?? {}) },
     models: { ...DEFAULT_SETTINGS.models, ...(raw.models ?? {}) },
     vision: {

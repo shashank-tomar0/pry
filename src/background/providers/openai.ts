@@ -1,3 +1,23 @@
+/**
+ * Planner adapter for every OpenAI-compatible endpoint PRY supports.
+ *
+ * WHY ONE TABLE AND NOT FOUR FILES
+ *
+ * Groq and NVIDIA used to carry their own copy of this file — the same helpers,
+ * the same stream loop, differing only in a base URL, a label, an output cap and
+ * whether they parsed a `reasoning_content` field. That is one bug fixed as
+ * many times as there are copies: Groq's reasoning-channel fix (chain-of-thought
+ * routed to `onText`, where the panel paints it as the agent's ANSWER) had to be
+ * copied into NVIDIA's file to reach it, and the next compatible provider would
+ * have meant a fourth copy. Everything the copies differed by now lives in
+ * `SPECS` as data, and the behaviour lives here once.
+ *
+ * The reasoning channel is deliberately uniform: every adapter that sees a
+ * reasoning field forwards it to `onThought`, never `onText`. `onThought` is the
+ * liveness signal that drives the wait ticker and feeds `liveness.reasoningChars`
+ * — the number the deliberation cut reads — and it is never printed verbatim.
+ */
+
 import OpenAI from "openai";
 import type {
   ConvMessage,
@@ -13,10 +33,72 @@ import { describeOpenAIError } from "./errors";
 
 type ChatMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
+/** Every provider this adapter serves. Ollama has its own native adapter. */
+export type OpenAICompatibleProvider = Exclude<ProviderId, "anthropic" | "ollama">;
+
 /**
+ * What one OpenAI-compatible endpoint needs, as data.
+ *
+ * `maxTokensParam` is a real fork in the road rather than a style choice: OpenAI
+ * renamed the output cap for its reasoning models and rejects the old name on
+ * them, while every other compatible endpoint — and OpenRouter, which passes the
+ * field through to whichever model is behind it — expects `max_tokens`.
+ */
+interface CompatibleSpec {
+  /** Human name used in the planner's label and in every error it raises. */
+  label: string;
+  baseURL: string;
+  maxTokensParam: "max_tokens" | "max_completion_tokens";
+  /**
+   * Output cap in tokens.
+   *
+   * Stated per provider because the free tiers are not interchangeable: a large
+   * cap on a metered free tier is a request the provider can refuse outright,
+   * which reads to the user as a broken model.
+   */
+  maxTokens: number;
+  /** Extra request headers, where the endpoint asks to be attributed. */
+  headers?: Record<string, string>;
+}
+
+const SPECS: Record<OpenAICompatibleProvider, CompatibleSpec> = {
+  openai: {
+    label: "OpenAI",
+    baseURL: "https://api.openai.com/v1",
+    maxTokensParam: "max_completion_tokens",
+    maxTokens: 8000,
+  },
+  openrouter: {
+    label: "OpenRouter",
+    baseURL: "https://openrouter.ai/api/v1",
+    maxTokensParam: "max_tokens",
+    maxTokens: 8000,
+    // OpenRouter asks for these to attribute traffic; both are optional, and
+    // omitting them only costs the attribution.
+    headers: { "HTTP-Referer": "https://github.com/pry/pry-agent", "X-Title": "PRY Agent" },
+  },
+  /** Free tier, ~280-1000 tokens/s, 40 requests/minute. */
+  groq: {
+    label: "Groq",
+    baseURL: "https://api.groq.com/openai/v1",
+    maxTokensParam: "max_tokens",
+    maxTokens: 2048,
+  },
+  /** Free tier at integrate.api.nvidia.com; 410 Gone means a retired model. */
+  nvidia: {
+    label: "NVIDIA",
+    baseURL: "https://integrate.api.nvidia.com/v1",
+    maxTokensParam: "max_tokens",
+    maxTokens: 2048,
+  },
+};
+
+/**
+ * Turn the canonical conversation into this API's message list.
+ *
  * OpenAI keeps assistant prose and tool calls on one message, and expects each
- * tool result as its own `role: "tool"` message — so one canonical tool turn
- * fans out into several messages here.
+ * tool result as its own `role: "tool"` message — so one canonical tool turn fans
+ * out into several messages here.
  */
 export function toMessages(system: string, messages: ConvMessage[]): ChatMessage[] {
   const out: ChatMessage[] = [{ role: "system", content: system }];
@@ -75,50 +157,36 @@ function toStopReason(raw: string | null | undefined, hasToolCalls: boolean): St
   return "end_turn";
 }
 
-const ENDPOINTS: Record<Exclude<ProviderId, "anthropic">, string> = {
-  openai: "https://api.openai.com/v1",
-  openrouter: "https://openrouter.ai/api/v1",
-  ollama: "http://localhost:11434/v1",
-  groq: "https://api.groq.com/openai/v1",
-  nvidia: "https://integrate.api.nvidia.com/v1",
-};
-
-/**
- * Serves both OpenAI and OpenRouter — OpenRouter exposes the same chat
- * completions surface, so only the base URL and a couple of headers differ.
- */
 export function createOpenAIPlanner(
-  provider: Exclude<ProviderId, "anthropic">,
+  provider: OpenAICompatibleProvider,
   apiKey: string,
   model: string,
   customBaseURL?: string,
 ): Planner {
+  const spec = SPECS[provider];
+
   const client = new OpenAI({
     apiKey,
-    baseURL: customBaseURL ?? ENDPOINTS[provider],
+    baseURL: customBaseURL ?? spec.baseURL,
     dangerouslyAllowBrowser: true,
-    defaultHeaders:
-      provider === "openrouter"
-        ? // OpenRouter attributes traffic with these; both are optional.
-          { "HTTP-Referer": "https://github.com/pry/pry-agent", "X-Title": "PRY Agent" }
-        : undefined,
+    defaultHeaders: spec.headers,
   });
 
-  const labels: Record<Exclude<ProviderId, "anthropic">, string> = {
-    openai: "OpenAI",
-    openrouter: "OpenRouter",
-    ollama: "Ollama (Local)",
-    groq: "Groq",
-    nvidia: "NVIDIA",
-  };
-  const label = labels[provider] ?? provider;
-
   return {
-    label: `${label} ${model}`,
+    label: `${spec.label} ${model}`,
 
-    async run({ system, messages, tools, signal, onText }: PlannerRequest): Promise<PlannerTurn> {
+    async run({
+      system,
+      messages,
+      tools,
+      signal,
+      onText,
+      onThought,
+      onMilestone,
+    }: PlannerRequest): Promise<PlannerTurn> {
       let stream: Awaited<ReturnType<typeof client.chat.completions.create>>;
 
+      onMilestone?.("requested", performance.now());
       try {
         stream = await client.chat.completions.create(
           {
@@ -126,22 +194,24 @@ export function createOpenAIPlanner(
             messages: toMessages(system, messages),
             tools: toTools(tools),
             stream: true,
-            // OpenAI renamed this for reasoning models; OpenRouter takes the
-            // original name and passes it through to whichever model is behind it.
-            // Ollama uses max_tokens.
-            ...(provider === "openai"
-              ? { max_completion_tokens: 8000 }
-              : { max_tokens: 8000 }),
-          },
+            [spec.maxTokensParam]: spec.maxTokens,
+          } as OpenAI.Chat.Completions.ChatCompletionCreateParams,
           { signal },
         );
       } catch (error) {
-        throw describeOpenAIError(error, label);
+        throw describeOpenAIError(error, spec.label);
       }
+      // The promise resolving means the endpoint sent response headers: it
+      // answered. Nothing about how LONG the model will take is known yet — a
+      // streaming request sends no body bytes until the model produces a token —
+      // so this is the one measurement that separates a queue from a think.
+      onMilestone?.("headers", performance.now());
 
       let text = "";
       let refusal = "";
       let finishReason: string | null | undefined;
+      /** Reported once, on the first byte of any kind — see PlannerMilestone. */
+      let outputReported = false;
 
       // Tool calls stream in as deltas keyed by index — name arrives once, then
       // arguments accumulate across many chunks as raw JSON text.
@@ -153,14 +223,45 @@ export function createOpenAIPlanner(
           if (!choice) continue;
           if (choice.finish_reason) finishReason = choice.finish_reason;
 
-          const delta = choice.delta;
-          if (delta?.content) {
+          const delta = choice.delta as {
+            content?: string;
+            refusal?: string;
+            reasoning_content?: string;
+            reasoning?: string;
+            tool_calls?: Array<{
+              index: number;
+              id?: string;
+              function?: { name?: string; arguments?: string };
+            }>;
+          };
+
+          // The model produced something. Reported before the channel split
+          // because a turn that goes straight to a tool call sends no content at
+          // all, and that turn still took time the wait policy needs to measure.
+          if (
+            !outputReported &&
+            (delta.content || delta.refusal || delta.tool_calls?.length || delta.reasoning_content || delta.reasoning)
+          ) {
+            outputReported = true;
+            onMilestone?.("output", performance.now());
+          }
+
+          // A reasoning model's chain-of-thought arrives in its own field
+          // (`reasoning_content` on NIM/Groq, `reasoning` on OpenRouter's
+          // pass-through) and belongs on the REASONING channel. Sent to `onText`
+          // it would be painted as the agent's answer AND leave
+          // `liveness.reasoningChars` at zero, which silently disables the
+          // deliberation cut.
+          const reasoning = delta.reasoning_content ?? delta.reasoning;
+          if (reasoning) onThought?.(String(reasoning));
+
+          if (delta.content) {
             text += delta.content;
             onText(delta.content);
           }
-          if (delta?.refusal) refusal += delta.refusal;
+          if (delta.refusal) refusal += delta.refusal;
 
-          for (const call of delta?.tool_calls ?? []) {
+          for (const call of delta.tool_calls ?? []) {
             const existing = partials.get(call.index) ?? { id: "", name: "", args: "" };
             if (call.id) existing.id = call.id;
             if (call.function?.name) existing.name = call.function.name;
@@ -169,7 +270,7 @@ export function createOpenAIPlanner(
           }
         }
       } catch (error) {
-        throw describeOpenAIError(error, label);
+        throw describeOpenAIError(error, spec.label);
       }
 
       const toolCalls = Array.from(partials.entries())

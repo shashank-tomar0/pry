@@ -25,6 +25,7 @@ import {
   MIC_AUDIO_CONSTRAINTS,
   MIC_FALLBACK_CONSTRAINTS,
   classifyMicFailure,
+  mergeFloat32Arrays,
   micFailureAdvice,
   toSpeakable,
 } from "./voice-core";
@@ -67,6 +68,19 @@ export interface VoiceControllerConfig {
 
 const MIC_CHUNK_FRAMES = 1600; // 100 ms at 16 kHz — keeps latency bounded.
 
+/**
+ * Minimum speech buffered before one AudioBufferSource is scheduled.
+ *
+ * The TTS stream flushes whatever bytes each network read delivered —
+ * sometimes a few milliseconds — and every scheduled buffer is a splice
+ * point: an arbitrary cut mid-waveform is a click, and dozens per second
+ * read as a permanent crackle bed under the voice (the reported "background
+ * noise every time"). Flooring at 0.25 s trades a quarter-second of start
+ * latency for far fewer, longer buffers. Remainder flushes at stream end.
+ * Exported so the harness pins the trade rather than a magic number.
+ */
+export const MIN_SPEECH_CHUNK_SAMPLES = 4000;
+
 export class VoiceController {
   private scribe: ScribeConnection | null = null;
   private mediaStream: MediaStream | null = null;
@@ -75,6 +89,9 @@ export class VoiceController {
   private playbackAudioCtx: AudioContext | null = null;
   private playbackGain: GainNode | null = null;
   private nextPlaybackTime = 0;
+  /** Unscheduled speech bytes, in arrival order — see MIN_SPEECH_CHUNK_SAMPLES. */
+  private speechQueue: Float32Array[] = [];
+  private queuedSpeechSamples = 0;
   private ttsAbort: AbortController | null = null;
   private cancelListening = false;
   private state: "idle" | "connecting" | "listening" | "error" = "idle";
@@ -371,12 +388,34 @@ export class VoiceController {
     this.nextPlaybackTime = start + buffer.duration;
   }
 
+  /**
+   * Queue streamed speech, scheduling only whole floors of it. Short reads
+   * accumulate instead of each becoming a click-prone sliver of a buffer;
+   * `force` (stream end) flushes whatever remains, even a stub.
+   */
+  private queueSpeechChunk(samples: Float32Array, force = false): void {
+    if (samples.length > 0) {
+      this.speechQueue.push(samples);
+      this.queuedSpeechSamples += samples.length;
+    }
+    if (!force && this.queuedSpeechSamples < MIN_SPEECH_CHUNK_SAMPLES) return;
+    if (this.queuedSpeechSamples === 0) return;
+    const merged = mergeFloat32Arrays(this.speechQueue);
+    this.speechQueue = [];
+    this.queuedSpeechSamples = 0;
+    this.playAudioChunk(merged);
+  }
+
   /** Stop any active or queued TTS speech immediately. */
   stopSpeaking(): void {
     if (this.ttsAbort) {
       this.ttsAbort.abort();
       this.ttsAbort = null;
     }
+    // Drop unscheduled audio too: a queued floor must never outlive the
+    // utterance it belonged to, or stopping one answer leaks into the next.
+    this.speechQueue = [];
+    this.queuedSpeechSamples = 0;
     if (this.playbackGain && this.playbackAudioCtx) {
       try {
         this.playbackGain.disconnect();
@@ -424,8 +463,7 @@ export class VoiceController {
     const ctx = this.ensurePlaybackContext();
     if (ctx) {
       this.nextPlaybackTime = ctx.currentTime;
-    }
-    const abort = new AbortController();
+    }    const abort = new AbortController();
     this.ttsAbort = abort;
     try {
       await streamTts(
@@ -435,8 +473,13 @@ export class VoiceController {
         {
           onChunk: (samples) => {
             if (!abort.signal.aborted) {
-              this.playAudioChunk(samples);
+              this.queueSpeechChunk(samples);
               this.config.speakAssistantText?.(safe);
+            }
+          },
+          onDone: () => {
+            if (!abort.signal.aborted) {
+              this.queueSpeechChunk(new Float32Array(0), true);
             }
           },
           onError: (msg) => {

@@ -1068,6 +1068,34 @@ ok("snapshot value redacts to a bare token (offset 0 is not emitted)",
 ok("snapshot page text redacts to a bare token",
   sweptValue.text === "To: <CRED_1>", `got ${JSON.stringify(sweptValue.text)}`);
 
+// ─── Scenario O3: tokenizeDetections must not corrupt what it replaces ─────
+// Two live failures from the same run. First, the text path's callback read
+// the match OFFSET as if it were the word-bound delimiter ("To:
+// shashank…@gmail.com" → "To: 4<CRED_1>"), which the planner read as a
+// corrupted recipient. Second, the element path was a bare split/join, so a
+// vaulted "mail" rewrote "Gmail" to "G<PII_1>" — quoted back by the planner
+// as its own task ("open g<PII_1>"). The word-bound guard itself was broken
+// too (template-literal `\p` compiles to "p"), and is pinned below by effect.
+const o3det = tokenizer.tokenizeDetections(
+  { elements: [], text: "To: shashank.tomar.work@gmail.com done", url: "", title: "" },
+  [{ kind: "credential", value: "shashank.tomar.work@gmail.com" }],
+);
+ok("an email in page text redacts with no offset digit glued on",
+  o3det.text === "To: <CRED_1> done" && !/\d<[A-Z]+_\d+>/.test(o3det.text),
+  `got ${JSON.stringify(o3det.text)}`);
+const o3mail = new FreshTokenizer();
+o3mail.tokenize("mail", "pii_text");
+ok("a vaulted fragment never rewrites the longer word containing it",
+  o3mail.redactValues("open gmail and write email") === "open gmail and write email",
+  `got ${JSON.stringify(o3mail.redactValues("open gmail and write email"))}`);
+ok("…in element values either",
+  o3mail.tokenizeDetections(
+    { elements: [{ id: 0, role: "button", name: "x", value: "Gmail" }], text: "", url: "", title: "" },
+    [{ kind: "pii_text", value: "mail", elementSelector: '[data-pry-id="0"]' }],
+  ).elements[0].value === "Gmail");
+ok("…while the fragment standing alone still tokenizes",
+  o3mail.redactValues("open mail now") === "open <PII_1> now");
+
 // Letter-run values must KEEP the delimiter their word-bound pattern captured.
 const nameTokenizer = new FreshTokenizer();
 const nameTok = nameTokenizer.tokenize("Priya Sharma", "person");
@@ -2570,6 +2598,15 @@ ok("a stale span from another page is not reported as a detection on this one",
   fusedAbsent.added === 0, JSON.stringify(fusedAbsent.detections.map((d) => d.value)));
 ok("omitting the haystack keeps the previous behaviour (callers opt in)",
   fuseDetections([], [{ text: "Ravi Menon", label: "PER", score: 0.9 }]).added === 1);
+// A span must occur as its OWN word, not inside a longer one: NER read "mail"
+// out of a Gmail page, the substring check passed on "Gmail", the fragment
+// vaulted — and downstream it tokenized inside ordinary words ("open
+// g<PII_1>"). URLs count as boundaries ("mail" in "mail.google.com" is its
+// own host label), which is correct: a standalone Mail reference is real.
+ok("a span that only occurs inside a longer word is not a detection",
+  fuseDetections([], [{ text: "mail", label: "ORG", score: 0.7 }], "Gmail login").added === 0);
+ok("but the same span as its own word still counts",
+  fuseDetections([], [{ text: "mail", label: "ORG", score: 0.7 }], "Mail inbox").added === 1);
 
 // ── Scenario AJ: region→image mapping is one function, two capture paths ──
 // A stitched full-page canvas needs the tile scale AND the restored scroll
@@ -3879,6 +3916,24 @@ ok("and an endpoint that ANSWERED with a status is not read as a transport failu
   transportFailure("503 Service Unavailable") === null &&
     !/connection dropped/.test(describeOpenAIError({ status: 503, message: "Service Unavailable" }, "Groq").message));
 
+// The HTTP parser's failures are transport too. Reported live: headers
+// arrived at 0.9s, then undici choked mid-body — "unexpected tokens remaining
+// in message header". It carried no HTTP status, matched no retry keyword,
+// and a healthy run died on a hiccup instead of spending its one retry.
+const parserError = describeOpenAIError(
+  { message: 'unexpected tokens remaining in message header: Some("are at Google login page…")' },
+  "NVIDIA",
+);
+ok("a parser failure mid-body is described as the connection, not an unknown API error",
+  /connection dropped mid-answer/.test(parserError.message) && !/API error unknown/.test(parserError.message),
+  parserError.message);
+ok("and it is retryable, because headers prove the prompt reached the model",
+  isRetryablePlannerError(parserError.message), parserError.message);
+ok("the raw parser words are retryable wherever they surface",
+  isRetryablePlannerError("HPE_INVALID_HEADER_TOKEN failure") &&
+  isRetryablePlannerError("socket hang up while streaming"),
+  "HPE_/hang-up must read as transport");
+
 // ── A request nobody acknowledged is not a slow model ───────────────────────
 // The silence budget bounds the wait for a MODEL. It cannot tell a model
 // thinking from a request no endpoint accepted, and spending all of it on the
@@ -4946,6 +5001,70 @@ ok("recorded experience is keyed by where the run worked, not where it started",
   /domain: snapshot\?\.url \? extractDomain\(snapshot\.url\) : domain/.test(agentStagnationSource) &&
   /pageType: snapshot\s*\n?\s*\? classifyPageType\(snapshot\.url/.test(agentStagnationSource));
 
+// ─── Scenario AW: learned memory stores shapes, never values ───────────────
+// Reported run ("open yt in the new tab"): a stored trajectory replayed
+// "Task: open youtube and search for harkirat / Steps: navigate → type → …"
+// verbatim and the run obeyed the OLD values. Prompt framing alone did not
+// stop it, so values are scrubbed at WRITE time: structured PII by the shared
+// matchers, typed values harvested from the executor's own `Typed "…"` truth.
+const { harvestTypedValues, scrubMemoryText } = await import("../src/background/memory-scrub.ts");
+const { bareNavigationGoal: bareGoalCheck2 } = await import("../src/background/deterministic.ts");
+const typeSteps = [
+  { action: "type", text: 'Typed "harkirat" into <input "Search">. Field now shows: "harkirat", and pressed Enter.' },
+  { action: "click_text", text: 'Clicked "Sign in" (exact match).' },
+];
+ok("typed values are harvested from type steps only",
+  JSON.stringify(harvestTypedValues(typeSteps)) === JSON.stringify(["harkirat"]),
+  JSON.stringify(harvestTypedValues(typeSteps)));
+ok("bare tokens and short runs are not values",
+  harvestTypedValues([
+    { action: "type", text: 'Typed "<CRED_1>" into <input "Email">.' },
+    { action: "type", text: 'Typed "ab" into <input "X">.' },
+  ]).length === 0);
+ok("structured PII masks by kind",
+  scrubMemoryText("send it to jane@example.com today", []) === "send it to [email] today");
+ok("a harvested search term masks case-insensitively without touching route words",
+  scrubMemoryText("open youtube and search for Harkirat", ["harkirat"]) === "open youtube and search for [...]");
+ok("longest value masks first so no fragment survives",
+  scrubMemoryText("watch harkirat singh live", ["harkirat", "harkirat singh"]) === "watch [...] live");
+ok("a value that is a substring of a longer word does not clobber it",
+  scrubMemoryText("open the mail app", ["mail"]) === "open the [...] app" &&
+  scrubMemoryText("open gmail", ["mail"]) === "open gmail");
+const workerMemorySource = await readFile("src/background/service-worker.ts", "utf8");
+ok("trajectory tasks and answers are scrubbed before they are stored",
+  /task: scrubForMemory\(lastExperience\.task\)/.test(workerMemorySource) &&
+  /answer: scrubForMemory\(answer\)/.test(workerMemorySource));
+ok("and generated lessons are scrubbed before they are stored",
+  /lessons\.map\(scrubForMemory\)/.test(workerMemorySource));
+ok("the learning reset actually covers the replay stores, not just rules",
+  /case "clear-learning":[\s\S]{0,1200}clearTrajectories\(\)/.test(workerMemorySource) &&
+  /case "clear-learning":[\s\S]{0,1200}clearLessons\(\)/.test(workerMemorySource));
+const trajRenderSource = await readFile("src/background/trajectories.ts", "utf8");
+ok("replayed routes say their bracketed spans were removed at write time",
+  /where that older[\s\S]{0,24}task's own words were removed/.test(trajRenderSource));
+ok("replayed lessons say they are site logic, not the current task",
+  /never names,[\s\S]{0,80}search terms, or values to reuse/.test(agentHistorySource));
+
+// "open yt in the new tab" is a one-shot tab action, not a same-tab
+// navigation (the planner spent a reasoning turn to pick navigate in place).
+// Narrow shape only: resolvable target plus an explicit new-tab suffix.
+const detNewTab = tryDeterministic("open yt in the new tab", navSnap);
+ok("deterministic 'open yt in the new tab' opens a tab",
+  detNewTab.resolved && detNewTab.action?.name === "open_tab" &&
+  detNewTab.action?.input.url === "https://youtube.com",
+  JSON.stringify(detNewTab.action?.input));
+const detNewTabGmail = tryDeterministic("open gmail in a new tab", navSnap);
+ok("the suffix has an 'a' variant",
+  detNewTabGmail.resolved && detNewTabGmail.action?.name === "open_tab" &&
+  detNewTabGmail.action?.input.url === "https://gmail.com",
+  JSON.stringify(detNewTabGmail.action?.input));
+ok("an unresolvable target in a new tab still falls through to the planner",
+  !tryDeterministic("open settings in a new tab", navSnap).resolved);
+ok("and multi-step tasks keep falling through, suffix or not",
+  !tryDeterministic("open yt and search in a new tab", navSnap).resolved);
+ok("a new-tab task is not a bare navigation goal",
+  bareGoalCheck2("open yt in the new tab") === null);
+
 console.log("\n=== Scenario AT: what task text is redacted, and what must not be ===\n");
 
 // An audit of the whole task path against realistic inputs, kept as the
@@ -5117,6 +5236,23 @@ ok("the legend names the token's CATEGORY without its value",
   legendFromVault ?? "(null)");
 ok("and it is not empty on a run that tokenized something",
   legendFromVault !== null && legendFromVault.includes("<PII_1>"));
+// Two credentials must be tellable apart by the planner: kind alone cannot
+// separate the work address from the signed-in account, and the model
+// invented the difference last time. Masked samples (audited non-recoverable
+// in maskSample) disambiguate without leaking either value.
+const twoCreds = new PIITokenizer();
+twoCreds.tokenize("shashank.tomar.work@gmail.com", "credential");
+twoCreds.tokenize("shashanktomar911@gmail.com", "credential");
+const twoLegend = buildTokenLegend(twoCreds.getEntries());
+const twoLines = (twoLegend ?? "").split("\n").filter((l) => l.includes("CRED_"));
+ok("two same-kind tokens carry distinct masked samples",
+  twoLines.length === 2 && twoLines[0] !== twoLines[1] &&
+  twoLines.every((l) => /•••@gmail\.com/.test(l)),
+  twoLegend ?? "(null)");
+ok("and neither sample recovers its account",
+  typeof twoLegend === "string" &&
+  !twoLegend.includes("shashank.tomar.work") && !twoLegend.includes("shashanktomar911"),
+  twoLegend ?? "(null)");
 ok("for a task with no tokens the legend is absent rather than empty",
   (() => {
     const t = new PIITokenizer();

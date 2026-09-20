@@ -1,0 +1,110 @@
+name: Live AI check
+
+# WHY THIS EXISTS
+#
+# `npm run verify` runs against STUBBED providers, so every green assertion it
+# makes answers "is the pipeline wired correctly" — none of them answers "does a
+# real model, given PRY's real system prompt and tool schema, produce an action
+# PRY can execute". A retired model id, a revoked or expired key, a provider that
+# changed its API shape and a prompt the model cannot follow are all invisible to
+# the stubbed suite and fatal in the product. The three of those that are not the
+# prompt are also invisible until someone runs a task by hand, which means the
+# first person to find out is whoever is holding the laptop at the demo.
+#
+# So one real call is made on a schedule, against whatever key the repository
+# has, and its failure is a red build.
+#
+# WHAT IT NEEDS
+#
+#   secrets.GROQ_API_KEY — a free-tier Groq key. One provider is enough to catch
+#   the failure modes above; add a second by adding its secret and putting it in
+#   the matrix below (`PROVIDER` + the model can be overridden per entry with
+#   MODEL). The key is used once per run and is never printed: the script masks it
+#   to `gsk_…9c7J` before it appears in any log line.
+#
+# COST AND NOISE
+#
+# Not on pull_request: a forked PR has no secret, and a check that cannot run
+# should not be a check that fails. The schedule is what catches a model going
+# away while nothing is being committed; the push trigger is what catches a
+# change to the request itself, and it is limited to the files that determine
+# what the model is asked.
+
+on:
+  schedule:
+    # Daily, off the hour: GitHub's scheduled runs queue behind the top of the
+    # hour and can be delayed by tens of minutes.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/background/prompt.ts"
+      - "src/background/tools.ts"
+      - "src/background/providers/**"
+      - "src/shared/models.ts"
+      - "src/shared/types.ts"
+      - "scripts/ai-live-check.mjs"
+      - ".github/workflows/live-ai-check.yml"
+
+concurrency:
+  group: live-ai-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live:
+    name: Live provider (${{ matrix.provider }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: groq
+            secret: GROQ_API_KEY
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      # The check bundles the real adapter, prompt and tool schema with esbuild,
+      # so it runs the shipped request rather than a description of it.
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      # Said plainly, before the provider is called: a missing secret is a
+      # repository misconfiguration, and the script's own exit code for it (2) is
+      # not distinguishable from "the provider rejected the key" in a log a
+      # maintainer reads at a glance.
+      - name: Check the key is configured
+        env:
+          KEY_VAR: ${{ matrix.secret }}
+          KEY_VALUE: ${{ secrets[matrix.secret] }}
+        run: |
+          if [ -z "${KEY_VALUE}" ]; then
+            echo "::error::No $KEY_VAR secret is configured for this repository."
+            echo "Add it under Settings -> Secrets and variables -> Actions, or this check cannot run."
+            exit 1
+          fi
+          echo "$KEY_VAR is configured."
+
+      - name: Ask a real model for a real tool call and a real answer
+        env:
+          PROVIDER: ${{ matrix.provider }}
+          API_KEY: ${{ secrets[matrix.secret] }}
+        run: |
+          # The script reads its key from the provider's own variable name, which
+          # is why the secret is not passed under a generic one.
+          case "$PROVIDER" in
+            groq) export GROQ_API_KEY="$API_KEY" ;;
+            nvidia) export NVIDIA_API_KEY="$API_KEY" ;;
+            openai) export OPENAI_API_KEY="$API_KEY" ;;
+            anthropic) export ANTHROPIC_API_KEY="$API_KEY" ;;
+            openrouter) export OPENROUTER_API_KEY="$API_KEY" ;;
+          esac
+          unset API_KEY
+          npm run check:ai

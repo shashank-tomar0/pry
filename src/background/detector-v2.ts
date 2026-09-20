@@ -78,7 +78,20 @@ export function fuseDetections(
   for (const span of nerSpans) {
     const text = span.text.trim();
     if (text.length < 3) continue;
-    if (haystack !== undefined && !haystack.includes(text)) continue;
+    // Whole-word presence, not substring: a span of "mail" is "on the page"
+    // only as its own word, not inside "Gmail" or a mail.google.com URL. The
+    // substring check vaulted exactly that, and the vaulted fragment then
+    // tokenized inside longer words downstream. (Double backslashes: plain
+    // string to the RegExp constructor — correct here. The template-literal
+    // trap that bit wordBoundPattern does not apply.)
+    if (haystack !== undefined) {
+      const escapedSpan = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const wholeWord = new RegExp(
+        `(^|[^\\p{L}\\p{M}0-9_])${escapedSpan}(?=$|[^\\p{L}\\p{M}0-9_])`,
+        "iu",
+      );
+      if (!wholeWord.test(haystack)) continue;
+    }
     // Duplicate if the span appears inside any known value or vice versa.
     const overlapping = values.some(
       (v) => v.includes(text) || text.includes(v),

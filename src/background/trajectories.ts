@@ -105,7 +105,9 @@ export function renderTrajectoryRoutes(trajectories: Trajectory[]): string {
     `different task. Extra steps are wrong answers that look thorough, and each one ` +
     `costs a full model round trip.\n\n` +
     trajectories.map((t) => `Task: ${t.task}\nSteps: ${t.steps}`).join("\n\n") +
-    `\n--- End routes ---`
+    `\n--- End routes ---\n` +
+    `Entries show shapes only: [...] (and [email], [name], ...) mark where that older ` +
+    `task's own words were removed at write time. Never reconstruct them — proceed without.`
   );
 }
 

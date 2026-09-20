@@ -164,13 +164,32 @@ export function floatTo16BitPCM(samples: Float32Array): Uint8Array {
  *  Positive values divide by 32767 (the positive peak) so a 1.0 input
  *  decodes back to exactly 1.0; negatives divide by 32768 (the negative
  *  peak) so -1.0 maps to exactly -1.0. */
-export function pcm16ToFloat32(bytes: Uint8Array): Float32Array {
-  const n = Math.floor(bytes.length / 2);
+export function pcm16ToFloat32(bytes: Uint8Array): Float32Array {  const n = Math.floor(bytes.length / 2);
   const out = new Float32Array(n);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   for (let i = 0; i < n; i++) {
     const v = view.getInt16(i * 2, true);
     out[i] = v < 0 ? v / 0x8000 : v / 0x7fff;
+  }
+  return out;
+}
+
+/**
+ * Concatenate streamed speech chunks into one buffer, preserving order.
+ *
+ * Pure so the playback queue's merge is pinned without an AudioContext: the
+ * controller accumulates network-sized reads and schedules one longer buffer
+ * per floor, and a merge that reordered or dropped samples would be audible
+ * corruption rather than a test failure.
+ */
+export function mergeFloat32Arrays(parts: readonly Float32Array[]): Float32Array {
+  let total = 0;
+  for (const part of parts) total += part.length;
+  const out = new Float32Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
   }
   return out;
 }

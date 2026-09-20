@@ -25,6 +25,7 @@ import { createPlanner } from "./providers";
 import { generateLessons } from "./lesson-generator";
 import { getLessons, recordLessons } from "./lessons";
 import { getTrajectories, recordTrajectory } from "./trajectories";
+import { harvestTypedValues, scrubMemoryText } from "./memory-scrub";
 import { saveSession, getSessions, deleteSession, clearHistory } from "./history";
 import { recordExperience, getMemoryStats, getExperiencesForDomain } from "./experience-memory";
 import { reflectOnRun } from "./reflection";
@@ -1307,12 +1308,25 @@ async function start(task: string, tabId: number): Promise<void> {
         // what the next run should do differently); successful runs deposit a
         // compact sanitized trajectory for few-shot replay. Both are rare,
         // capped, and egress-metered.
+        //
+        // Values are scrubbed BEFORE either store (see memory-scrub): a past
+        // task's search terms replay verbatim otherwise, and a later run for
+        // a different task obeyed one ("I'll obey the route" → typed the old
+        // query). The harvest reads what this run actually typed, from the
+        // executor's own `Typed "…" into …` ground truth, so no guessing.
+        const memoryValues = harvestTypedValues(
+          transcript
+            .filter((e) => e.role === "step")
+            .map((e) => ({ action: e.action, text: e.text ?? "" })),
+        );
+        const scrubForMemory = (s: string): string => scrubMemoryText(s, memoryValues);
         try {
           if (!lastExperience.taskSuccess) {
             const planner = createPlanner(settings);
             const lessons = await generateLessons(planner, lastExperience);
-            if (lessons.length > 0) {
-              await recordLessons(lastExperience.domain, lastExperience.pageType, lessons);
+            const clean = lessons.map(scrubForMemory).filter(Boolean);
+            if (clean.length > 0) {
+              await recordLessons(lastExperience.domain, lastExperience.pageType, clean);
               // Honest egress: the lesson prompt/response crossed the wire.
               const lessonBytes = new Blob([
                 JSON.stringify(lessons),
@@ -1331,9 +1345,9 @@ async function start(task: string, tabId: number): Promise<void> {
               await recordTrajectory({
                 domain: lastExperience.domain,
                 pageType: lastExperience.pageType,
-                task: lastExperience.task.slice(0, 200),
+                task: scrubForMemory(lastExperience.task).slice(0, 200),
                 steps,
-                answer,
+                answer: scrubForMemory(answer),
               });
             }
           }
@@ -1498,8 +1512,16 @@ chrome.runtime.onMessage.addListener(
         void (async () => {
           const { clearExperienceMemory } = await import("./experience-memory");
           const { clearLearnedRules } = await import("./learned-rules");
+          const { clearTrajectories } = await import("./trajectories");
+          const { clearLessons } = await import("./lessons");
           await clearExperienceMemory();
           await clearLearnedRules();
+          // Trajectories and lessons are learned memory too: a stored route
+          // whose task carried a previous chat's search term replayed it into
+          // an unrelated run ("I'll obey the route"), and no reset path
+          // covered these two stores, so the poison survived every wipe.
+          await clearTrajectories();
+          await clearLessons();
           await chrome.storage.local.remove(LAST_REFLECTION_KEY);
           // The panel's button says "Reset learning memory (experiences + rules
           // + ledger)" and this handler did not clear the ledger, so the audit

@@ -101,6 +101,13 @@ export function tokenKindLabel(kind: string): string {
  * value. Returns null when there is nothing to explain, so callers can skip the
  * section entirely rather than print an empty header.
  *
+ * Each line also carries the token's MASKED sample ("sh•••@gmail.com") — the
+ * same non-recoverable sample the audit panel shows, audited in maskSample.
+ * Kind alone cannot disambiguate two credentials (the work address vs the
+ * signed-in account), and a model that cannot tell them apart invents the
+ * difference. The sample is masked before it is built, so nothing the vault
+ * holds reaches the planner either way.
+ *
  * Capped: a legend long enough to dominate the prompt would cost more context
  * than the values it replaces, and the cap is stated in the legend itself so a
  * truncated list is never mistaken for the whole vault.
@@ -108,7 +115,10 @@ export function tokenKindLabel(kind: string): string {
 export function buildTokenLegend(entries: readonly TokenEntry[], max = 8): string | null {
   if (entries.length === 0) return null;
   const shown = entries.slice(0, max);
-  const lines = shown.map((e) => `  ${e.token} = ${tokenKindLabel(e.kind)}`);
+  const lines = shown.map((e) => {
+    const sample = maskSample(e.original);
+    return `  ${e.token} = ${tokenKindLabel(e.kind)} (${sample})`;
+  });
   if (entries.length > shown.length) {
     lines.push(`  (+${entries.length - shown.length} more token(s), same rule)`);
   }
@@ -228,7 +238,28 @@ export class PIITokenizer {
   }
 
   private wordBoundPattern(escaped: string): RegExp {
-    return new RegExp(`(^|[^\p{L}\p{M}])${escaped}(?=$|[^\p{L}\p{M}])`, "gu");
+    // Double backslashes are load-bearing: this is a TEMPLATE literal, where
+    // `\p` collapses to "p" (unknown escapes lose the backslash), so a single
+    // `\p{L}` compiles to [^p{L}p{M}] — a class that MATCHES ordinary letters
+    // and vaulted "mail" inside "Gmail" ("open g<PII_1>", quoted back by the
+    // planner as its own task). `\\p` survives the template as `\p`, which is
+    // what the RegExp engine needs. Regex literals (`/.../u`) elsewhere in
+    // this file are unaffected — only `new RegExp` from a template bites.
+    return new RegExp(`(^|[^\\p{L}\\p{M}])${escaped}(?=$|[^\\p{L}\\p{M}])`, "gu");
+  }
+
+  /**
+   * The replacement pattern for one value, shared by the element and text
+   * paths of tokenizeDetections: word-bounded for letter-runs (names), bare
+   * global for everything else (emails, numbers, keys). One definition so the
+   * two paths can never drift apart again — that drift is how the element
+   * path stayed a bare split/join while the text path grew guards.
+   */
+  private boundedFor(val: string): RegExp {
+    const escaped = val.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return this.isLetterRun(val)
+      ? this.wordBoundPattern(escaped)
+      : new RegExp(escaped, "g");
   }
 
   /**
@@ -242,7 +273,9 @@ export class PIITokenizer {
    * callback written for the grouped case is silently wrong for the bare one:
    * with no groups, `String.replace` passes the match OFFSET as the second
    * argument, so the callback splices that offset into the text as if it were
-   * a leading delimiter.
+   * a leading delimiter. The callback below therefore reads the group ONLY
+   * when it is a string (`typeof lead === "string"`), emitting the bare token
+   * otherwise — one shape that is correct for both patterns.
    *
    * Live failure this fixes (the panel's own transcript): a clean action detail
    * of `Typed "<email>" into …` re-redacted to `Typed "7<CRED_1>" … Field now
@@ -252,14 +285,8 @@ export class PIITokenizer {
    * the run trying to reconcile a value nobody typed, and timed out mid-task.
    */
   private replaceValueWithToken(text: string, entry: TokenEntry): string {
-    const escaped = entry.original.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    if (this.isLetterRun(entry.original)) {
-      return text.replace(
-        this.wordBoundPattern(escaped),
-        (_match, lead: string) => `${lead ?? ""}${entry.token}`,
-      );
-    }
-    return text.replace(new RegExp(escaped, "g"), () => entry.token);
+    return text.replace(this.boundedFor(entry.original), (match: string, lead?: unknown) =>
+      `${typeof lead === "string" ? lead : ""}${entry.token}`);
   }
 
   /**
@@ -516,13 +543,31 @@ export class PIITokenizer {
       const token = this.tokenize(val, tokenKind);
       let replacedAny = false;
 
+      // One replacement shape for both paths below. The callback reads `lead`
+      // ONLY when it is a string: the word-bound pattern carries one capture
+      // group (the delimiter before the value), while the bare pattern carries
+      // none — and with no groups String.replace passes the match OFFSET as
+      // the second argument. A callback written for the grouped shape splices
+      // that offset into the text ("To: shashank…@gmail.com" → "To: 4<CRED_1>"),
+      // which the planner then reads as a corrupted recipient. The live Gmail
+      // failure this guards was exactly that digit.
+      const replaceWithToken = (s: string): string =>
+        s.replace(this.boundedFor(val), (match: string, lead?: unknown) =>
+          `${typeof lead === "string" ? lead : ""}${token}`);
+
       // 1) Element path: replace the value on the element the detector flagged.
+      // Guarded exactly like the text path: a bare split/join here turned a
+      // vaulted "mail" into "G<PII_1>" inside element values ("Gmail"), which
+      // the planner echoed as its own task ("open g<PII_1>").
       const selMatch = det.elementSelector?.match(/data-pry-id="(\d+)"/);
       if (selMatch) {
         const el = elementsById.get(parseInt(selMatch[1], 10));
         if (el && el.value && el.value.includes(val) && !TOKEN_RE.test(el.value)) {
-          el.value = el.value.split(val).join(token);
-          replacedAny = true;
+          const nextEl = replaceWithToken(el.value);
+          if (nextEl !== el.value) {
+            el.value = nextEl;
+            replacedAny = true;
+          }
         }
       }
 
@@ -531,12 +576,7 @@ export class PIITokenizer {
       //    and word-bounded so "Singh" never corrupts "Singhania" — in any
       //    script, so "राम" doesn't corrupt a longer Devanagari word).
       if (val.length >= 4 && text.includes(val)) {
-        const escaped = val.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const isAlpha = this.isLetterRun(val);
-        const bounded = isAlpha
-          ? this.wordBoundPattern(escaped)
-          : new RegExp(escaped, "g");
-        const next = text.replace(bounded, (match, lead) => `${lead ?? ""}${token}`);
+        const next = replaceWithToken(text);
         if (next !== text) {
           text = next;
           replacedAny = true;

@@ -166,7 +166,16 @@ export function tryDeterministic(
     /^(?:go to|open|navigate to|visit)\s+(.+)$/i,
   );
   if (navMatch) {
-    const raw = navMatch[1].trim();
+    let raw = navMatch[1].trim();
+
+    // "open X in a new tab" is a one-shot tab action, not a navigation of the
+    // current tab: the planner otherwise spends a reasoning turn to pick the
+    // wrong one (the reported "open yt in the new tab" ran navigate in place
+    // and then obeyed a stale route). Stripped before validation so the same
+    // URL/alias rules below decide whether X is resolvable at all.
+    const newTab = /\bin\s+(?:a\s+|another\s+|the\s+)?new\s+tab\s*$/i.test(raw);
+    if (newTab) raw = raw.replace(/\bin\s+(?:a\s+|another\s+|the\s+)?new\s+tab\s*$/i, "").trim();
+    if (raw.length === 0) return { resolved: false };
 
     // Reject if the URL contains multi-step connectors — this is a complex
     // task that the LLM should handle, not the deterministic planner.
@@ -210,6 +219,13 @@ export function tryDeterministic(
       url = `https://${raw}`;
     }
 
+    if (newTab) {
+      return {
+        resolved: true,
+        action: { name: "open_tab", input: { url, reason: `Deterministic: open "${url.slice(0, 50)}" in a new tab` } },
+        explanation: `Open ${url.slice(0, 50)} in a new tab`,
+      };
+    }
     return {
       resolved: true,
       action: { name: "navigate", input: { url, reason: `Deterministic: navigate to "${url.slice(0, 50)}"` } },

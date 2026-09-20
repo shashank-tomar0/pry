@@ -44,7 +44,13 @@ export function modelUnavailableReason(
  * A connection that dies mid-answer arrives as whatever the socket layer threw —
  * `terminated` with a `SocketError` cause in undici, `fetch failed`, `other side
  * closed` — and before this mapping existed it reached the transcript as that
- * bare word. Two things were wrong with that. The user was shown a word that
+ * bare word. The HTTP parser's own failures belong here too: a response whose
+ * headers arrive and whose body then chokes the parser (`unexpected tokens
+ * remaining in message header`, `HPE_*`) is a dead stream, not a provider
+ * verdict — it carries no HTTP status, which is exactly the branch below that
+ * calls this. Misread once live: the parser error surfaced as "API error
+ * unknown", matched no retry keyword, and a healthy run died on a hiccup
+ * instead of spending its one retry. Two things were wrong with that. The user was shown a word that
  * names nothing they can act on, and `isRetryablePlannerError` saw no keyword it
  * recognised, so a dropped answer got NO retry even though the model HAD seen the
  * prompt — the opposite of the policy's intent for a genuine hiccup.
@@ -56,7 +62,7 @@ export function modelUnavailableReason(
 export function transportFailure(message: string, cause = ""): string | null {
   if (/abort/i.test(message)) return null;
   if (
-    !/terminated|socket|econn|epipe|fetch failed|network|other side closed|premature close|und_err|connection (error|closed|reset|dropped)/i.test(
+    !/terminated|socket|econn|epipe|fetch failed|network|other side closed|premature close|und_err|connection (error|closed|reset|dropped)|unexpected token|message header|HPE_[A-Z_]+|parse error|socket hang up|hang up/i.test(
       `${message} ${cause}`,
     )
   ) {

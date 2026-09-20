@@ -224,7 +224,7 @@ const bundle = await build({
 const mod = await import(
   `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString("base64")}`
 );
-const { MIC_READY_ANNOUNCEMENT, micToggleAction, VoiceController } = mod;
+const { MIC_READY_ANNOUNCEMENT, micToggleAction, VoiceController, mergeFloat32Arrays, MIN_SPEECH_CHUNK_SAMPLES } = mod;
 
 /** A controller wired to collectors, so one tap's effects are all inspectable. */
 function makeHarness() {
@@ -503,6 +503,44 @@ ok(
   idle.errors.length === 0 && idle.submitted.length === 0,
   JSON.stringify({ errors: idle.errors, submitted: idle.submitted }),
 );
+
+// ─── 6. Streamed speech schedules floors, not slivers ───────────────────────
+// The TTS stream flushes whatever each network read delivered — sometimes a
+// few milliseconds — and every scheduled buffer is a splice point. Unfloored,
+// dozens of slivers per second read as a permanent crackle bed under the
+// voice (the reported "background noise every time"). The controller queues
+// to a 0.25 s floor and flushes the remainder at stream end.
+console.log("\n=== Speech playback floors network-sized reads ===\n");
+
+ok("the speech floor is a quarter second at 16 kHz", MIN_SPEECH_CHUNK_SAMPLES === 4000);
+ok("merge preserves order across uneven parts",
+  (() => {
+    const merged = mergeFloat32Arrays([new Float32Array([1, 2]), new Float32Array([]), new Float32Array([3])]);
+    return merged.length === 3 && merged[0] === 1 && merged[1] === 2 && merged[2] === 3;
+  })());
+
+let scheduledBuffers = 0;
+const realCreateBuffer = FakeAudioContext.prototype.createBuffer;
+FakeAudioContext.prototype.createBuffer = function (...args) {
+  scheduledBuffers++;
+  return realCreateBuffer.apply(this, args);
+};
+const tts = makeHarness();
+const bufsBefore = scheduledBuffers;
+tts.controller.queueSpeechChunk(new Float32Array(100));
+ok("a short read schedules nothing on its own", scheduledBuffers === bufsBefore);
+tts.controller.queueSpeechChunk(new Float32Array(3900));
+ok("crossing the floor schedules exactly one merged buffer", scheduledBuffers === bufsBefore + 1);
+tts.controller.queueSpeechChunk(new Float32Array(100));
+ok("the next short read waits again", scheduledBuffers === bufsBefore + 1);
+tts.controller.queueSpeechChunk(new Float32Array(0), true);
+ok("stream end flushes the remainder instead of dropping it", scheduledBuffers === bufsBefore + 2);
+tts.controller.queueSpeechChunk(new Float32Array(100));
+tts.controller.stopSpeaking();
+tts.controller.queueSpeechChunk(new Float32Array(3900));
+ok("stopping drops the queue — no utterance leaks into the next",
+  scheduledBuffers === bufsBefore + 2);
+FakeAudioContext.prototype.createBuffer = realCreateBuffer;
 
 console.log(`\nvoice-test: ${passed} assertion(s) passed.\n`);
 assert.ok(passed > 0);

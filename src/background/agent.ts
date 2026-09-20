@@ -1302,7 +1302,9 @@ export async function runTask(
     return (
       `--- Lessons learned on this site (from past runs) ---\n` +
       relevant.map((l) => `- ${l.text}`).join("\n") +
-      `\n--- End lessons ---`
+      `\n--- End lessons ---\n` +
+      `These describe how THIS SITE works (which control, which URL shape) — never names, ` +
+      `search terms, or values to reuse. Your task is the \`Task:\` line below.`
     );
   })();
   // The wording here is behavior, so it lives in trajectories.ts as a pure,
@@ -3679,7 +3681,7 @@ export function isRetryablePlannerError(message: string): boolean {
   // `retryPolicyFor`, which holds both facts; this string check remains for the
   // callers that see only the message, and for the genuinely unproven endpoint.
   if (/did not respond within/i.test(message)) return false;
-  return /rate.?limit|timed? ?out|network|fetch failed|econn|overloaded|temporarily|503|429|502|504|timeout|stopped streaming/i.test(
+  return /rate.?limit|timed? ?out|network|fetch failed|econn|overloaded|temporarily|503|429|502|504|timeout|stopped streaming|unexpected token|message header|HPE_[A-Z_]+|parse error|socket hang up|dropped mid/i.test(
     message,
   );
 }

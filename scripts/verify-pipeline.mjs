@@ -800,6 +800,7 @@ console.log("\n=== Scenario L: blank-model fallback + friendly model errors ===\
 const { modelUnavailableReason, transportFailure, describeOpenAIError } = await import(
   "../src/background/providers/errors.ts",
 );
+const { normalizeToolName } = await import("../src/background/providers/types.ts");
 const { createPlanner } = await import("../src/background/providers/index.ts");
 const { PROVIDERS, PROVIDER_IDS } = await import("../src/shared/models.ts");
 const { DEFAULT_SETTINGS } = await import("../src/shared/types.ts");
@@ -811,6 +812,31 @@ ok("400 with model-not-found text recognised",
   modelUnavailableReason(400, "model does not exist") !== null);
 ok("rate limits are NOT model errors", modelUnavailableReason(429, "rate limit exceeded") === null);
 ok("server errors are NOT model errors", modelUnavailableReason(500, "boom") === null);
+
+// Streamed tool names can carry a reasoning model's channel markers — live:
+// gpt-oss via NIM emitted `type_text<|channel|>commentary`, a 37-second turn
+// that died as "Unknown tool". Names repair against the offered tools.
+const KNOWN_TOOLS = ["navigate", "click", "click_text", "type", "type_text", "read_page"];
+ok("exact names pass through untouched",
+  normalizeToolName("click_text", KNOWN_TOOLS) === "click_text");
+ok("a channel-marker suffix is cut and the valid tool executes",
+  normalizeToolName("type_text<|channel|>commentary", KNOWN_TOOLS) === "type_text" &&
+  normalizeToolName("click<|channel|>analysis", KNOWN_TOOLS) === "click");
+ok("an invented name is NOT guessed into a real tool (still refused downstream)",
+  normalizeToolName("search_youtube", KNOWN_TOOLS) === "search_youtube");
+ok("but marker soup never reaches the executor's refusal line",
+  normalizeToolName("search_youtube<|channel|>commentary", KNOWN_TOOLS) === "search_youtube");
+ok("empty and blank names stay empty (filtered upstream as before)",
+  normalizeToolName("", KNOWN_TOOLS) === "" && normalizeToolName("   ", KNOWN_TOOLS) === "");
+
+// The "Learning: applying N rules" line once counted categories with no
+// in-run consumer (site_pattern/safety/redaction) silently inside the total —
+// "2 stored rule(s): 1 filter, 0 strategy". Only pii_detection and strategy
+// act, so the remainder is named as recorded-but-inert.
+const agentRulesSource = await readFile("src/background/agent.ts", "utf8");
+ok("the learning line counts only acting rules and names the inert remainder",
+  /applying \${fpRules \+ strategyRules}/.test(agentRulesSource) &&
+  /no in-run effect/.test(agentRulesSource));
 
 // A blank stored model falls back to the provider default instead of throwing
 // "No model chosen" mid-run (createPlanner constructs a client only).
@@ -3815,12 +3841,13 @@ ok("the loop hands the retry policy the endpoint evidence instead of the message
   /retryPolicyFor\(firstTurnLiveness, firstMessage, \{[\s\S]{0,160}?endpointProvenThisRun: endpointServedThisRun/.test(agentBudgetSource) &&
     /endpointAnsweredThisRun,/.test(agentBudgetSource));
 ok("and that evidence is set where a turn actually resolved",
-  /turn = await runPlannerTurn\(new AbortController\(\), firstTurnLiveness\);\n\s*endpointServedThisRun = true;/.test(agentBudgetSource) &&
+  /turn = await runPlannerTurn\(new AbortController\(\), firstTurnLiveness\);\r?\n\s*endpointServedThisRun = true;/.test(agentBudgetSource) &&
   // The retry passes isRetry=false DELIBERATELY (see the comment above the
   // call): a dropped mid-answer means the model already saw the prompt, so the
   // retry gets the full first-output window while the unanswered-headers cut
   // still applies. An earlier revision of this assertion pinned `true`.
-  /runPlannerTurn\(new AbortController\(\), retryLiveness, false\);\n\s*endpointServedThisRun = true;/.test(agentBudgetSource));
+  // `\r?` because source pins must match LF and CRLF checkouts alike.
+  /runPlannerTurn\(new AbortController\(\), retryLiveness, false\);\r?\n\s*endpointServedThisRun = true;/.test(agentBudgetSource));
 
 // ── What the silence was actually spent on ──────────────────────────────────
 // The reported run could not tell "the provider never answered" from "it

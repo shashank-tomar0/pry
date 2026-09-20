@@ -28,7 +28,7 @@ import type {
   StopReason,
   ToolSpec,
 } from "./types";
-import { parseArguments } from "./types";
+import { normalizeToolName, parseArguments } from "./types";
 import { describeOpenAIError } from "./errors";
 
 type ChatMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -280,7 +280,10 @@ export function createOpenAIPlanner(
           // Some OpenAI-compatible backends omit ids; the id only has to be
           // unique within the turn for the tool result to match up.
           id: call.id || `call_${index}`,
-          name: call.name,
+          // Streamed names can carry the model's channel markers
+          // (normalizeToolName) — repaired here so a formatting leak executes
+          // instead of dying as "Unknown tool" in the executor.
+          name: normalizeToolName(call.name, tools.map((t) => t.name)),
           input: parseArguments(call.args),
         }));
 

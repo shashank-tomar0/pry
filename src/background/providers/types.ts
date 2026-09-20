@@ -119,3 +119,24 @@ export function parseArguments(raw: unknown): Record<string, unknown> {
     return {};
   }
 }
+
+/**
+ * Clean a streamed tool-call name against the tools the turn offered.
+ *
+ * Reasoning models leak their native channel markers into streamed fields:
+ * gpt-oss served through an OpenAI-compatible endpoint produced
+ * `type_text<|channel|>commentary` as a function name — a 37-second reasoning
+ * turn that died in the executor as "Unknown tool". The name is cut at the
+ * first channel/control marker and at whitespace, then matched exactly; an
+ * unrecognized name comes back WITHOUT the marker soup, so the executor's
+ * refusal names the attempt rather than the transport's debris. Genuinely
+ * invented names pass through unchanged (still unknown, still refused) —
+ * this repairs formatting damage, never guesses intent.
+ */
+export function normalizeToolName(raw: string, known: readonly string[]): string {
+  const name = String(raw ?? "").trim();
+  if (!name || known.includes(name)) return name;
+  const cut = name.split(/<\|.*$/)[0].split(/\s/)[0].trim();
+  if (cut && known.includes(cut)) return cut;
+  return cut || name;
+}

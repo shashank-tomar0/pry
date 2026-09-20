@@ -966,14 +966,21 @@ export async function runTask(
   if (applicableRules.length > 0) {
     const fpRules = applicableRules.filter((r) => r.category === "pii_detection").length;
     const strategyRules = applicableRules.filter((r) => r.category === "strategy").length;
+    // The remaining categories (site_pattern, safety, redaction) are minted,
+    // stored and dashboarded but have NO in-run consumer — only pii_detection
+    // (suppression keys) and strategy (LLM-only routing) act. Counting them
+    // silently inside the total once printed "2 stored rule(s): 1 filter,
+    // 0 strategy", so they are named as what they are: recorded, not applied.
+    const noteRules = applicableRules.length - fpRules - strategyRules;
     emit({
       kind: "entry",
       entry: {
         id: nextId(),
         role: "system",
         text:
-          `Learning: applying ${applicableRules.length} stored rule(s) for ${domain} ` +
-          `(${fpRules} false-positive filter${fpRules === 1 ? "" : "s"}, ${strategyRules} strategy rule${strategyRules === 1 ? "" : "s"}${sanitizeCtx.llmOnly ? ", deterministic disabled by learning" : ""}).`,
+          `Learning: applying ${fpRules + strategyRules} stored rule(s) for ${domain} ` +
+          `(${fpRules} false-positive filter${fpRules === 1 ? "" : "s"}, ${strategyRules} strategy rule${strategyRules === 1 ? "" : "s"}${sanitizeCtx.llmOnly ? ", deterministic disabled by learning" : ""})` +
+          `${noteRules > 0 ? ` + ${noteRules} recorded note${noteRules === 1 ? "" : "s"} (no in-run effect)` : ""}.`,
       },
     });
   }

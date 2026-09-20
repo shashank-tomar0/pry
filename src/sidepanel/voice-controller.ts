@@ -168,7 +168,18 @@ export class VoiceController {
         }
       };
       source.connect(this.processor);
-      this.processor.connect(this.audioCtx.destination);
+      // Keep-alive WITHOUT monitoring: a ScriptProcessor only fires
+      // onaudioprocess while connected through to the destination, so it
+      // must join the output graph — but the mic must never be audible.
+      // The spec zero-fills unwritten output, yet routing live input
+      // straight at the speakers relies on every Chromium variant doing so,
+      // and the failure mode is exactly the reported one ("someone's mic is
+      // on" under everything). A zero-gain node keeps the graph alive with
+      // structural silence instead of a spec promise.
+      const silentKeepAlive = this.audioCtx.createGain();
+      silentKeepAlive.gain.value = 0;
+      this.processor.connect(silentKeepAlive);
+      silentKeepAlive.connect(this.audioCtx.destination);
       if (this.cancelListening) {
         this.cleanup();
         return;

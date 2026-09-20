@@ -62,9 +62,11 @@ class FakeScriptProcessor {
   constructor() {
     this.onaudioprocess = null;
     this.connected = false;
+    this.connectedTo = [];
   }
-  connect() {
+  connect(dest) {
     this.connected = true;
+    this.connectedTo.push(dest ?? null);
   }
   disconnect() {
     this.connected = false;
@@ -79,6 +81,7 @@ class FakeAudioContext {
     this.sampleRate = options.sampleRate ?? 16000;
     this.destination = { kind: "destination" };
     this.processors = [];
+    this.gains = [];
     this.closed = false;
     audioContexts.push(this);
   }
@@ -91,7 +94,9 @@ class FakeAudioContext {
     return processor;
   }
   createGain() {
-    return { gain: { value: 0 }, connect() {}, disconnect() {} };
+    const node = { gain: { value: 0 }, connect() {}, disconnect() {} };
+    this.gains.push(node);
+    return node;
   }
   createBuffer(_channels, length, rate) {
     return { duration: length / rate, getChannelData: () => new Float32Array(length) };
@@ -504,7 +509,29 @@ ok(
   JSON.stringify({ errors: idle.errors, submitted: idle.submitted }),
 );
 
-// ─── 6. Streamed speech schedules floors, not slivers ───────────────────────
+// ─── 6. The mic is never audible ────────────────────────────────────────────
+// The capture processor must join the output graph (Chrome only fires
+// onaudioprocess on a connected node) but must never reach the speakers:
+// a straight processor→destination wire makes room noise ride under
+// everything ("someone's mic is on"). The keep-alive runs through a
+// zero-gain node instead — structural silence, not a spec promise.
+console.log("\n=== Capture never monitors the microphone ===\n");
+
+FakeWebSocket.reset();
+const monitor = makeHarness();
+await monitor.controller.startListening();
+await settle();
+const micCtx = audioContexts.at(-1);
+const micProcessor = micCtx.processors.at(-1);
+const keepAliveGains = micCtx.gains.filter((g) => g.gain.value === 0);
+ok("the capture processor runs through a zero-gain keep-alive",
+  micProcessor.connectedTo.length === 1 && keepAliveGains.includes(micProcessor.connectedTo[0]),
+  JSON.stringify(micProcessor.connectedTo.map((t) => t?.kind ?? "gain")));
+ok("and nothing in the capture graph touches the speakers",
+  !micProcessor.connectedTo.includes(micCtx.destination));
+await monitor.controller.stopListening();
+
+// ─── 7. Streamed speech schedules floors, not slivers ───────────────────────
 // The TTS stream flushes whatever each network read delivered — sometimes a
 // few milliseconds — and every scheduled buffer is a splice point. Unfloored,
 // dozens of slivers per second read as a permanent crackle bed under the

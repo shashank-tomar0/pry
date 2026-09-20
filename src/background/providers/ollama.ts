@@ -15,7 +15,7 @@ import type {
   PlannerTurn,
   ToolSpec,
 } from "./types";
-import { PlannerError, parseArguments } from "./types";
+import { PlannerError, normalizeToolName, parseArguments } from "./types";
 
 // ─── Ollama API Types ─────────────────────────────────────────────────────
 
@@ -265,6 +265,16 @@ export function createOllamaPlanner(model: string): Planner {
     }: PlannerRequest): Promise<PlannerTurn> {
       const ollamaMessages = toOllamaMessages(system, messages);
 
+      // Streamed names can carry channel markers (see normalizeToolName) —
+      // repaired against the offered tools so a formatting leak executes
+      // instead of dying as "Unknown tool" in the executor.
+      const cleanCalls = (
+        calls: Array<{ id: string; name: string; input: Record<string, unknown> }>,
+      ): Array<{ id: string; name: string; input: Record<string, unknown> }> => {
+        const known = tools.map((t) => t.name);
+        return calls.map((c) => ({ ...c, name: normalizeToolName(c.name, known) }));
+      };
+
       // Try with tools first.
       let body: OllamaChatRequest = {
         model,
@@ -277,7 +287,7 @@ export function createOllamaPlanner(model: string): Planner {
         const result = await streamChat(baseUrl, body, signal, onText, onMilestone);
         return {
           text: result.text,
-          toolCalls: result.toolCalls,
+          toolCalls: cleanCalls(result.toolCalls),
           stopReason: result.toolCalls.length > 0 ? "tool_use" : "end_turn",
         };
       } catch (error) {
@@ -296,7 +306,7 @@ export function createOllamaPlanner(model: string): Planner {
               const result = await streamChat(baseUrl, bodyNoTools, signal, onText, onMilestone);
               return {
                 text: result.text,
-                toolCalls: result.toolCalls,
+                toolCalls: cleanCalls(result.toolCalls),
                 stopReason: result.toolCalls.length > 0 ? "tool_use" : "end_turn",
               };
             } catch {

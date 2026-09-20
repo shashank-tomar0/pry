@@ -1,7 +1,26 @@
 import * as esbuild from "esbuild";
 import { cp, mkdir, rm, readdir } from "node:fs/promises";
+import { execSync } from "node:child_process";
 
 const watch = process.argv.includes("--watch");
+
+/**
+ * Build stamp, baked into every bundle so a running install can say which
+ * source it was built from. Users report voice/planner behaviour against the
+ * wrong build otherwise ("I still hear the noise" on a fix they never
+ * loaded) — the options page footer prints this, and it is the first thing
+ * to check before debugging anything behavioural.
+ */
+function buildId() {
+  try {
+    const sha = execSync("git rev-parse --short HEAD", { encoding: "utf8" }).trim();
+    const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
+    return `${sha} · ${stamp}Z`;
+  } catch {
+    return `dev · ${new Date().toISOString().slice(0, 16).replace("T", " ")}Z`;
+  }
+}
+const PRY_BUILD_ID = process.env.PRY_BUILD_ID ?? buildId();
 
 await rm("dist", { recursive: true, force: true });
 await mkdir("dist", { recursive: true });
@@ -130,6 +149,7 @@ const shared = {
   logLevel: "info",
   define: {
     "process.env.NODE_ENV": watch ? '"development"' : '"production"',
+    "PRY_BUILD_ID": JSON.stringify(PRY_BUILD_ID),
   },
 };
 

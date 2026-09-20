@@ -194,6 +194,20 @@ export function mergeFloat32Arrays(parts: readonly Float32Array[]): Float32Array
   return out;
 }
 
+/**
+ * Split stream bytes into a 2-byte-aligned head and the carried tail.
+ *
+ * PCM16 samples are byte PAIRS, but network reads split anywhere: an
+ * odd-length read ends mid-sample, and the dangling byte is the first half
+ * of the NEXT sample — it must ride along, never be dropped or decoded.
+ * Pure so the reassembly is pinned without a socket: dropping it deletes one
+ * sample per odd read (an audible tick every time the network chunks oddly).
+ */
+export function drainAligned(buffer: Uint8Array): { aligned: Uint8Array; rest: Uint8Array } {
+  const alignedLen = buffer.length - (buffer.length % 2);
+  return { aligned: buffer.subarray(0, alignedLen), rest: buffer.subarray(alignedLen) };
+}
+
 /** Base64-encode binary audio for the Scribe WebSocket frames. */
 export function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
@@ -209,8 +223,30 @@ export function bytesToBase64(bytes: Uint8Array): string {
  * injectable) so tests can assert the exact payload — model id, output
  * format, and the header that carries the key.
  */
-const TTS_MODEL_FLASH = "eleven_flash_v2_5";
-export const TTS_OUTPUT_FORMAT = "pcm_16000"; // 16 kHz mono PCM for streaming playback
+/**
+ * Default TTS model: Turbo v2.5 — ElevenLabs' quality/latency middle tier.
+ *
+ * Flash v2.5 (the previous default) is the fastest, cheapest voice and it
+ * sounds like it: breathy, thin sibilants, the persistent harsh bed users
+ * report as "hiss". Multilingual v2 is the best quality but adds seconds of
+ * first-byte latency to every spoken answer. Turbo keeps streaming latency
+ * close to Flash while generating audibly cleaner speech.
+ */
+const TTS_MODEL_DEFAULT = "eleven_turbo_v2_5";
+/**
+ * Requested TTS wire format: 24 kHz mono PCM.
+ *
+ * WHY NOT 16 kHz (telephone-grade) or 44.1 kHz (full fidelity):
+ * sibilant energy lives at 4–8+ kHz, and a 16 kHz stream caps reproduction
+ * at 8 kHz — S-sounds arrive harsh and hissy no matter how clean the rest of
+ * the chain is (the reported permanent "sssss" bed). 24 kHz lifts the ceiling
+ * to 12 kHz audibly. 44.1 kHz PCM is documented as Pro-tier-only and would
+ * 402-fail free installs, so it is not requested; if the tier ever rejects
+ * 24 kHz too, the client falls back to pcm_16000 on a 422 (see tts-client).
+ */
+export const TTS_OUTPUT_FORMAT: string = "pcm_24000"; // 24 kHz mono PCM for streaming playback
+/** Playback (and only playback) runs at the wire rate — the mic stays 16 kHz. */
+export const PLAYBACK_SAMPLE_RATE_HZ = 24000;
 
 /**
  * Default narration voice — a PREMADE voice, deliberately.
@@ -327,6 +363,6 @@ export const MIC_FALLBACK_CONSTRAINTS: MediaStreamConstraints = { audio: true };
 export function ttsRequestBody(text: string): Record<string, unknown> {
   return {
     text,
-    model_id: TTS_MODEL_FLASH,
+    model_id: TTS_MODEL_DEFAULT,
   };
 }

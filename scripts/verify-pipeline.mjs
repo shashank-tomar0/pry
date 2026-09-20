@@ -1754,6 +1754,7 @@ const {
   bytesToBase64,
   ttsRequestBody,
   TTS_OUTPUT_FORMAT,
+  PLAYBACK_SAMPLE_RATE_HZ,
   classifyMicFailure,
   micFailureAdvice,
   MIC_AUDIO_CONSTRAINTS,
@@ -1892,10 +1893,10 @@ ok("bytesToBase64 round-trip",
 
 // TTS request body shape.
 const body = ttsRequestBody("hello");
-ok("ttsRequestBody uses Flash v2.5 and forwards text",
-  body.model_id === "eleven_flash_v2_5" && body.text === "hello");
-ok("TTS output format is PCM16 (matches AudioContext default)",
-  TTS_OUTPUT_FORMAT === "pcm_16000");
+ok("ttsRequestBody uses Turbo v2.5 (quality tier, not the breathy Flash) and forwards text",
+  body.model_id === "eleven_turbo_v2_5" && body.text === "hello");
+ok("TTS output format is 24 kHz PCM (sibilants need the headroom; playback ctx matches)",
+  TTS_OUTPUT_FORMAT === "pcm_24000" && PLAYBACK_SAMPLE_RATE_HZ === 24000);
 
 // ─── Scenario Z: Scribe client wire shapes (pure functions only) ─────────────
 console.log("\n=== Scenario Z: Scribe client URL + token auth ===\n");
@@ -5006,6 +5007,8 @@ ok("and the replayed block says it is not the current task",
 const { pageSignature, STAGNATION_STEPS, STAGNATION_DIRECTIVE } = await import("../src/background/agent.ts");
 ok("the legend scope covers the opening page read, not just the task",
   /tokenizedTask\.includes\(e\.token\) \|\| openingPageRead\.includes\(e\.token\)/.test(agentHistorySource));
+ok("and the agent hands the legend which tokens the task owns",
+  /tokenizer\.getEntries\(\)\.filter\(\(e\) => tokenizedTask\.includes\(e\.token\)\)\.map\(\(e\) => e\.token\)/.test(agentHistorySource));
 ok("page signatures are stable for the same page",
   pageSignature("https://mail.google.com/mail/u/0/#inbox", 30, "Inbox Compose") ===
   pageSignature("https://mail.google.com/mail/u/0/#inbox", 30, "Inbox Compose"));
@@ -5280,6 +5283,18 @@ ok("and neither sample recovers its account",
   typeof twoLegend === "string" &&
   !twoLegend.includes("shashank.tomar.work") && !twoLegend.includes("shashanktomar911"),
   twoLegend ?? "(null)");
+// Provenance: a task token is an instruction parameter, a page-seen token is
+// data. A later run addressed a Gmail to a YouTube channel name vaulted two
+// pages earlier because nothing marked which token the task owned — the
+// legend now states it per line, and the agent passes the task's token set.
+const provLegend = buildTokenLegend(twoCreds.getEntries(), 8, ["<CRED_1>"]);
+const provLines = (provLegend ?? "").split("\n");
+ok("task tokens are marked as the request's own parameters",
+  provLines.some((l) => l.includes("<CRED_1>") && l.includes("from your task") && l.includes("sh•••@gmail.com")),
+  provLegend ?? "(null)");
+ok("page-seen tokens are marked as data, never to reuse",
+  provLines.some((l) => l.includes("<CRED_2>") && l.includes("seen on the page")),
+  provLegend ?? "(null)");
 ok("for a task with no tokens the legend is absent rather than empty",
   (() => {
     const t = new PIITokenizer();

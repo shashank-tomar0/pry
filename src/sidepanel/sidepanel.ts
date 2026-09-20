@@ -77,6 +77,18 @@ async function bootstrapVoice(): Promise<void> {
       onError: (msg) => {
         emitLocalStatus(msg);
       },
+      onStats: (stats) => {
+        // Stream-health evidence, shown only when the ear heard gaps: clean
+        // speech stays quiet, while a starving stream names itself (gap count
+        // and longest silence) instead of sounding like a bad microphone.
+        // This is the line to paste into a voice-quality bug report.
+        if (stats.gaps > 0) {
+          emitLocalStatus(
+            `spoken reply had ${stats.gaps} audio gap(s), longest ${stats.gapMsMax}ms ` +
+              `across ${stats.chunks} chunk(s) — the stream delivered slower than realtime.`,
+          );
+        }
+      },
     },
   });
 

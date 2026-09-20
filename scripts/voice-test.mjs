@@ -229,7 +229,7 @@ const bundle = await build({
 const mod = await import(
   `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString("base64")}`
 );
-const { MIC_READY_ANNOUNCEMENT, micToggleAction, VoiceController, mergeFloat32Arrays, MIN_SPEECH_CHUNK_SAMPLES } = mod;
+const { MIC_READY_ANNOUNCEMENT, micToggleAction, VoiceController, mergeFloat32Arrays, drainAligned, MIN_SPEECH_CHUNK_SAMPLES, PREBUFFER_SAMPLES, PLAYBACK_SAMPLE_RATE_HZ, TTS_OUTPUT_FORMAT, audioGapMs, AUDIO_GAP_FLOOR_MS } = mod;
 
 /** A controller wired to collectors, so one tap's effects are all inspectable. */
 function makeHarness() {
@@ -539,11 +539,31 @@ await monitor.controller.stopListening();
 // to a 0.25 s floor and flushes the remainder at stream end.
 console.log("\n=== Speech playback floors network-sized reads ===\n");
 
-ok("the speech floor is a quarter second at 16 kHz", MIN_SPEECH_CHUNK_SAMPLES === 4000);
+ok("the speech floor is a quarter second at the playback rate",
+  PLAYBACK_SAMPLE_RATE_HZ === 24000 && MIN_SPEECH_CHUNK_SAMPLES === 6000);
+ok("and the opening prebuffer is three floors (0.75 s)",
+  PREBUFFER_SAMPLES === 18000 && PREBUFFER_SAMPLES > MIN_SPEECH_CHUNK_SAMPLES);
+ok("and the wire asks for 24 kHz PCM, not telephone-grade",
+  TTS_OUTPUT_FORMAT === "pcm_24000");
 ok("merge preserves order across uneven parts",
   (() => {
     const merged = mergeFloat32Arrays([new Float32Array([1, 2]), new Float32Array([]), new Float32Array([3])]);
     return merged.length === 3 && merged[0] === 1 && merged[1] === 2 && merged[2] === 3;
+  })());
+ok("even reads split cleanly with no tail",
+  (() => {
+    const { aligned, rest } = drainAligned(new Uint8Array([1, 2, 3, 4]));
+    return aligned.length === 4 && rest.length === 0;
+  })());
+ok("an odd read keeps its dangling byte instead of dropping a sample",
+  (() => {
+    const { aligned, rest } = drainAligned(new Uint8Array([1, 2, 3, 4, 5]));
+    return aligned.length === 4 && rest.length === 1 && rest[0] === 5;
+  })());
+ok("a lone byte waits rather than decoding half a sample",
+  (() => {
+    const { aligned, rest } = drainAligned(new Uint8Array([9]));
+    return aligned.length === 0 && rest.length === 1;
   })());
 
 let scheduledBuffers = 0;
@@ -557,17 +577,44 @@ const bufsBefore = scheduledBuffers;
 tts.controller.queueSpeechChunk(new Float32Array(100));
 ok("a short read schedules nothing on its own", scheduledBuffers === bufsBefore);
 tts.controller.queueSpeechChunk(new Float32Array(3900));
-ok("crossing the floor schedules exactly one merged buffer", scheduledBuffers === bufsBefore + 1);
+tts.controller.queueSpeechChunk(new Float32Array(8000));
+ok("even past the old floor, the opening prebuffer holds", scheduledBuffers === bufsBefore);
+tts.controller.queueSpeechChunk(new Float32Array(6000));
+ok("hitting the prebuffer schedules exactly one merged buffer", scheduledBuffers === bufsBefore + 1);
 tts.controller.queueSpeechChunk(new Float32Array(100));
-ok("the next short read waits again", scheduledBuffers === bufsBefore + 1);
+ok("after starting, short reads wait for the speaking floor again", scheduledBuffers === bufsBefore + 1);
+tts.controller.queueSpeechChunk(new Float32Array(5900));
+ok("and the floor still schedules exactly one merged buffer", scheduledBuffers === bufsBefore + 2);
+tts.controller.queueSpeechChunk(new Float32Array(100));
 tts.controller.queueSpeechChunk(new Float32Array(0), true);
-ok("stream end flushes the remainder instead of dropping it", scheduledBuffers === bufsBefore + 2);
+ok("stream end flushes the remainder instead of dropping it", scheduledBuffers === bufsBefore + 3);
 tts.controller.queueSpeechChunk(new Float32Array(100));
 tts.controller.stopSpeaking();
-tts.controller.queueSpeechChunk(new Float32Array(3900));
+tts.controller.queueSpeechChunk(new Float32Array(17900));
 ok("stopping drops the queue — no utterance leaks into the next",
-  scheduledBuffers === bufsBefore + 2);
+  scheduledBuffers === bufsBefore + 3);
 FakeAudioContext.prototype.createBuffer = realCreateBuffer;
+
+// ─── 8. Playback gaps are measured, not guessed ─────────────────────────────
+// "First words clean, then choppy" is a starving stream: buffers scheduled
+// later than the previous one ends. The detector counts only real gaps —
+// startup latency (no predecessor) and sub-50 ms scheduling jitter are not
+// starvation and must not report.
+console.log("\n=== Audio underruns are measured at schedule time ===\n");
+
+ok("continuous scheduling measures no gap", audioGapMs(1.0, 1.0) === 0);
+ok("a first schedule has no predecessor to gap against", audioGapMs(0, 3.2) === 0);
+ok("sub-floor slips are jitter, not starvation",
+  audioGapMs(1.0, 1.0 + (AUDIO_GAP_FLOOR_MS - 1) / 1000) === 0);
+ok("a real stall reports its milliseconds",
+  audioGapMs(1.0, 1.4) === 400 && audioGapMs(2.0, 2.251) === 251);
+const controllerSource = await readFile("src/sidepanel/voice-controller.ts", "utf8");
+ok("gap stats ride the utterances completion callback",
+  /onStats\?: \(stats: SpeechStats\)/.test(controllerSource) &&
+  /this\.callbacks\.onStats\?\.\(\{/.test(controllerSource));
+const ttsSource = await readFile("src/sidepanel/tts-client.ts", "utf8");
+ok("a tier-rejected hi-fi stream falls back to 16 kHz instead of failing voiceless",
+  /res\.status === 422/.test(ttsSource) && /"pcm_16000"/.test(ttsSource));
 
 console.log(`\nvoice-test: ${passed} assertion(s) passed.\n`);
 assert.ok(passed > 0);

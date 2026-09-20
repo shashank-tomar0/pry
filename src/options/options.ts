@@ -360,8 +360,18 @@ $("close").addEventListener("click", () => window.close());
 
 // ─── Initialize ────────────────────────────────────────────────────────────
 
+declare const PRY_BUILD_ID: string;
+
 void (async () => {
   const stored = await chrome.storage.local.get("settings");
   settings = normaliseSettings(stored.settings);
   renderAll();
+  const buildEl = document.getElementById("build-id");
+  if (buildEl) {
+    try {
+      buildEl.textContent = typeof PRY_BUILD_ID !== "undefined" ? PRY_BUILD_ID : "dev (watch)";
+    } catch {
+      buildEl.textContent = "dev (watch)";
+    }
+  }
 })();

@@ -13,7 +13,7 @@
  * "redacted" before any bytes leave the device.
  */
 
-import { DEFAULT_TTS_VOICE_ID, pcm16ToFloat32, TTS_OUTPUT_FORMAT, ttsRequestBody } from "./voice-core";
+import { DEFAULT_TTS_VOICE_ID, drainAligned, pcm16ToFloat32, TTS_OUTPUT_FORMAT, ttsRequestBody } from "./voice-core";
 
 const TTS_STREAM_URL = (voiceId: string) =>
   `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}/stream`;
@@ -36,18 +36,46 @@ export async function streamTts(
   if (!text.trim()) return;
 
   const url = new URL(TTS_STREAM_URL(voiceId));
-  url.searchParams.set("output_format", TTS_OUTPUT_FORMAT);
 
-  const res = await fetch(url.toString(), {
-    method: "POST",
-    headers: {
-      "xi-api-key": apiKey,
-      "content-type": "application/json",
-      accept: "audio/pcm",
-    },
-    body: JSON.stringify(ttsRequestBody(text)),
-    signal,
-  });
+  // The hi-fi format is requested first; a 422 (validation) means the tier
+  // rejected it — documented for 44.1 kHz PCM on non-Pro plans, possible for
+  // anything above 16 kHz later — and the run falls back to telephone-grade
+  // rather than failing voiceless. Only 422 retries: 401/402/4xx name the
+  // real problem (key, voice, quota) and must surface, not loop.
+  const formats: string[] =
+    TTS_OUTPUT_FORMAT === "pcm_16000" ? ["pcm_16000"] : [TTS_OUTPUT_FORMAT, "pcm_16000"];
+  let res: Response | null = null;
+  let downgraded = false;
+  for (const format of formats) {
+    url.searchParams.set("output_format", format);
+    res = await fetch(url.toString(), {
+      method: "POST",
+      headers: {
+        "xi-api-key": apiKey,
+        "content-type": "application/json",
+        accept: "audio/pcm",
+      },
+      body: JSON.stringify(ttsRequestBody(text)),
+      signal,
+    });
+    if (res.status === 422 && !downgraded) {
+      downgraded = true;
+      await res.text().catch(() => "");
+      continue;
+    }
+    break;
+  }
+  if (!res) {
+    callbacks.onError?.("ElevenLabs TTS returned no response.");
+    return;
+  }
+  if (downgraded) {
+    // Said once per utterance would spam; the panel surfaces errors, and a
+    // downgrade is worth one line so "why does it sound thin" is answerable.
+    callbacks.onError?.(
+      "ElevenLabs rejected the 24 kHz stream for this plan — playing telephone-grade 16 kHz instead.",
+    );
+  }
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     // 402 is the one users will actually hit: ElevenLabs' free plan rejects
@@ -77,15 +105,17 @@ export async function streamTts(
   }
 
   const reader = res.body.getReader();
-  let leftover = new Uint8Array();
+  let leftover: Uint8Array = new Uint8Array();
   // Flush whatever's in the buffer (PCM16 samples must be 2-byte aligned).
+  // The tail byte of an odd-length read is CARRIED, not dropped: it is the
+  // first half of the next sample, and dropping it deletes a sample per odd
+  // read (an audible tick each time). drainAligned splits head from tail so
+  // the bookkeeping cannot drift again.
   const flush = (): void => {
-    let buf = leftover;
-    const alignedLen = buf.length - (buf.length % 2);
-    if (alignedLen < 2) return;
-    if (alignedLen !== buf.length) buf = buf.subarray(0, alignedLen);
-    callbacks.onChunk?.(pcm16ToFloat32(buf));
-    leftover = buf.subarray(alignedLen);
+    const { aligned, rest } = drainAligned(leftover);
+    if (aligned.length < 2) return;
+    callbacks.onChunk?.(pcm16ToFloat32(aligned));
+    leftover = rest;
   };
 
   while (true) {

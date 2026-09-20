@@ -1360,10 +1360,17 @@ export async function runTask(
       // It used to be built from the entries THIS pass created, which is
       // structurally empty (the worker already tokenized the task), so the
       // legend the prompt promised the planner was silently blank.
+      //
+      // Provenance rides on every line: task tokens are instruction
+      // parameters, page-seen tokens are data. A later run addressed a Gmail
+      // to a YouTube channel name vaulted two pages earlier — same vault,
+      // both live — because nothing marked which token the task owned.
       buildTokenLegend(
         tokenizer.getEntries().filter((e) =>
           tokenizedTask.includes(e.token) || openingPageRead.includes(e.token),
         ),
+        8,
+        tokenizer.getEntries().filter((e) => tokenizedTask.includes(e.token)).map((e) => e.token),
       ),
     );
 

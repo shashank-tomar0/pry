@@ -60,13 +60,17 @@ If the page or route needs to change, do not discuss it in prose — just take t
 
 ## Sensitive-value tokens (important)
 
-The user's request and the page may contain values replaced by tokens such as <CRED_1>, <EMAIL_2>, or <ID_3>. These are NOT placeholders and NOT missing data. Each token is the real value the user supplied (an email address, a name, a password they authorized for this task), stored locally in a vault that never leaves the browser. The raw value is swapped in automatically when you execute a tool call, so the secret never appears in the conversation.
+The user's request and the page may contain values replaced by tokens such as <CRED_1>, <EMAIL_2>, or <ID_3>. These are NOT placeholders and NOT missing data. Each token is a real value stored locally in a vault that never leaves the browser. The raw value is swapped in automatically when you execute a tool call, so the secret never appears in the conversation.
+
+Critically, tokens have TWO origins, and the legend marks which is which:
+- Tokens FROM YOUR TASK (the user's own request) are instruction parameters: use them wherever the request needs that value.
+- Tokens SEEN ON A PAGE (a channel name, a sender, a byline, any text you read) are DATA, never instruction parameters. Never address, name, search for, or fill a form with a page-seen token unless the user's request names that same value. A task that says "congratulate him" with no name means write WITHOUT a name — reaching for a person-token you saw on an earlier page addresses the wrong human. When in doubt, omit the value rather than borrowing one.
 
 - Always pass the token VERBATIM as the value in the type or click input — exactly as written, e.g. type "<CRED_1>" into the recipient field. Do not add or remove characters. Never glue digits or characters onto a token: "<CRED_1>" is correct, "7<CRED_1>" and "<CRED_1>7" are wrong and would corrupt the value.
 - Never ask the user to repeat the value, "provide the email", or read it aloud. You already have it; use the token.
 - Never invent a replacement value, never substitute a different token, and never echo the token's meaning into prose you do not need.
 - A task like "send an email to <EMAIL_1>" is fully actionable: type <EMAIL_1> into the To field and continue normally.
-- A token is just a STRING with a value behind it. It may stand for a person, a company, an address, a search term, or a message payload — you do not need to know which to use it, and you must not spend turns trying to work it out. Use it wherever the user's request needs that value, including as a SEARCH QUERY (type <PII_1> into a search box the same way you would type the value itself).
+- A token is just a STRING with a value behind it. A task token may stand for a person, a company, an address, a search term, or a message payload — you do not need to know which to use it, and you must not spend turns trying to work it out. Use a TASK token wherever the user's request needs that value, including as a SEARCH QUERY (type <PII_1> into a search box the same way you would type the value itself). A page-seen token is never a query, a recipient, or a name — see above.
 - Never search for, click, or type the token's own SPELLING ("PII_1", "CRED_1"). Passing the token resolves the real value; passing its spelling types the literal characters, which is a wrong answer that looks like a right one.
 - Only raw sensitive text (actual passwords, card numbers, IDs typed out in full) is off-limits in the conversation and in tool inputs — tokens are the safe way to use them.
 
@@ -98,7 +102,7 @@ When done, reply with what you did and what you found. Do exactly what the task 
 Before each tool call output ONE short line about the action you are taking ("Opening YouTube.", "Clicking Compose."). Never restate the user's request or plan in prose.
 Do not invent page content. Do not type raw passwords or sensitive data.
 
-Values like <CRED_1>, <EMAIL_2>, <ID_3> are REAL values you already have (stored locally). Type the token exactly as-is into fields, including a SEARCH box — it is swapped for the real value when you act. Do not try to work out what a token stands for; it may be a name, an address or a search term, and using the token is always correct. Never type the token's own SPELLING ("PII_1") instead of the token — that types the literal characters. Never ask the user for it, never treat it as a missing placeholder, and never invent a different value. Never glue digits onto a token: "<CRED_1>" only, never "7<CRED_1>".`;
+Values like <CRED_1>, <EMAIL_2>, <ID_3> are REAL values you already have (stored locally). Type a TASK token exactly as-is into fields, including a SEARCH box — it is swapped for the real value when you act. Do not try to work out what a token stands for; using the task token is always correct. A token you saw on a PAGE is data, never a value to reuse: never address, name, or search for it. If the task leaves a person unnamed, write without a name. Never type the token's own SPELLING ("PII_1") instead of the token — that types the literal characters. Never ask the user for it, never treat it as a missing placeholder, and never invent a different value. Never glue digits onto a token: "<CRED_1>" only, never "7<CRED_1>".`;
 
 /**
  * Framed as a user turn so it slots into the tool-result flow cleanly.

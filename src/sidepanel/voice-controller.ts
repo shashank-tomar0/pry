@@ -24,6 +24,7 @@
 import {
   MIC_AUDIO_CONSTRAINTS,
   MIC_FALLBACK_CONSTRAINTS,
+  PLAYBACK_SAMPLE_RATE_HZ,
   classifyMicFailure,
   mergeFloat32Arrays,
   micFailureAdvice,
@@ -44,6 +45,15 @@ export interface VoiceControllerCallbacks {
   onFinal?: (text: string) => void;
   /** Called on STT or TTS errors so the UI can surface them. */
   onError?: (message: string) => void;
+  /**
+   * Called when a spoken utterance's stream ends, with its scheduling health.
+   * Gaps mean the network delivered slower than realtime and the ear heard
+   * silence between buffers — the measurable form of "good start, then
+   * choppy". The panel reports it only when nonzero, so clean speech stays
+   * quiet and a starving stream names itself instead of sounding like a bad
+   * microphone.
+   */
+  onStats?: (stats: SpeechStats) => void;
   /** Called when STT state changes (idle, listening, connecting, error). */
   onStateChange?: (state: "idle" | "connecting" | "listening" | "error") => void;
   /** Called when the Scribe WebSocket finishes opening. */
@@ -77,9 +87,48 @@ const MIC_CHUNK_FRAMES = 1600; // 100 ms at 16 kHz — keeps latency bounded.
  * read as a permanent crackle bed under the voice (the reported "background
  * noise every time"). Flooring at 0.25 s trades a quarter-second of start
  * latency for far fewer, longer buffers. Remainder flushes at stream end.
- * Exported so the harness pins the trade rather than a magic number.
+ * Derived from the playback rate (not a magic count) so a format change
+ * keeps the TIME trade. Exported so the harness pins it.
  */
-export const MIN_SPEECH_CHUNK_SAMPLES = 4000;
+export const MIN_SPEECH_CHUNK_SAMPLES = Math.floor(PLAYBACK_SAMPLE_RATE_HZ / 4);
+
+/**
+ * Speech buffered before the FIRST scheduled source of an utterance.
+ *
+ * The TTS stream arrives as an initial burst followed by a trickle, and the
+ * 0.25 s floor above starts playback off the burst — the first words sound
+ * clean, then the trickle cannot sustain realtime and every later floor
+ * underruns into gaps (the reported "first 2 words good, then bad mic-open
+ * voice"). Holding the first schedule until 0.75 s is banked trades a beat
+ * of start latency for a reservoir the trickle rarely empties; later floors
+ * stay at 0.25 s so steady speech adds no further delay. Stream end still
+ * flushes whatever remains. Rate-derived like the floor. Exported so the
+ * harness pins the trade.
+ */
+export const PREBUFFER_SAMPLES = Math.floor((PLAYBACK_SAMPLE_RATE_HZ * 3) / 4);
+
+/**
+ * A playback gap in milliseconds, or 0 when scheduling is continuous.
+ *
+ * Pure so the underrun detector is pinned without an AudioContext: when the
+ * next buffer starts later than the previous one ends, the ear heard
+ * silence — the stream trickled slower than realtime. Sub-50 ms slips are
+ * scheduling jitter, not starvation, and are not counted.
+ */
+export const AUDIO_GAP_FLOOR_MS = 50;
+export function audioGapMs(expectedEndSec: number, startSec: number): number {
+  if (!(expectedEndSec > 0)) return 0;
+  const gapMs = (startSec - expectedEndSec) * 1000;
+  return gapMs > AUDIO_GAP_FLOOR_MS ? Math.round(gapMs) : 0;
+}
+
+/** Stream-health summary for one spoken utterance (see onStats). */
+export interface SpeechStats {
+  gaps: number;
+  gapMsTotal: number;
+  gapMsMax: number;
+  chunks: number;
+}
 
 export class VoiceController {
   private scribe: ScribeConnection | null = null;
@@ -92,6 +141,13 @@ export class VoiceController {
   /** Unscheduled speech bytes, in arrival order — see MIN_SPEECH_CHUNK_SAMPLES. */
   private speechQueue: Float32Array[] = [];
   private queuedSpeechSamples = 0;
+  /** True once this utterance has started scheduling (prebuffer spent). */
+  private playbackStarted = false;
+  /** Scheduling health for the current utterance (see onStats). */
+  private speechGaps = 0;
+  private speechGapMsTotal = 0;
+  private speechGapMsMax = 0;
+  private speechChunks = 0;
   private ttsAbort: AbortController | null = null;
   private cancelListening = false;
   private state: "idle" | "connecting" | "listening" | "error" = "idle";
@@ -374,7 +430,10 @@ export class VoiceController {
     if (!this.playbackAudioCtx || this.playbackAudioCtx.state === "closed") {
       const Ctor = (window.AudioContext || (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext) as typeof AudioContext | undefined;
       if (!Ctor) return null;
-      this.playbackAudioCtx = new Ctor({ sampleRate: SCRIBE_SAMPLE_RATE_HZ });
+      // Playback runs at the WIRE rate (24 kHz), not the mic rate (16 kHz):
+      // scheduling 24 kHz samples on a 16 kHz clock plays everything slow
+      // and low. The mic context elsewhere in this file stays 16 kHz for Scribe.
+      this.playbackAudioCtx = new Ctor({ sampleRate: PLAYBACK_SAMPLE_RATE_HZ });
       this.playbackGain = this.playbackAudioCtx.createGain();
       this.playbackGain.gain.value = 1.0;
       this.playbackGain.connect(this.playbackAudioCtx.destination);
@@ -394,27 +453,42 @@ export class VoiceController {
     source.buffer = buffer;
     source.connect(this.playbackGain);
     const now = ctx.currentTime;
+    // Gaps measure only BETWEEN scheduled buffers: the first schedule has no
+    // predecessor, and startup latency (network time before any audio) is not
+    // starvation. speechChunks>0 exactly marks "a buffer ends at expected".
+    const expected = this.speechChunks > 0 ? this.nextPlaybackTime : 0;
     const start = Math.max(now, this.nextPlaybackTime);
+    const gap = audioGapMs(expected, start);
+    if (gap > 0) {
+      this.speechGaps++;
+      this.speechGapMsTotal += gap;
+      this.speechGapMsMax = Math.max(this.speechGapMsMax, gap);
+    }
     source.start(start);
     this.nextPlaybackTime = start + buffer.duration;
+    this.speechChunks++;
   }
 
   /**
    * Queue streamed speech, scheduling only whole floors of it. Short reads
    * accumulate instead of each becoming a click-prone sliver of a buffer;
-   * `force` (stream end) flushes whatever remains, even a stub.
+   * `force` (stream end) flushes whatever remains, even a stub. The first
+   * schedule of an utterance waits for the deeper prebuffer (see
+   * PREBUFFER_SAMPLES); everything after it uses the speaking floor.
    */
   private queueSpeechChunk(samples: Float32Array, force = false): void {
     if (samples.length > 0) {
       this.speechQueue.push(samples);
       this.queuedSpeechSamples += samples.length;
     }
-    if (!force && this.queuedSpeechSamples < MIN_SPEECH_CHUNK_SAMPLES) return;
+    const floor = this.playbackStarted ? MIN_SPEECH_CHUNK_SAMPLES : PREBUFFER_SAMPLES;
+    if (!force && this.queuedSpeechSamples < floor) return;
     if (this.queuedSpeechSamples === 0) return;
     const merged = mergeFloat32Arrays(this.speechQueue);
     this.speechQueue = [];
     this.queuedSpeechSamples = 0;
     this.playAudioChunk(merged);
+    this.playbackStarted = true;
   }
 
   /** Stop any active or queued TTS speech immediately. */
@@ -427,6 +501,11 @@ export class VoiceController {
     // utterance it belonged to, or stopping one answer leaks into the next.
     this.speechQueue = [];
     this.queuedSpeechSamples = 0;
+    this.playbackStarted = false;
+    this.speechGaps = 0;
+    this.speechGapMsTotal = 0;
+    this.speechGapMsMax = 0;
+    this.speechChunks = 0;
     if (this.playbackGain && this.playbackAudioCtx) {
       try {
         this.playbackGain.disconnect();
@@ -509,6 +588,18 @@ export class VoiceController {
       if (this.ttsAbort === abort) {
         this.ttsAbort = null;
       }
+    }
+    // Stream-health report: what scheduling observed, up to stream end
+    // (already-scheduled buffers may still be playing — the stats describe
+    // delivery, which is where starvation lives). Skipped for aborted
+    // utterances: a cancelled stream's gaps are the cancellation, not news.
+    if (!abort.signal.aborted) {
+      this.callbacks.onStats?.({
+        gaps: this.speechGaps,
+        gapMsTotal: this.speechGapMsTotal,
+        gapMsMax: this.speechGapMsMax,
+        chunks: this.speechChunks,
+      });
     }
   }
 

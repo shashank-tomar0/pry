@@ -440,6 +440,12 @@ const GLYPHS: Record<string, string> = {
 function render(entry: TranscriptEntry): void {
   emptyEl.classList.add("hidden");
   const stick = atBottom();
+  // Auto-scroll follows NEW cards only, never live patches: a reasoning turn
+  // patches its card every ~60 ms, and yanking on each one welds the user to
+  // the bottom — scrolling up mid-stream (or through the completion burst)
+  // fights the panel and reads as "stuck". New cards still pull a bottomed
+  // view along; patches only repaint in place.
+  const isNew = !nodes.has(entry.id);
 
   let node = nodes.get(entry.id);
   if (!node) {
@@ -559,7 +565,7 @@ function render(entry: TranscriptEntry): void {
     node.textContent = entry.text;
   }
 
-  if (stick) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  if (stick && isNew) transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
 function setRunning(running: boolean): void {
@@ -1016,7 +1022,12 @@ function buildShot(
   img.addEventListener("load", updateAspect);
   img.src = src;
   img.alt = label;
-  img.loading = "lazy";
+  // Eager, not lazy: lazy audit images decode WHEN SCROLLED TO, and each
+  // decode resizes its box to the natural ratio — the transcript jumps under
+  // the user's fingers exactly when they scroll the completed tail, which
+  // reads as a stuck scroll. Eager pays the decode during the completion
+  // burst instead, before anyone scrolls there.
+  img.loading = "eager";
   if (img.complete) updateAspect();
 
   const labelEl = document.createElement("div");

@@ -616,5 +616,24 @@ const ttsSource = await readFile("src/sidepanel/tts-client.ts", "utf8");
 ok("a tier-rejected hi-fi stream falls back to 16 kHz instead of failing voiceless",
   /res\.status === 422/.test(ttsSource) && /"pcm_16000"/.test(ttsSource));
 
+// ─── 9. Completed transcript stays scrollable ─────────────────────────────
+// Reported UX: scrolling the completed tail feels stuck. Two mechanisms:
+// (1) the renderer yanked to bottom on EVERY patch, so a 60 ms reasoning
+// stream welded the view down; (2) audit screenshots decoded lazily WHEN
+// SCROLLED TO, resizing boxes under the user's fingers. Auto-scroll now
+// follows new cards only; audit images decode eagerly in the burst.
+console.log("\n=== Completed transcript stays scrollable ===\n");
+
+ok(
+  "auto-scroll follows new cards, never live patches",
+  /const isNew = !nodes\.has\(entry\.id\);/.test(sidepanelSource) &&
+    /if \(stick && isNew\) transcriptEl\.scrollTop = transcriptEl\.scrollHeight;/.test(sidepanelSource),
+);
+ok(
+  "audit screenshots decode eagerly so boxes never resize under a scroll",
+  /img\.loading = "eager";/.test(sidepanelSource) &&
+    !/img\.loading = "lazy";/.test(sidepanelSource),
+);
+
 console.log(`\nvoice-test: ${passed} assertion(s) passed.\n`);
 assert.ok(passed > 0);

@@ -45,7 +45,13 @@ import { isAadhaarNumber, isCardNumber } from "../shared/checksums";
 // One email shape for both channels, built from the shared source rather than
 // re-typed: the two copies drifted once already, and the result was a value
 // tokenized for the model while staying readable pixels on screen.
-import { EMAIL_PATTERN_SOURCE } from "../shared/text-pii-patterns";
+import {
+  API_KEY_SOURCES,
+  CUE_NAME_RE,
+  EMAIL_PATTERN_SOURCE,
+  HONORIFIC_NAME_RE,
+  matchCuedSecrets,
+} from "../shared/text-pii-patterns";
 
 // ─── DOM-Based PII Detection ───────────────────────────────────────────────
 
@@ -64,16 +70,9 @@ const CREDENTIAL_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
   { pattern: /\bapi[-\s]?key\b/i, label: "API key field" },
 ];
 
-const API_KEY_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
-  { pattern: /^sk-ant-[a-zA-Z0-9_-]{20,}/, label: "Anthropic API key" },
-  { pattern: /^sk-[a-zA-Z0-9]{20,}/, label: "OpenAI API key" },
-  { pattern: /^ghp_[a-zA-Z0-9]{36}/, label: "GitHub personal access token" },
-  { pattern: /^gho_[a-zA-Z0-9]{36}/, label: "GitHub OAuth token" },
-  { pattern: /^ghs_[a-zA-Z0-9]{36}/, label: "GitHub server-to-server token" },
-  { pattern: /^xox[baprs]-[a-zA-Z0-9-]+/, label: "Slack token" },
-  { pattern: /^AKIA[0-9A-Z]{16}/, label: "AWS access key" },
-  { pattern: /^eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\./, label: "JWT token" },
-];
+const API_KEY_PATTERNS: Array<{ pattern: RegExp; label: string }> = API_KEY_SOURCES.map(
+  ({ source, label }) => ({ pattern: new RegExp(`^(?:${source})`), label }),
+);
 
 const INDIAN_ID_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
   // Aadhaar: 12 digits, may be grouped as XXXX XXXX XXXX
@@ -176,6 +175,12 @@ interface TextPattern {
   label: string;
   /** Validator: when present, hits that fail it become `rejected` candidates. */
   validate?: (match: string) => boolean;
+  /**
+   * Match group carrying the VALUE. The cue-name pattern matches "From: Jane
+   * Smith" but only group 1 ("Jane Smith") is PII — vaulting the whole match
+   * would eat the cue label everywhere it appears.
+   */
+  valueGroup?: number;
 }
 
 /**
@@ -202,19 +207,57 @@ export function detectTextPIIDetailed(text: string): {
       };
     }),
     ...INTERNATIONAL_ID_PATTERNS.map((p): TextPattern => ({ pattern: p.pattern, kind: "id_number", label: p.label })),
+    ...API_KEY_SOURCES.map(
+      ({ source, label }): TextPattern => ({
+        pattern: new RegExp(source, "g"),
+        kind: "api_key",
+        label,
+      }),
+    ),
+    // Regex-visible names: the NER model catches bare names, but honorific
+    // and cue-labelled names are deterministic — the pixel channel already
+    // paints them, so the text channel must tokenize them too.
+    {
+      pattern: new RegExp(HONORIFIC_NAME_RE.source, HONORIFIC_NAME_RE.flags),
+      kind: "pii_text",
+      label: "Person name",
+    },
+    {
+      pattern: new RegExp(CUE_NAME_RE.source, CUE_NAME_RE.flags),
+      kind: "pii_text",
+      label: "Person name",
+      valueGroup: 1,
+    },
+    // Bare card numbers (Luhn-checked like the pixel channel) and cue-word
+    // secrets (OTP, passwords): neither has a detector of its own, so page
+    // text carrying them reached the planner raw while pixels were painted.
+    {
+      pattern: /\b(?:\d{4}[\s-]?){3}\d{4}\b/g,
+      kind: "credential",
+      label: "Card number (Luhn valid)",
+      validate: (m) => isCardNumber(m),
+    },
     { pattern: EMAIL_PATTERN, kind: "credential", label: "Email address" },
     { pattern: PHONE_PATTERN, kind: "credential", label: "Phone number" },
   ];
 
-  for (const { pattern, kind, label, validate } of patterns) {
+  // Cued secrets report value spans (not whole matches), so they join below
+  // rather than through the pattern table.
+  for (const s of matchCuedSecrets(text)) {
+    detections.push({ kind: "credential", value: s.value, confidence: 0.9, label: s.label });
+  }
+
+  for (const { pattern, kind, label, validate, valueGroup } of patterns) {
     const globalRegex = pattern.global ? pattern : new RegExp(pattern.source, pattern.flags + "g");
     const matches = text.matchAll(globalRegex);
     for (const match of matches) {
       if (match.index === undefined) continue;
-      if (validate && !validate(match[0])) {
+      const hit = valueGroup !== undefined ? (match[valueGroup] ?? "") : match[0];
+      if (!hit) continue;
+      if (validate && !validate(hit)) {
         rejected.push({
           kind,
-          value: match[0],
+          value: hit,
           confidence: 0.15,
           label: `${label} lookalike (checksum failed)`,
         });
@@ -222,7 +265,7 @@ export function detectTextPIIDetailed(text: string): {
       }
       detections.push({
         kind,
-        value: match[0],
+        value: hit,
         confidence: kind === "credential" ? 0.9 : 0.7,
         label,
       });

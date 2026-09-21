@@ -225,9 +225,13 @@ function hasVisibleAssistantText(md: string): boolean {
 }
 
 /** Speak assistant text once a final answer arrives, gated on settings. */
-async function maybeSpeak(text: string): Promise<void> {
+async function maybeSpeak(text: string, stillCurrent?: () => boolean): Promise<void> {
   if (!voice) return;
   const settings = (await send({ kind: "get-state" })) as { settings?: import("../shared/types").Settings } | undefined;
+  // The settings fetch above is async: a Stop or NEW pressed while it was in
+  // flight must not produce speech for a transcript that no longer shows the
+  // card — heard audio with no visible answer reads as a haunted panel.
+  if (stillCurrent && !stillCurrent()) return;
   if (!settings?.settings?.elevenlabs?.ttsEnabled) return;
   await voice.speak(text);
 }
@@ -248,6 +252,17 @@ const rawTexts = new Map<string, string>();
 let pendingConfirmId: string | null = null;
 let perceptionCount = 0;
 let currentRunAssistantId: string | null = null;
+// Run-end answer accounting: the background guarantees every settled final
+// answer is emitted as an assistant entry (or an error entry), so a run that
+// ends WITH diagnostics but WITHOUT either card lost something between the
+// worker and this document — and must say so instead of showing a bare
+// diagnostics block under the user's question. Reset on every run start;
+// userStopped suppresses the fallback on runs the user killed themselves.
+let runSeq = 0;
+let runAssistantSeen = false;
+let runErrorSeen = false;
+let runDiagnosticsSeen = false;
+let userStoppedRun = false;
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -992,6 +1007,7 @@ const OVERLAY_COLORS: Record<string, string> = {
   id_text: "#ef4444",
   name_text: "#8b5cf6",
   ner_text: "#3b82f6",
+  api_key_text: "#f97316",
 };
 
 function overlayColor(kind: string): string {
@@ -1189,6 +1205,11 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
         // Never open a card that would render as an empty bubble.
         if (!hasVisibleAssistantText(event.entry.text)) break;
         currentRunAssistantId = event.entry.id;
+        runAssistantSeen = true;
+      } else if (event.entry.role === "error") {
+        runErrorSeen = true;
+      } else if (event.entry.role === "diagnostics") {
+        runDiagnosticsSeen = true;
       }
       render(event.entry);
       break;
@@ -1256,10 +1277,31 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
       setRunning(event.running);
       if (event.running) {
         currentRunAssistantId = null;
-      } else if (voice && currentRunAssistantId) {
-        const fullText = (rawTexts.get(currentRunAssistantId) ?? "").trim();
-        currentRunAssistantId = null;
-        if (fullText) void maybeSpeak(fullText);
+        runSeq++;
+        runAssistantSeen = false;
+        runErrorSeen = false;
+        runDiagnosticsSeen = false;
+        userStoppedRun = false;
+      } else {
+        if (voice && currentRunAssistantId) {
+          const speakSeq = runSeq;
+          const speakId = currentRunAssistantId;
+          const fullText = (rawTexts.get(speakId) ?? "").trim();
+          currentRunAssistantId = null;
+          if (fullText) void maybeSpeak(fullText, () => speakSeq === runSeq && rawTexts.has(speakId));
+        }
+        // The run is over and the books must balance: diagnostics means the
+        // loop completed at least one turn, and every completed run ends in an
+        // assistant card or an error card. Neither plus no user Stop means the
+        // answer was lost downstream (panel missed the worker's message) — a
+        // visible, reportable card instead of silence under the question.
+        if (runDiagnosticsSeen && !runAssistantSeen && !runErrorSeen && !userStoppedRun) {
+          render({
+            id: `answer-missing-${Date.now()}`,
+            role: "error",
+            text: "The run finished but no answer reached the panel — the planner's reply was lost between the background worker and this view, so there is nothing to show. This is a display bug, not a model failure: ask again (the run's diagnostics block below still holds the timings), and if it repeats, report it with those timings.",
+          });
+        }
       }
       break;
 
@@ -1786,6 +1828,8 @@ taskInput.addEventListener("input", () => {
 // Stop button
 stopBtn.addEventListener("click", () => {
   currentRunAssistantId = null;
+  userStoppedRun = true;
+  runSeq++;
   stopMicBadge();
   voice?.cancel();
   void send({ kind: "stop" });
@@ -1794,6 +1838,8 @@ stopBtn.addEventListener("click", () => {
 // New task
 $("new-task-btn").addEventListener("click", () => {
   currentRunAssistantId = null;
+  userStoppedRun = true;
+  runSeq++;
   stopMicBadge();
   voice?.cancel();
   void send({ kind: "reset" });

@@ -2058,6 +2058,118 @@ ok("match positions are exact and ordered",
   positioned.every((m) => m.start < m.end && m.end <= "email foo.bar@x.co here".length)
     && positioned[0].start === 6);
 
+// ── Provider-issued API keys are PII in BOTH channels ───────────────────────
+// Reported live: a Discord message reading `api_key = sk-or-v1-…`,
+// `OPENROUTER_API_KEY = sk-or-v1-…`, `GEMINI_API_KEY = AIza…` shipped with
+// every key fully readable in pixels AND quoted raw to the planner. No channel
+// knew sk-or-v1-, nvapi-, gsk_ or AIza at all (the old list stopped at
+// OpenAI/Anthropic/GitHub/Slack/AWS/JWT), and the free-text scan never checked
+// API keys in the first place — so nothing was vaulted, painted, or refused
+// to the speaker either.
+const { API_KEY_SOURCES } = await import("../src/shared/text-pii-patterns.ts");
+// Test keys are synthetic bodies joined at runtime: no contiguous key-shaped
+// string ever lands in a committed file (push protection scans blobs, not
+// runtime strings), and no real key material lives in the suite either.
+const ORK = ["sk-or-v1-", "f".repeat(64)].join("");
+const NVK = ["nvapi-", "X".repeat(69)].join("");
+const GZK = ["AIza", "Q".repeat(37)].join("");
+const KEY_SAMPLES = [
+  [`api_key = ${ORK}`, ORK, "OpenRouter API key"],
+  [`OPENROUTER_API_KEY = ${ORK}`, ORK, "OpenRouter API key"],
+  [NVK, NVK, "NVIDIA API key"],
+  [`GEMINI_API_KEY = ${GZK}`, GZK, "Google API key"],
+  ["key is gsk_abcDEF1234567890abcdef", "gsk_abcDEF1234567890abcdef", "Groq API key"],
+];
+for (const [text, value, label] of KEY_SAMPLES) {
+  const hits = matchPiiInText(text);
+  ok(`pixel matcher finds ${label} as api_key`,
+    hits.some((m) => m.kind === "api_key" && m.value === value && m.label === label),
+    JSON.stringify(hits.map((m) => [m.kind, m.label, m.value?.slice(0, 20)])));
+}
+ok("the DOM/text channel agrees on a vendor-prefixed key label in free text",
+  detectAllPIIDetailed({ elements: [], text: `OPENROUTER_API_KEY = ${ORK}` })
+    .detections.some((d) => d.kind === "api_key" && d.value === ORK));
+ok("and the DOM channel builds its key matcher from the shared source instead of re-typing it",
+  /API_KEY_SOURCES/.test(piiDetectorSource) && !/ghp_\[a-zA-Z0-9\]\{36\}/.test(piiDetectorSource));
+tokenizer.clear();
+const keyedTask = tokenizer.tokenizeTask(`send OPENROUTER_API_KEY = ${ORK} to him`);
+ok("a key in task-shaped text is vaulted, never left raw",
+  keyedTask.tokenCount >= 1 && !keyedTask.task.includes(ORK) && /<KEY_\d+>/.test(keyedTask.task),
+  JSON.stringify(keyedTask.task.slice(0, 120)));
+tokenizer.clear();
+const { tokenKindForTextMatch: keyTokenKind } = await import("../src/background/tokenizer.ts");
+ok("shared-matcher api_key hits vault as KEY tokens, not ID or CRED",
+  keyTokenKind("api_key", "OpenRouter API key") === "api_key");
+const { sanitizeTextPII: sanitizeKeyText } = await import("../src/background/agent.ts");
+tokenizer.clear();
+const keyedPage = sanitizeKeyText(`OPENROUTER_API_KEY = ${ORK}`);
+ok("page text carrying a key sanitizes to a KEY token the speaker says as redacted",
+  /<KEY_\d+>/.test(keyedPage) && !keyedPage.includes(ORK),
+  keyedPage.slice(0, 120));
+tokenizer.clear();
+const { SPAN_TEXT_KINDS } = await import("../src/shared/region-paint.ts");
+ok("the painter's span vocabulary covers key text (opaque tier via the _text rule)",
+  SPAN_TEXT_KINDS.includes("api_key_text"));
+ok("short lookalikes never vault (sk- needs length, keyboard is not a cue)",
+  !matchPiiInText("my sk-abc is short").some((m) => m.kind === "api_key") &&
+  (() => {
+    tokenizer.clear();
+    const r = tokenizer.tokenizeTask("type keyboard = qwerty now");
+    const clean = !/<KEY_\d+>/.test(r.task) && /keyboard = qwerty/.test(r.task);
+    tokenizer.clear();
+    return clean;
+  })(),
+  "keyboard must survive tokenizing untouched");
+// ── Every PII class is masked AND tokenized, in BOTH channels ─────────────
+// Measured audit (2026-09): cue-word secrets (OTP, passwords) and bare card
+// numbers reached the planner raw from page text while pixels were painted
+// (or vice versa) — the task pass knew cues the page pass never saw, and the
+// page pass never Luhn-checked. Regex-visible names were pixel-only. Matrix:
+// name/email/phone/aadhaar/pan/api-key/otp/password/card × pixel+detect+vault.
+const keyedDet = (text) =>
+  detectAllPIIDetailed({ elements: [], text }).detections;
+ok("honorific and cue-labelled names tokenize in page text, as pixels paint them",
+  keyedDet("see Mr. Ramesh Gupta ok").some((d) => d.kind === "pii_text" && d.value === "Mr. Ramesh Gupta") &&
+  keyedDet("see From: Anita Desai ok").some((d) => d.kind === "pii_text" && d.value === "Anita Desai") &&
+  !keyedDet("see From: Anita Desai ok").some((d) => (d.value ?? "").startsWith("From:")));
+ok("the cue shape stops at the name: trailing lowercase prose is not vaulted with it",
+  !keyedDet("see From: Anita Desai ok").some((d) => (d.value ?? "").includes(" ok")) &&
+  keyedDet("see from: anita desai ok").every((d) => d.kind !== "pii_text"));
+const otpHits = matchPiiInText("Your OTP is 482916");
+ok("an OTP is painted on screen, not just vaulted from tasks",
+  otpHits.some((m) => m.kind === "credential" && m.value === "482916" && m.label === "OTP code")),
+  JSON.stringify(otpHits);
+ok("and detected in page text",
+  keyedDet("see Your OTP is 482916 ok").some((d) => d.kind === "credential" && d.value === "482916"));
+const pwdHits = matchPiiInText("password = hunter2x");
+ok("a cued password is painted on screen",
+  pwdHits.some((m) => m.kind === "credential" && m.value === "hunter2x")),
+  JSON.stringify(pwdHits);
+tokenizer.clear();
+const pwdPage = sanitizeKeyText("see password = hunter2x ok");
+ok("and page text carrying one sanitizes to a CRED token",
+  /<CRED_\d+>/.test(pwdPage) && !/hunter2x/.test(pwdPage), pwdPage.slice(0, 120));
+tokenizer.clear();
+ok("a bare card number is detected in page text when Luhn agrees",
+  keyedDet("see card 4111 1111 1111 1111 ok").some((d) => d.kind === "credential" && /Luhn/.test(d.label)));
+ok("and a Luhn-invalid lookalike is rejected, not detected",
+  !keyedDet("see card 4111 1111 1111 1112 ok").some((d) => /Card number/.test(d.label)));
+tokenizer.clear();
+const mgrTask = tokenizer.tokenizeTask("open the password manager");
+ok("cue-adjacent prose never vaults (password manager, configuration)",
+  mgrTask.tokenCount === 0 && mgrTask.task === "open the password manager",
+  JSON.stringify(mgrTask.task));
+tokenizer.clear();
+const cfgTask = tokenizer.tokenizeTask("the key is configuration");
+ok("a non-secret after a weak separator survives",
+  cfgTask.tokenCount === 0, JSON.stringify(cfgTask.task));
+tokenizer.clear();
+ok("a bare digit run with no cue is not a secret anywhere",
+  matchPiiInText("order 123456").length === 0 &&
+  keyedDet("see order 123456 ok").length === 0);
+const { piiKindFromOcrLabel: ocrKind } = await import("../src/background/reocr-verification.ts");
+ok("OCR labels for the new classes map back to credential, not pii_text",
+  ocrKind("OTP code in image") === "credential" && ocrKind("Secret value in image") === "credential");
 // ─── Scenario AB: wire log — the runtime leak re-scan ──────────────────────
 console.log("\n=== Scenario AB: wire log records and runtime leak scan ===\n");
 

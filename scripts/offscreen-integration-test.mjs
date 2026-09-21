@@ -384,7 +384,7 @@ function makePage(width, height, glyphs) {
 const KNOWN_AUDIT_KINDS = new Set([
   "face", "credential", "id_number", "api_key", "pii_text", "input_field",
   "image_text", "password", "credit_card", "otp", "pan_card", "cvv",
-  "email_text", "phone_text", "id_text", "name_text", "ner_text",
+  "email_text", "phone_text", "id_text", "name_text", "ner_text", "api_key_text", "credential_text",
 ]);
 
 const PAGE_WIDTH = 200;

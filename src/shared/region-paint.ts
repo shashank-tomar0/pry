@@ -138,6 +138,8 @@ export const SPAN_TEXT_KINDS: readonly string[] = [
   "phone_text",
   "id_text",
   "name_text",
+  "api_key_text",
+  "credential_text",
   "ner_text",
   "image_text",
 ];

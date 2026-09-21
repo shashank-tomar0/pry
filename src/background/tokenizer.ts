@@ -13,7 +13,7 @@
  */
 
 import type { DetectedPII } from "./pii-detector";
-import { matchPiiInText } from "../shared/text-pii-patterns";
+import { matchCuedSecrets, matchPiiInText } from "../shared/text-pii-patterns";
 import { isAadhaarNumber, isCardNumber } from "../shared/checksums";
 
 /**
@@ -27,27 +27,12 @@ import { isAadhaarNumber, isCardNumber } from "../shared/checksums";
  */
 export function tokenKindForTextMatch(kind: string, label: string): DetectedPII["kind"] {
   if (kind === "name_text") return "pii_text";
-  if (kind === "email" || kind === "phone") return "credential";
+  if (kind === "email" || kind === "phone" || kind === "credential") return "credential";
+  if (kind === "api_key") return "api_key";
   return /card|ssn/i.test(label) ? "credential" : "id_number";
 }
 
-/**
- * Does this word look like a secret a user typed, rather than ordinary prose?
- *
- * Used only where the text itself gives a cue ("password", "api key") but the
- * separator is weak ("is", or nothing at all), so a plain English word can
- * follow the cue: "open the password manager", "the key is configuration".
- * A secret in practice carries a digit or a symbol; prose does not. Requiring
- * one keeps the capture precise, and the cost is stated: a value made only of
- * letters ("correcthorsebatterystaple") is NOT captured, because the rule that
- * would catch it also vaults the word "configuration".
- */
-function looksLikeSecret(value: string): boolean {
-  const v = value.trim();
-  if (v.length < 6) return false;
-  if (/\s/.test(v)) return false;
-  return /[\d]|[^A-Za-z0-9]/.test(v);
-}
+// ─── Token Vault ────────────────────────────────────────────────────────────
 
 // ─── Token Vault ────────────────────────────────────────────────────────────
 
@@ -448,25 +433,11 @@ export class PIITokenizer {
     // 3b. Cue-word secrets, which have no distinguishing shape: an OTP is six
     //    digits, a password is whatever the user chose. The cue word is what
     //    makes these safe to capture — and the shape guard is what stops
-    //    "open the password manager" from vaulting the word "manager".
-    for (const m of text.matchAll(/\b(?:otp|one[-\s]?time(?:\s+(?:code|password|passcode))?|verification\s+code|security\s+code)\b\s*(?:is|:|=)?\s*(\d{4,8})\b/gi)) {
-      const digits = m[1];
-      const start = (m.index ?? 0) + m[0].indexOf(digits);
-      add(start, start + digits.length, digits, "credential");
-    }
-    for (const m of text.matchAll(/\b(?:password|passphrase|pwd|passcode|pin|api[\s_-]?key|apikey|key|secret|access[\s_-]?token|token)\b\s*(?:is|:|=)\s*([^\s,;]+)/gi)) {
-      const value = (m[1] ?? "").trim();
-      if (!looksLikeSecret(value)) continue;
-      const start = (m.index ?? 0) + m[0].indexOf(value);
-      add(start, start + value.length, value, "credential");
-    }
-    // The bare form ("with password hunter2copy"): no separator, so the value
-    // has to look like a secret on its own.
-    for (const m of text.matchAll(/\b(?:password|passphrase|pwd|passcode)\b\s+([^\s,;]+)/gi)) {
-      const value = (m[1] ?? "").trim();
-      if (!looksLikeSecret(value)) continue;
-      const start = (m.index ?? 0) + m[0].indexOf(value);
-      add(start, start + value.length, value, "credential");
+    //    "open the password manager" from vaulting the word "manager". One
+    //    shared matcher (text-pii-patterns) serves this pass AND the pixel
+    //    channel, so a secret vaulted from the task is painted on screen too.
+    for (const s of matchCuedSecrets(text)) {
+      add(s.start, s.end, s.value, "credential");
     }
 
     // Overlap-resolve (longest wins, earlier start first) and splice in one pass.

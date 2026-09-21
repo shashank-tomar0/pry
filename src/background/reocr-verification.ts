@@ -88,7 +88,7 @@ export function detectPIIInText(text: string): string[] {
  */
 export function piiKindFromOcrLabel(label: string): string {
   if (/aadhaar|pan|ssn|passport|ifsc/i.test(label)) return "id_number";
-  if (/card|email|phone/i.test(label)) return "credential";
+  if (/card|email|phone|otp|password|passcode|secret/i.test(label)) return "credential";
   if (/api key|jwt|github|aws|anthropic|openai|token/i.test(label)) return "api_key";
   return "pii_text";
 }

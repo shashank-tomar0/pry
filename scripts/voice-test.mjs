@@ -643,6 +643,29 @@ ok(
   "a removed card never breaks the flush for the rest",
   /!target\.isConnected/.test(sidepanelSource) || /!target \|\| !target\.isConnected/.test(sidepanelSource),
 );
+// Reported live: the run settled (diagnostics printed, TTS spoke) but NO
+// answer card ever appeared under the question — a lost worker→panel message
+// with nothing to name it. The panel now balances the books at run end:
+// diagnostics seen + no assistant card + no error card + no user Stop means
+// the answer vanished downstream, and that renders a reportable error card
+// instead of silence.
+ok(
+  "a run that ends with diagnostics but no answer and no error names the loss",
+  /runDiagnosticsSeen && !runAssistantSeen && !runErrorSeen && !userStoppedRun/.test(sidepanelSource) &&
+    /no answer reached the panel/.test(sidepanelSource),
+);
+ok(
+  "the fallback never fires on user-stopped runs or runs that already errored",
+  /userStoppedRun = true/.test(sidepanelSource) && /runErrorSeen = true/.test(sidepanelSource),
+);
+// Same run's other half: speech is async (settings fetch), so a Stop/NEW in
+// the gap used to speak text for a transcript that no longer shows the card.
+// The speaker re-checks the run is still current after the await.
+ok(
+  "speech after an async gap is dropped when the run moved on",
+  /stillCurrent\?: \(\) => boolean/.test(sidepanelSource) &&
+    /if \(stillCurrent && !stillCurrent\(\)\) return;/.test(sidepanelSource),
+);
 
 console.log(`\nvoice-test: ${passed} assertion(s) passed.\n`);
 assert.ok(passed > 0);

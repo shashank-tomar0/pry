@@ -107,7 +107,7 @@ export function sanitizeTextPII(text: string): string {
   const matches = matchPiiInText(out);
   for (let i = matches.length - 1; i >= 0; i--) {
     const m = matches[i];
-    const kind = m.kind === "id_text" ? "id_number" : "credential";
+    const kind = m.kind === "api_key" ? "api_key" : m.kind === "id_text" ? "id_number" : "credential";
     const token = tokenizer.tokenize(m.value, kind);
     out = out.slice(0, m.start) + token + out.slice(m.end);
   }

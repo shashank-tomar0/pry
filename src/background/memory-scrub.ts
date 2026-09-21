@@ -40,6 +40,8 @@ const KIND_PLACEHOLDER: Record<string, string> = {
   phone: "[phone]",
   id_text: "[id]",
   name_text: "[name]",
+  api_key: "[key]",
+  credential: "[secret]",
 };
 export const TYPED_VALUE_PLACEHOLDER = "[...]";
 

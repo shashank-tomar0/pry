@@ -8,6 +8,7 @@ import {
   isClickableTarget,
   describeTextTarget,
   normalizeForMatch,
+  scoreTextMatch,
   boxContains,
   type FieldRun,
   type TextRun,
@@ -651,22 +652,8 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
 }
 
 function findText(query: string): ActionResult {
-  const needle = query.toLowerCase();
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  const candidates: string[] = [];
-  const seen = new Set<string>();
-  let node: Node | null;
-  while ((node = walker.nextNode()) && candidates.length < 24) {
-    const text = node.textContent?.trim();
-    if (text && text.toLowerCase().includes(needle)) {
-      const parent = node.parentElement;
-      if (parent && parent.offsetParent !== null && !seen.has(text)) {
-        seen.add(text);
-        candidates.push(text.slice(0, 200));
-      }
-    }
-  }
-  if (candidates.length === 0) {
+  const needle = normalizeForMatch(query);
+  if (!needle || needle.length < 2) {
     return fail(`No visible text matching ${JSON.stringify(query)} on this page.`);
   }
   // Rank, don't just take document order: the node whose ENTIRE text is the
@@ -674,20 +661,51 @@ function findText(query: string): ActionResult {
   // hunting for, while long nodes that merely contain it ("YouTube - Quarterly
   // reminder about YouTube's Terms of Service…" — newsletter rows) used to
   // fill the hit cap in DOM order and hide the actual match. Ties break
-  // toward shorter text.
+  // toward shorter text. Scoring reuses the shared matcher (exact → fuzzy),
+  // so a near-miss spelling ("Sheriyans" for on-screen "Sheryians") still
+  // resolves — labelled approximate so the planner knows what it got.
+  const SCORE_ORDER = { exact: 0, prefix: 1, word: 2, substring: 3, fuzzy: 4 } as const;
+  const collect = (cap: number, fuzzyOk: boolean): string[] => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node: Node | null;
+    while ((node = walker.nextNode()) && out.length < cap) {
+      const text = node.textContent?.trim();
+      if (!text || seen.has(text)) continue;
+      const parent = node.parentElement;
+      if (!parent || parent.offsetParent === null) continue;
+      seen.add(text);
+      const reason = scoreTextMatch(text, query);
+      if (reason && (fuzzyOk || reason !== "fuzzy")) out.push(text.slice(0, 200));
+    }
+    return out;
+  };
+  // Fast path first: today's substring sweep, same cap, same cost. The wider
+  // fuzzy walk runs only when nothing matched at all.
+  let candidates = collect(24, false);
+  let approximate = false;
+  if (candidates.length === 0) {
+    const pool = collect(200, true);
+    if (pool.length === 0) {
+      return fail(`No visible text matching ${JSON.stringify(query)} on this page.`);
+    }
+    candidates = pool;
+    approximate = true;
+  }
   const rank = (text: string): number => {
-    const lower = text.toLowerCase();
-    if (lower === needle) return 0;
-    if (lower.startsWith(needle)) return 1;
-    return 2;
+    const reason = scoreTextMatch(text, query);
+    if (!reason) return 5;
+    return SCORE_ORDER[reason];
   };
   const top = candidates
     .map((text) => ({ text, r: rank(text), len: text.length }))
     .sort((a, b) => a.r - b.r || a.len - b.len)
     .slice(0, 5);
   const scope = candidates.length > top.length ? ` (top ${top.length} of ${candidates.length})` : "";
+  const approx = approximate ? " (approximate match — verify before clicking)" : "";
   return done(
-    `Found ${candidates.length} match(es)${scope}:\n${top.map((h) => `- ${h.text}`).join("\n")}`,
+    `Found ${candidates.length} match(es)${approx}${scope}:\n${top.map((h) => `- ${h.text}`).join("\n")}`,
   );
 }
 

@@ -634,6 +634,15 @@ ok(
   /img\.loading = "eager";/.test(sidepanelSource) &&
     !/img\.loading = "lazy";/.test(sidepanelSource),
 );
+ok(
+  "streaming paints coalesce to one per frame instead of one per patch",
+  /schedulePaint\(event\.id, \(\) => \{/.test(sidepanelSource) &&
+    /requestAnimationFrame\(flush\)/.test(sidepanelSource),
+);
+ok(
+  "a removed card never breaks the flush for the rest",
+  /!target\.isConnected/.test(sidepanelSource) || /!target \|\| !target\.isConnected/.test(sidepanelSource),
+);
 
 console.log(`\nvoice-test: ${passed} assertion(s) passed.\n`);
 assert.ok(passed > 0);

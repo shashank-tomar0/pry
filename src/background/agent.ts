@@ -148,9 +148,10 @@ function renderSnapshot(snapshot: PageSnapshot): string {
  * Per-run learning context consulted by the sanitizer. Built once per task
  * from the rules stored for (domain, page type) — this is what closes the
  * self-improvement loop: rules learned on earlier runs change what this run
- * detects, suppresses, and how it plans.
+ * detects, suppresses, and how it plans. Exported (with sanitizeSnapshot)
+ * so the harness drives the real sanitizer instead of inferring it.
  */
-interface SanitizeCtx {
+export interface SanitizeCtx {
   /** `kind:method` keys to drop (learned false positives). */
   fpKeys: Set<string>;
   /** Learned strategy rule says deterministic fails here — skip it. */
@@ -159,6 +160,13 @@ interface SanitizeCtx {
   ruleCount: number;
   /** When false, DOM PII is redacted directly instead of tokenized (user toggle). */
   tokenize: boolean;
+  /**
+   * The (already tokenized) task text. Detections matching its raw words are
+   * the task's own targets (see isTaskOwnedValue) and stay readable in the
+   * TEXT channel — while still being painted in the pixel channel, whose VLM
+   * never sees the task.
+   */
+  taskText?: string;
   /**
    * Tier-0 NER spans (Detection v2), fetched per snapshot by the caller and
    * fused into detection here. Fused first so tokenize/redact see one list.
@@ -200,6 +208,37 @@ export function isFollowUpTask(task: string): boolean {
   return FOLLOW_UP_LEAD.test(t) || FOLLOW_UP_REFERENCE.test(t);
 }
 
+/** Shortest detection value that may be recognised as the task's own words.
+ *  Below this, whole-word matching collides with ordinary vocabulary ("mail"
+ *  inside "open gmail" is a different word — and must stay tokenized). */
+const TASK_OWNED_MIN_LEN = 5;
+
+/**
+ * True when a detected value is literally the task's own wording.
+ *
+ * WHY THIS EXISTS
+ *
+ * The pipeline redacted the task's own target out of the page it had to
+ * work: asked to "search for harkirat singh", the NER span for that name was
+ * tokenized in every page read, so the planner hunted something it could no
+ * longer see (and its text tools, which run on raw DOM, disagreed with what
+ * it was shown). Redaction protects values the model does NOT have; hiding
+ * what the task already gave it buys zero privacy at the cost of the task.
+ * Secrets are unaffected by construction — tokenizeTask vaults them first,
+ * so the task text carries `<CRED_1>`, never the raw digits for a page value
+ * to match against.
+ *
+ * Whole-phrase, case-insensitive, length-floored: "mail" never matches inside
+ * "gmail", and fragments never exempt anything.
+ */
+export function isTaskOwnedValue(value: string | undefined, taskText: string): boolean {
+  const v = String(value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  const t = String(taskText ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  if (v.length < TASK_OWNED_MIN_LEN || t.length === 0) return false;
+  const escaped = v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`).test(t);
+}
+
 /** Readable audit label per PII kind (visual detections already carry theirs). */
 const AUDIT_KIND_LABELS: Record<string, string> = {
   credential: "Credential (text)",
@@ -232,8 +271,10 @@ function auditFromDetections(
  * Returns a sanitized snapshot, the kept PII list, and the false-positive
  * candidates that were rejected (learned-rule suppression or checksum
  * failures) so they become measured FP signal instead of over-redaction.
+ * Exported so the harness pins the real pipeline (including task-owned
+ * exemptions) against real snapshots.
  */
-function sanitizeSnapshot(
+export function sanitizeSnapshot(
   snapshot: PageSnapshot,
   ctx: SanitizeCtx = EMPTY_SANITIZE_CTX,
 ): {
@@ -308,6 +349,18 @@ function sanitizeSnapshot(
     }));
   }
 
+  // 2.6 Task-owned values stay readable in the TEXT channel. A detection
+  // whose value is literally the task's own wording (isTaskOwnedValue) is
+  // the thing the run was asked to work with — tokenizing it blinds the
+  // planner to its own target while buying no privacy (the model already has
+  // it from the task). Pixels are deliberately NOT exempted: piiTargets below
+  // still carry these values to the frame painter, because the VLM that reads
+  // the frame never sees the task text. Counts, tokens and the DOM audit list
+  // below all run on the filtered list, so "2 detected / 2 tokenized" can
+  // never again describe a target the planner can plainly read.
+  const owned = (v?: string): boolean => isTaskOwnedValue(v, ctx.taskText ?? "");
+  const textDetections = allDetections.filter((d) => !owned(d.value));
+
   // 3. Tokenize the values the detectors actually flagged (names, emails,
   //    phones, ID numbers) so they become vault tokens the LLM can reference
   //    instead of raw values. When the user disabled tokenization, skip the
@@ -315,7 +368,7 @@ function sanitizeSnapshot(
   let tokenized;
   let swept;
   if (ctx.tokenize !== false) {
-    tokenized = tokenizer.tokenizeDetections(snapshot, allDetections);
+    tokenized = tokenizer.tokenizeDetections(snapshot, textDetections);
 
     // 3b. Vault sweep: replace ANY remaining vault value in element values,
     //     names, or page text with its token — even on elements no detector
@@ -337,7 +390,7 @@ function sanitizeSnapshot(
       elements: swept.elements,
       text: swept.text,
     },
-    allDetections,
+    textDetections,
   );
 
   return {
@@ -355,9 +408,9 @@ function sanitizeSnapshot(
     tokenCount: tokenized.tokenCount,
     textRedactedCount: redactedCount,
     detections: [
-      ...keptRegex.map((d) => ({ kind: d.kind, method: "regex", confidence: d.confidence })),
-      ...keptContextual.map((d) => ({ kind: d.kind, method: "contextual", confidence: d.confidence })),
-      ...mlMerged,
+      ...keptRegex.filter((d) => !owned(d.value)).map((d) => ({ kind: d.kind, method: "regex", confidence: d.confidence })),
+      ...keptContextual.filter((d) => !owned(d.value)).map((d) => ({ kind: d.kind, method: "contextual", confidence: d.confidence })),
+      ...mlMerged.filter((_m, i) => !owned(ctx.mlDetections?.[i]?.value)),
     ],
     suppressed,
     rejected: detailed.rejected.map((r) => ({
@@ -962,6 +1015,11 @@ export async function runTask(
     llmOnly: recommendsLLMOnly(applicableRules),
     ruleCount: applicableRules.length,
     tokenize: settings.privacy.tokenizePII !== false,
+    // The task's own words, so detections matching them stay readable (see
+    // isTaskOwnedValue). This is the already-tokenized task: secrets arrive
+    // as vault tokens, which no raw page value can match — only raw
+    // instruction parameters (names, search terms) qualify.
+    taskText: task,
   };
   if (applicableRules.length > 0) {
     const fpRules = applicableRules.filter((r) => r.category === "pii_detection").length;
@@ -1483,6 +1541,28 @@ export async function runTask(
   function finishTask(): void {
     if (experienceEmitted) return;
     experienceEmitted = true;
+
+    // A run that ends with no planner turn AND no executed action has nothing
+    // to show for itself — yet without this notice it ends exactly like a
+    // success ("Task ended", totals, silence). Observed live: a wait line
+    // ticking with streamed reasoning, then a bare "Task ended" with no
+    // diagnostics block (which is omitted when no turn was ever recorded) and
+    // no error. finalAnswerGiven excludes the one legitimate shape (a bare
+    // navigation goal that stopped itself with its own message).
+    if (plannerTurns.length === 0 && trackedActions.length === 0 && !finalAnswerGiven) {
+      if (!signal.aborted) errorCount++;
+      emit({
+        kind: "entry",
+        entry: {
+          id: nextId(),
+          role: signal.aborted ? "system" : "error",
+          text: signal.aborted
+            ? "Run stopped before the first planner turn completed."
+            : "Run ended before the first planner turn completed — no action was taken and the model was never heard from. " +
+              "This is not a completed task. Rerun it; if it repeats, the diagnostics to paste into a bug report are missing because no attempt was recorded, so say what the wait line showed instead.",
+        },
+      });
+    }
 
     const hasSuccessfulActions = trackedActions.some((a) => a.success);
     // Semantic-ish outcome: no errors, at least one real action (or none was
@@ -2605,7 +2685,13 @@ export async function runTask(
     }
 
     if (turn.stopReason !== "refusal" && turn.toolCalls.length === 0) {
-      const full = tokenizer.redactValues(turn.text);
+      // A turn cut by the output cap ends mid-sentence with no error and no
+      // marker — the transcript shows a half answer under a completed run,
+      // which reads as a hang followed by a stop. Name the cut where the
+      // answer is shown, so "it just stopped" becomes actionable.
+      const truncated = turn.stopReason === "max_tokens";
+      const full = tokenizer.redactValues(turn.text) +
+        (truncated ? "\n\n[cut off — hit the output limit; ask to continue for the rest.]" : "");
       if (full.trim()) {
         if (!opened) {
           opened = true;
@@ -2638,7 +2724,27 @@ export async function runTask(
     // No tools left to call — the model has given its final answer. This turn
     // has no tool result to carry the joined frame evidence (see the join
     // above), so it is reported here instead of being dropped.
+    // An EMPTY final answer is a failure with a panel, not a quiet success:
+    // observed live twice in a row ("can you see aadhar no"), the run printed
+    // its audit card and "Task ended" while the answer card stayed empty —
+    // and the run was even recorded as a success. The notice names the miss
+    // so the next ask can say what it needed instead.
     if (turn.toolCalls.length === 0) {
+      if (!turn.text.trim()) {
+        errorCount++;
+        emit({
+          kind: "entry",
+          entry: {
+            id: nextId(),
+            role: "error",
+            text:
+              `The planner ended its turn with no tool calls and no answer text, so there ` +
+              `is nothing to show for this task. The page is where the transcript says it ` +
+              `is — describe what you need from it (read it aloud, click something, ` +
+              `extract a value) and ask again.`,
+          },
+        });
+      }
       finalAnswerGiven = true;
       reportUndeliveredFrameNote();
       finishTask();
@@ -3881,12 +3987,25 @@ export function retryPolicyFor(
   if (liveness.ended === "unanswered") {
     // Not a dropped request (there may have been no connection to drop) and not a
     // slow model: nothing acknowledged the prompt. The loop re-routes this turn to
-    // another endpoint when it has one; with none, re-sending to this one spends
-    // the rest of the budget to be told the same thing.
+    // another endpoint when it has one; with none, re-sending to an endpoint that
+    // has never answered spends the rest of the budget to be told the same thing.
+    //
+    // EXCEPT on an endpoint this run has already heard from: four settled turns
+    // followed by one unacknowledged request is a blip — a queue spike, a lost
+    // SYN — not a dead provider (the reported run watched headers drift 1.2 s →
+    // 15 s across four good turns, then died on the fifth request with no retry
+    // one compose step from done). The retry keeps the full first-output window
+    // WITH the unanswered cut intact, so a still-dead endpoint costs at most one
+    // more acknowledgement budget, never a second 90 s wait.
+    if (opts.endpointProvenThisRun || opts.endpointAnsweredThisRun) {
+      return { retry: true, because: "" };
+    }
     return {
       retry: false,
       because:
-        "the endpoint never acknowledged the request, so nothing about this model has been tested",
+        "the endpoint never acknowledged the request, so nothing about this model has been tested. " +
+        "Nothing was sent to the model yet — on a free-tier queue this often clears between attempts, " +
+        "so running the same task again is the first thing to try before switching models",
     };
   }
   if (liveness.ended === "silent" && liveness.events === 0) {

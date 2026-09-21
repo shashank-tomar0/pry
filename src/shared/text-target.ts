@@ -34,10 +34,10 @@ export interface TextRun {
 /** A candidate the matcher chose, with how confident the match is. */
 export interface TextMatch<T extends TextRun = TextRun> {
   run: T;
-  /** 100 exact · 80 prefix · 60 word-boundary · 40 substring. */
+  /** 100 exact · 80 prefix · 60 word-boundary · 40 substring · 20 fuzzy. */
   score: number;
   /** Why this scored what it did — shown in the action result. */
-  reason: "exact" | "prefix" | "word" | "substring";
+  reason: "exact" | "prefix" | "word" | "substring" | "fuzzy";
 }
 
 /** Collapse whitespace, strip zero-width characters, lowercase. */
@@ -55,9 +55,11 @@ export function normalizeForMatch(value: string): string {
  * An exact match beats a prefix, which beats a whole-word hit, which beats a
  * substring: "Sent" must not lose to "Sent items (3)" when the user asked for
  * "Sent", but "Meta" inside a long row is still a usable hit when that is all
- * there is.
+ * there is. Below substring sits fuzzy: one typo/transposition on a long word
+ * ("Sheriyans" for the on-screen "Sheryians"), which an exact-only matcher
+ * reports as absent while the user stares at it.
  */
-export function scoreTextMatch(candidate: string, query: string): TextMatch["reason"] | null {
+export function scoreTextMatch(candidate: string, query: string, opts?: { fuzzy?: boolean }): TextMatch["reason"] | null {
   const haystack = normalizeForMatch(candidate);
   const needle = normalizeForMatch(query);
   if (!needle || needle.length < 2) return null;
@@ -72,7 +74,93 @@ export function scoreTextMatch(candidate: string, query: string): TextMatch["rea
     if (bounded) return "word";
     return "substring";
   }
+  // Fuzzy is opt-out, not opt-in — except field matching disables it below:
+  // typing into the almost-right field is the worst outcome in this module
+  // (a read can be verified, a write cannot be unread), while finding text is
+  // read-only. One flag keeps both callers honest about which risk they take.
+  if (opts?.fuzzy === false) return null;
+  if (fuzzyWordHit(haystack, needle)) return "fuzzy";
   return null;
+}
+
+/** Shortest word that may fuzzy-match: below this, edit-distance-1 collides
+ *  with ordinary neighbours ("mail"/"main", "cat"/"car") far too eagerly. */
+const MIN_FUZZY_WORD_LEN = 6;
+/** Longest word compared: bounds the O(n·m) table on adversarial inputs. */
+const MAX_FUZZY_WORD_LEN = 32;
+
+/**
+ * True when any single word of the needle is one typo away from any single
+ * word of the haystack (insertion, deletion, substitution, or an adjacent
+ * transposition — Damerau distance 1). Scored below every exact shape, so it
+ * can only win when nothing cleaner matched: a fallback that reads the page
+ * the way a person skimming it does, not a license to click the almost-right
+ * thing over the right one.
+ *
+ * Two guards keep it narrow. Length floor (below it, edit-distance-1 collides
+ * with ordinary neighbours like "mail"/"main"). And letters-only words:
+ * glued minified runs ("waitlist1", timestamps, counts) must never fuzzy-match
+ * — that is what the joined-row pipeline is for — and neither may anything
+ * numeric, where one digit off is a different code, not a typo.
+ */
+export function fuzzyWordHit(haystack: string, needle: string): boolean {
+  const words = (s: string): string[] =>
+    s.split(/[^a-z0-9]+/).filter(
+      (w) => w.length >= MIN_FUZZY_WORD_LEN && w.length <= MAX_FUZZY_WORD_LEN && /^[a-z]+$/.test(w),
+    );
+  const hayWords = words(haystack);
+  const ndlWords = words(needle);
+  for (const n of ndlWords) {
+    for (const h of hayWords) {
+      if (Math.abs(h.length - n.length) > 1) continue;
+      if (damerauDistance1(h, n)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Damerau-Levenshtein distance ≤ 1 (one edit or one adjacent transposition).
+ * Pure and exported so the bound is pinned directly: this must stay a
+ * near-miss check, never a similarity score that grows teeth.
+ */
+export function damerauDistance1(a: string, b: string): boolean {
+  if (a === b) return true;
+  const la = a.length;
+  const lb = b.length;
+  if (Math.abs(la - lb) > 1) return false;
+  // Substitution (equal length) or adjacent transposition.
+  if (la === lb) {
+    let diffs = 0;
+    let first = -1;
+    for (let i = 0; i < la; i++) {
+      if (a[i] !== b[i]) {
+        diffs++;
+        if (first < 0) first = i;
+        if (diffs > 2) return false;
+      }
+    }
+    if (diffs === 1) return true;
+    // Exactly two diffs that are an adjacent swap.
+    return diffs === 2 && first + 1 < la && a[first] === b[first + 1] && a[first + 1] === b[first];
+  }
+  // Insertion/deletion: the longer string minus one char equals the shorter.
+  const [longer, shorter] = la > lb ? [a, b] : [b, a];
+  let i = 0;
+  let j = 0;
+  let skipped = false;
+  while (i < longer.length && j < shorter.length) {
+    if (longer[i] === shorter[j]) {
+      i++;
+      j++;
+    } else if (!skipped) {
+      skipped = true;
+      i++;
+    } else {
+      return false;
+    }
+  }
+  return true;
 }
 
 const SCORES: Record<TextMatch["reason"], number> = {
@@ -80,6 +168,7 @@ const SCORES: Record<TextMatch["reason"], number> = {
   prefix: 80,
   word: 60,
   substring: 40,
+  fuzzy: 20,
 };
 
 /**
@@ -163,7 +252,7 @@ export interface FieldRun extends TextRun {
 export function scoreFieldMatch(field: FieldRun, query: string): TextMatch["reason"] | null {
   let best: TextMatch["reason"] | null = null;
   for (const label of field.labels ?? []) {
-    const reason = scoreTextMatch(label, query);
+    const reason = scoreTextMatch(label, query, { fuzzy: false });
     if (!reason) continue;
     if (!best || SCORES[reason] > SCORES[best]) best = reason;
   }

@@ -292,7 +292,7 @@ function makePlanner(script, { plannerMs, onTurn, firstTokenMs = 0 }) {
       return {
         text: step.text ?? (step.stream ? step.stream.join("") : ""),
         toolCalls: step.toolCalls ?? [],
-        stopReason: "end_turn",
+        stopReason: step.stopReason ?? "end_turn",
       };
     },
   };
@@ -1364,6 +1364,62 @@ ok("and the run stops instead of billing identical steps forever",
   stallSeen.length < 8 &&
   stallEntries.some((e) => e.role === "error" && /still unchanged after the steering advice/.test(e.text ?? "")),
   `${stallSeen.length} turns`);
+
+// ─── Silent endings say what happened ───────────────────────────────────────
+// Two live shapes, both reported as bare "Task ended": (1) a turn that ends
+// with no tool calls AND no text — the answer card stays empty while the
+// audit card prints, and the run was even recorded a success; (2) a run that
+// dies before any planner turn is recorded (frozen wait line, then nothing —
+// no diagnostics block either, since there is no attempt to name).
+console.log("\n=== Empty and zero-turn endings are diagnosed, not silent ===\n");
+
+const emptyFinal = await runScenario({
+  name: "empty final",
+  vision: false,
+  captureMs: 0,
+  plannerMs: 0,
+  script: [{ text: "", toolCalls: [] }],
+});
+const emptyEntries = transcriptAfter(emptyFinal.emitted);
+const emptyExperience = emptyFinal.emitted.find((e) => e.kind === "experience")?.experience;
+ok("an empty final answer is announced instead of vanishing",
+  emptyEntries.some((e) => e.role === "error" && /no tool calls and no answer text/.test(e.text ?? "")));
+ok("and a run that answered nothing is not recorded as a success",
+  emptyExperience?.taskSuccess === false,
+  JSON.stringify({ taskSuccess: emptyExperience?.taskSuccess }));
+
+const zeroTurn = await runScenario({
+  name: "zero turns",
+  vision: false,
+  captureMs: 0,
+  plannerMs: 0,
+  settingsExtra: { maxSteps: 0 },
+  script: [finishTurn],
+});
+const zeroEntries = transcriptAfter(zeroTurn.emitted);
+const zeroExperience = zeroTurn.emitted.find((e) => e.kind === "experience")?.experience;
+ok("a run that never reached a planner turn says so explicitly",
+  zeroEntries.some((e) => /before the first planner turn completed/.test(e.text ?? "")));
+ok("and it is not recorded as a success either",
+  zeroExperience?.taskSuccess === false,
+  JSON.stringify({ taskSuccess: zeroExperience?.taskSuccess }));
+
+// ─── An answer cut by the output cap says so ────────────────────────────────
+// Reported run: the final answer stopped mid-sentence ("…so a simple
+// dynamic-programming approach") with no error and no marker — a completed
+// run presenting a half answer, which reads as a hang followed by a stop.
+console.log("\n=== A max_tokens cut is announced on the answer ===\n");
+
+const cutShort = await runScenario({
+  name: "truncated final",
+  vision: false,
+  captureMs: 0,
+  plannerMs: 0,
+  script: [{ text: "First half of the answer.", toolCalls: [], stopReason: "max_tokens" }],
+});
+const cutEntries = transcriptAfter(cutShort.emitted);
+ok("a final answer cut by the output cap carries the notice",
+  cutEntries.some((e) => e.role === "assistant" && /hit the output limit/.test(e.text ?? "")));
 
 // ─── A bare navigation goal that is already satisfied ───────────────────────
 // The reported run: task "open yt", the tab on YouTube, and the agent went on to

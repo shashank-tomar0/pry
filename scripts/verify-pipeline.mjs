@@ -3190,6 +3190,7 @@ const {
   normalizeForMatch, scoreTextMatch, rankTextMatches, pickTextMatch,
   isClickableTarget, describeTextTarget,
   scoreFieldMatch, rankFieldMatches, pickFieldMatch,
+  damerauDistance1, fuzzyWordHit,
 } = await import("../src/shared/text-target.ts");
 
 ok("matching ignores case and collapsed whitespace",
@@ -3203,6 +3204,27 @@ ok("scoring prefers exact over prefix over word over substring",
   scoreTextMatch("Open Sent now", "Sent") === "word" &&
   scoreTextMatch("City Sentry", "Sent") === "substring",
   ["Sent/Sent", scoreTextMatch("Sent", "Sent"), "City Sentry/Sent", scoreTextMatch("City Sentry", "Sent")].join(" | "));
+// Fuzzy sits BELOW every exact shape: a near-miss spelling ("Sheriyans" for
+// on-screen "Sheryians") resolves instead of reporting absent — while an
+// exact rival still wins outright, so tolerance never outranks precision.
+ok("a transposed spelling still resolves, ranked below all exact shapes",
+  scoreTextMatch("Sheryians Coding School", "Sheriyans") === "fuzzy" &&
+  rankTextMatches(
+    [{ text: "Sheryians Coding School", x: 0, y: 200, width: 200, height: 18 }, { text: "Sheriyans Fan Club", x: 0, y: 100, width: 200, height: 18 }],
+    "Sheriyans",
+  )[0].run.y === 100);
+ok("short words never fuzzy-match (mail/main, cat/car stay distinct)",
+  scoreTextMatch("Send main now", "mail") !== "fuzzy" &&
+  scoreTextMatch("a cat sat", "car") !== "fuzzy");
+ok("the distance bound is exactly one edit or one adjacent swap",
+  damerauDistance1("sheriyans", "sheryians") === true &&
+  damerauDistance1("cat", "car") === true &&
+  damerauDistance1("cat", "cats") === true &&
+  damerauDistance1("abc", "acb") === true &&
+  damerauDistance1("cat", "dog") === false &&
+  damerauDistance1("sheriyans", "sender") === false);
+ok("find_text delegates scoring to the shared matcher (fuzzy included)",
+  /scoreTextMatch\(text, query\)/.test(await readFile("src/content/act.ts", "utf8")));
 ok("a query shorter than 2 characters matches nothing",
   scoreTextMatch("Inbox", "I") === null && scoreTextMatch("Inbox", "") === null);
 
@@ -3315,6 +3337,8 @@ ok("a word inside a label still matches its field, one rank weaker",
 ok("scoring is per label, so a long name cannot beat a clean one by accumulating hits",
   scoreFieldMatch(fieldWith("Email", "address"), "email address") === null,
   "no single label says \"email address\", so nothing is claimed as an exact field name");
+ok("field matching stays exact-shaped: typing into the almost-right field cannot be undone",
+  scoreFieldMatch(fieldWith("Sheryians"), "Sheriyans") === null);
 ok("a field's VALUE is not a name: prefilled text cannot be matched as a label",
   pickFieldMatch([{ ...searchField, labels: ["Search"] }], "harkirat singh") === null,
   "matching the value would aim typing at whatever the page prefilled");
@@ -4001,6 +4025,19 @@ ok("the retry policy refuses it and states why",
   retryPolicyFor(live({ ended: "unanswered", events: 0, endedAfterMs: 25_000 }), unackedMessage).retry === false &&
     /never acknowledged/.test(retryPolicyFor(live({ ended: "unanswered", events: 0, endedAfterMs: 25_000 }), unackedMessage).because),
   retryPolicyFor(live({ ended: "unanswered", events: 0, endedAfterMs: 25_000 }), unackedMessage).because);
+ok("and the refusal tells the user a rerun often clears a queue stall (nothing was sent yet)",
+  /running the same task again is the first thing to try/.test(
+    retryPolicyFor(live({ ended: "unanswered", events: 0, endedAfterMs: 25_000 }), unackedMessage).because));
+// …UNLESS the endpoint already answered this run. Reported live: four settled
+// turns (headers drifting 1–15 s), then one unacknowledged request killed a
+// nearly-done compose with no retry and nowhere to re-route to. A blip on a
+// proven endpoint is what the one short retry exists for.
+const unackedProven = live({ ended: "unanswered", events: 0, endedAfterMs: 25_000 });
+ok("an unanswered turn on a proven endpoint IS retried once",
+  retryPolicyFor(unackedProven, unackedMessage, { endpointProvenThisRun: true }).retry === true &&
+  retryPolicyFor(unackedProven, unackedMessage, { endpointAnsweredThisRun: true }).retry === true);
+ok("and an unanswered turn on a silent endpoint still is not",
+  retryPolicyFor(unackedProven, unackedMessage, {}).retry === false);
 
 // Teeth: an endpoint that DID acknowledge the request must still get the whole
 // silence budget. The guard reads one fact — headers — and must not fire without it.
@@ -4944,6 +4981,14 @@ ok("the local prompt is bounded the same way",
 ok("the verify rule no longer sends the model back to re-read a page it just saw",
   /already in the last tool result/.test(SYSTEM_PROMPT) &&
   /do not spend a turn re-reading/.test(SYSTEM_PROMPT));
+// Reported compose failure: asked to "say hi … this is the testing mail",
+// the run typed the instruction sentence itself into the Subject field. The
+// task's words are the body content; the subject must be composed, not pasted.
+ok("the prompt forbids pasting the instruction sentence into the subject",
+  /never paste the instruction sentence into it/.test(SYSTEM_PROMPT));
+ok("and forbids echoing meta-instructions and typos into the body",
+  /strip the meta-instructions/.test(SYSTEM_PROMPT) &&
+    /spelled cleanly/.test(SYSTEM_PROMPT));
 
 const { renderTrajectoryRoutes } = await import("../src/background/trajectories.ts");
 const storedRoute = [{
@@ -5030,6 +5075,48 @@ ok("and a repeat after steering stops the run instead of billing forever",
 ok("recorded experience is keyed by where the run worked, not where it started",
   /domain: snapshot\?\.url \? extractDomain\(snapshot\.url\) : domain/.test(agentStagnationSource) &&
   /pageType: snapshot\s*\n?\s*\? classifyPageType\(snapshot\.url/.test(agentStagnationSource));
+
+// ─── Scenario AV2: the task's own target stays readable ───────────────────
+// Reported run: asked to search "sheriyans coding school", the pipeline
+// tokenized the channel name out of every page read (banner: "2 sensitive
+// items masked on screen"), so the planner hunted a target it could no
+// longer see — while its text tools, running on raw DOM, disagreed. Values
+// that ARE the task's words skip text-channel tokenization (the model
+// already has them; hiding them buys no privacy). Secrets are unaffected:
+// tokenizeTask vaults them first, so the task carries tokens no raw page
+// value can match.
+const { isTaskOwnedValue, sanitizeSnapshot: sanitizeSnapshotReal } = await import("../src/background/agent.ts");
+ok("a task-owned name is recognised, case-insensitively",
+  isTaskOwnedValue("Harkirat Singh", "open yt and search for harkirat singh") === true);
+ok("a differently-spelled page value is NOT task-owned (fuzzy find covers execution)",
+  isTaskOwnedValue("Sheryians Coding School", "open yt and search for sheriyans coding school") === false);
+ok("fragments never exempt anything (mail inside gmail stays tokenized)",
+  isTaskOwnedValue("mail", "open gmail") === false &&
+  isTaskOwnedValue("ab", "open abc") === false &&
+  isTaskOwnedValue("Harkirat Singh", "") === false);
+tokenizer.clear();
+const ownedSnap = {
+  url: "https://www.youtube.com/results?search_query=sheriyans",
+  title: "sheriyans - YouTube",
+  elements: [{ id: 0, role: "link", name: "sheriyans coding school", value: "" }],
+  text: "sheriyans coding school 738K subscribers",
+  truncated: false,
+  scroll: { y: 0, maxY: 0 },
+};
+// The NER span is fabricated data (the model is not loaded in the harness);
+// what matters is the sanitizer's decision on a span matching the task.
+const ownedMl = [{ kind: "pii_text", value: "sheriyans coding school", confidence: 0.85, label: "NER Organization" }];
+const ownedCtx = { fpKeys: new Set(), llmOnly: false, ruleCount: 0, tokenize: true, taskText: "open yt and search for sheriyans coding school", mlDetections: ownedMl };
+const ownedOut = sanitizeSnapshotReal(ownedSnap, ownedCtx);
+ok("the task's own target survives sanitizing readable",
+  ownedOut.sanitized.text.includes("sheriyans coding school") && ownedOut.tokenCount === 0,
+  JSON.stringify({ text: ownedOut.sanitized.text.slice(0, 80), tokens: ownedOut.tokenCount }));
+tokenizer.clear();
+const maskedOut = sanitizeSnapshotReal(ownedSnap, { ...ownedCtx, taskText: "open yt" });
+ok("and the same name tokenizes normally for an unrelated task",
+  !maskedOut.sanitized.text.includes("sheriyans coding school") && maskedOut.tokenCount === 1,
+  JSON.stringify({ text: maskedOut.sanitized.text.slice(0, 80), tokens: maskedOut.tokenCount }));
+tokenizer.clear();
 
 // ─── Scenario AW: learned memory stores shapes, never values ───────────────
 // Reported run ("open yt in the new tab"): a stored trajectory replayed

@@ -1149,6 +1149,39 @@ function initZoomModal(): void {
 
 // ─── Event Listener ────────────────────────────────────────────────────────
 
+// Streaming paints are coalesced to one per animation frame. The planner
+// streams deltas at network cadence while every paint re-formats the WHOLE
+// accumulated card (formatMarkdown), re-parses it (innerHTML) and forces
+// layout twice (scrollHeight reads + scrollTop write) — per patch. On a long
+// answer that saturates the renderer thread: patches queue faster than they
+// paint, clicks (Stop, NEW) wait behind the backlog, and the panel reads as
+// hung with a half-painted card. Coalescing keeps the latest text per card
+// and paints each card at most once per frame; state (rawTexts) still updates
+// per message, so nothing is lost, only merged.
+const paintQueue = new Map<string, () => void>();
+let paintQueued = false;
+function schedulePaint(id: string, paint: () => void): void {
+  paintQueue.set(id, paint);
+  if (paintQueued) return;
+  paintQueued = true;
+  const flush = (): void => {
+    paintQueued = false;
+    const jobs = [...paintQueue.values()];
+    paintQueue.clear();
+    for (const job of jobs) {
+      try {
+        job();
+      } catch {
+        // A card removed mid-frame (NEW pressed between schedule and paint)
+        // must never break the flush for the rest.
+      }
+    }
+    if (atBottom()) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  };
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(flush);
+  else setTimeout(flush, 0);
+}
+
 chrome.runtime.onMessage.addListener((event: AgentEvent) => {
   switch (event.kind) {
     case "entry":
@@ -1171,8 +1204,13 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
           const current = (event.replace ? "" : (rawTexts.get(event.id) ?? "")) + event.text;
           if (hasVisibleAssistantText(current)) {
             rawTexts.set(event.id, current);
-            const body = node.querySelector(".assistant-body");
-            if (body) body.innerHTML = formatMarkdown(current);
+            schedulePaint(event.id, () => {
+              const live = rawTexts.get(event.id);
+              const target = nodes.get(event.id);
+              if (live === undefined || !target || !target.isConnected) return;
+              const body = target.querySelector(".assistant-body");
+              if (body) body.innerHTML = formatMarkdown(live);
+            });
           }
         } else if (node.classList.contains("step")) {
           // Step patches are full REPLACEMENTS: the executor's detail
@@ -1185,8 +1223,13 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
           // Reasoning deltas are streaming APPENDS, rendered as plain text.
           const current = (rawTexts.get(event.id) ?? "") + (event.text ?? "");
           rawTexts.set(event.id, current);
-          const body = node.querySelector(".thought-body");
-          if (body) body.textContent = current;
+          schedulePaint(event.id, () => {
+            const live = rawTexts.get(event.id) ?? "";
+            const target = nodes.get(event.id);
+            if (!target || !target.isConnected) return;
+            const body = target.querySelector(".thought-body");
+            if (body) body.textContent = live;
+          });
         } else if (node.classList.contains("egress")) {
           rawTexts.set(event.id, event.text ?? "");
           const body = node.querySelector(".egress-body");
@@ -1201,7 +1244,11 @@ chrome.runtime.onMessage.addListener((event: AgentEvent) => {
       if (event.pending === false && node.classList.contains("thought")) {
         node.querySelector("details")?.removeAttribute("open");
       }
-      if (atBottom()) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+      // No scroll yank here: coalesced paints scroll once per frame when they
+      // flush (see schedulePaint). A per-patch scrollTop write plus its
+      // atBottom layout read is what kept the compositor busy at streaming
+      // cadence; step/system patches are rare enough that the flush covers
+      // them too.
       break;
     }
 

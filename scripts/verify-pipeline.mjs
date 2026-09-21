@@ -2815,6 +2815,7 @@ const {
   withTurnBudget, newTurnLiveness, turnCutShortMessageFor, isRetryablePlannerError,
   retryPolicyFor, RETRY_FIRST_OUTPUT_MS, scriptSwitchRate, plannerWaitCause,
   unansweredTurnMessageFor, UNANSWERED_HEADERS_MS, plannerDiagnosticsReport,
+  unansweredHeadersFor,
 } = await import("../src/background/agent.ts");
 
 const budgetOpts = (messageFor) => ({
@@ -4061,7 +4062,7 @@ await withTurnBudget(new Promise(() => {}), noMilestones, {
 ok("without adapter milestones the cut is the silence one, as before",
   noMilestones.ended === "silent", `ended=${noMilestones.ended}`);
 ok("the run passes the bound on the first attempt and not on the retry",
-  /const unansweredHeadersMs = deps\.unansweredHeadersMs \?\? UNANSWERED_HEADERS_MS/.test(agentBudgetSource) &&
+  /const unansweredHeadersMs = unansweredHeadersFor\(settings\.provider, deps\.unansweredHeadersMs\)/.test(agentBudgetSource) &&
     /headersMs: isRetry \? Infinity : unansweredHeadersMs/.test(agentBudgetSource) &&
     UNANSWERED_HEADERS_MS > 0 && UNANSWERED_HEADERS_MS < 90_000,
   `${Math.round(UNANSWERED_HEADERS_MS / 1000)}s`);
@@ -4124,6 +4125,25 @@ ok("a run whose first attempt settled reports no cut at all",
     turns: [{ planner: "Groq x", headersMs: 200, firstOutputMs: 300, ended: "settled", streamed: true, ranMs: 900, localWork: false }],
     vision: false, outcome: "success",
   })));
+// The acknowledgement budget is per-provider (NVIDIA free tier queues large
+// prefills ~50 s; measured live, same key/model/hour as a 3 s small probe).
+// The report prints the ENFORCED budget, and resolution order is override,
+// provider entry, default.
+ok("NVIDIA waits 60 s for acknowledgement, everyone else 25 s",
+  unansweredHeadersFor("nvidia") === 60_000 &&
+  unansweredHeadersFor("groq") === UNANSWERED_HEADERS_MS &&
+  unansweredHeadersFor("unknown-provider") === UNANSWERED_HEADERS_MS &&
+  unansweredHeadersFor("nvidia", 5_000) === 5_000);
+ok("and the diagnostics block prints the enforced budget, not the default",
+  /unanswered 60s/.test(plannerDiagnosticsReport({
+    planner: "NVIDIA x", fastModel: null, turns: [], vision: false,
+    outcome: "x", unansweredMs: 60_000,
+  })) &&
+  /unanswered 25s/.test(plannerDiagnosticsReport({
+    planner: "Groq x", fastModel: null, turns: [], vision: false, outcome: "x",
+  })));
+ok("and the loop resolves the budget through that function, not inline",
+  /unansweredHeadersFor\(settings\.provider, deps\.unansweredHeadersMs\)/.test(agentBudgetSource));
 // Read the panel here rather than reusing the variable the ledger section
 // declares below this point: an assertion that reaches forward is one reorder
 // away from a ReferenceError instead of a failing check.

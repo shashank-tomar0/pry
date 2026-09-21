@@ -539,7 +539,7 @@ export async function runTask(
   const speedUpQueuedMs = deps.queuedFirstTokenMs ?? QUEUED_FIRST_TOKEN_MS;
   const firstOutputMs = deps.firstOutputMs ?? FIRST_OUTPUT_TIMEOUT_MS;
   const retryFirstOutputMs = deps.retryFirstOutputMs ?? RETRY_FIRST_OUTPUT_MS;
-  const unansweredHeadersMs = deps.unansweredHeadersMs ?? UNANSWERED_HEADERS_MS;
+  const unansweredHeadersMs = unansweredHeadersFor(settings.provider, deps.unansweredHeadersMs);
 
   // Use a shorter system prompt for small local models to avoid context overflow.
   const isLocalModel = settings.provider === "ollama";
@@ -1614,6 +1614,10 @@ export async function runTask(
             fastModel: fastModelFor(settings),
             turns: plannerTurns,
             vision: visionEnabled && visionApiKey !== "",
+            // The enforced acknowledgement budget, not the default: on NVIDIA
+            // the block must read 60s, or "unanswered after 60s" looks like a
+            // run ignoring its own stated policy.
+            unansweredMs: unansweredHeadersMs,
             outcome:
               `${taskSuccess ? "success" : "not a success"} · ${trackedActions.length} action(s) · ` +
               `${failed} cut planner wait(s) · ${errorCount} error(s) · egress ${formatBytes(sessionEgressBytes)}`,
@@ -3297,6 +3301,32 @@ const FIRST_OUTPUT_TIMEOUT_MS = 90_000;
  */
 export const UNANSWERED_HEADERS_MS = 25_000;
 
+/**
+ * Per-provider acknowledgement budgets. The default above was measured when
+ * headers arrived in ~1 s on every provider — but a live probe (2026-09,
+ * NVIDIA NIM free tier) showed an agent-shaped ~32 KB request taking 51–64 s
+ * to first byte while a 1 KB probe on the same key, model and hour answered
+ * in ~3 s: the free-tier scheduler deprioritizes large prefills, twice in a
+ * row, while small ones fly. A 25 s cut therefore beheads exactly the turns
+ * a real run is made of, on this provider, deterministically-ish. NVIDIA
+ * gets 60 s (covers the measured cluster with margin); everyone else keeps
+ * the default. The price is stated, not hidden: a genuinely dead NVIDIA
+ * endpoint now burns up to 60 s instead of 25 before the run says so.
+ */
+export const UNANSWERED_HEADERS_BY_PROVIDER: Readonly<Record<string, number>> = {
+  nvidia: 60_000,
+};
+
+/**
+ * The acknowledgement budget a run actually enforces: explicit harness/test
+ * override first, then the provider's entry above, then the default. Pure so
+ * the precedence is pinned rather than inferred from the loop.
+ */
+export function unansweredHeadersFor(provider: string, overrideMs?: number): number {
+  if (overrideMs !== undefined) return overrideMs;
+  return UNANSWERED_HEADERS_BY_PROVIDER[provider] ?? UNANSWERED_HEADERS_MS;
+}
+
 /** Every reason one planner turn can be cut short; the message builder is keyed on it. */
 export type PlannerCutReason =
   | "silent"
@@ -4240,6 +4270,12 @@ export function plannerDiagnosticsReport(input: {
   turns: readonly PlannerTurnReport[];
   /** Whether the VLM pass was enabled for this run. */
   vision: boolean;
+  /**
+   * The acknowledgement budget this run enforced. Defaults to
+   * UNANSWERED_HEADERS_MS so callers that predate per-provider budgets
+   * (and their pinned reports) keep reading exactly what they always did.
+   */
+  unansweredMs?: number;
   /** How the run ended, in the run's own words. */
   outcome: string;
 }): string {
@@ -4269,7 +4305,7 @@ export function plannerDiagnosticsReport(input: {
   return [
     "- planner diagnostics, copy this into a bug report -",
     `planner  ${input.planner}${input.fastModel ? ` · fast model: ${input.fastModel}` : " · no distinct fast model"}`,
-    `budgets  first output ${secondsLabel(FIRST_OUTPUT_TIMEOUT_MS)} · stream silence ${secondsLabel(STREAM_IDLE_TIMEOUT_MS)} · turn ceiling ${secondsLabel(MAX_TURN_MS)} · unanswered ${secondsLabel(UNANSWERED_HEADERS_MS)} · retry ${secondsLabel(RETRY_FIRST_OUTPUT_MS)}`,
+    `budgets  first output ${secondsLabel(FIRST_OUTPUT_TIMEOUT_MS)} · stream silence ${secondsLabel(STREAM_IDLE_TIMEOUT_MS)} · turn ceiling ${secondsLabel(MAX_TURN_MS)} · unanswered ${secondsLabel(input.unansweredMs ?? UNANSWERED_HEADERS_MS)} · retry ${secondsLabel(RETRY_FIRST_OUTPUT_MS)}`,
     `attempts ${input.turns.length}`,
     ...attempts,
     `local    vision ${input.vision ? "on" : "off"} · local frame pipeline running during ${localTurns} of ${input.turns.length} attempt(s)`,

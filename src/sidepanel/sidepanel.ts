@@ -584,11 +584,52 @@ function render(entry: TranscriptEntry): void {
 }
 
 function setRunning(running: boolean): void {
+  panelRunning = running;
   statusDot?.classList.toggle("running", running);
   if (statusText) statusText.textContent = running ? "RUNNING" : "IDLE";
   runBtn?.classList.toggle("hidden", running);
   stopBtn?.classList.toggle("hidden", !running);
   if (taskInput) taskInput.disabled = running;
+}
+
+/**
+ * Long-lived worker port (see the keep-alive note in service-worker.ts).
+ *
+ * An approval wait is worker-idle time, and an idle MV3 worker is suspended
+ * ~30 s in — killing the approval timer and the run with it, while the panel
+ * stays on RUNNING forever. This open port is what holds the worker through
+ * human-speed waits. If the port drops mid-run anyway (worker restarted
+ * despite it), the run is gone with no status event coming — so say so
+ * instead of displaying a live run that will never move again.
+ */
+let keepalivePort: chrome.runtime.Port | null = null;
+let keepaliveRetries = 0;
+let panelRunning = false;
+function ensureKeepalive(): void {
+  if (keepalivePort) return;
+  try {
+    keepalivePort = chrome.runtime.connect({ name: "pry-keepalive" });
+  } catch {
+    keepalivePort = null;
+    return;
+  }
+  keepaliveRetries = 0;
+  keepalivePort.onDisconnect.addListener(() => {
+    keepalivePort = null;
+    if (panelRunning) {
+      render({
+        id: `worker-lost-${Date.now()}`,
+        role: "error",
+        text: "Lost the connection to the background worker mid-run — the run cannot continue and no further updates will arrive. Press NEW and run the task again.",
+      });
+      setRunning(false);
+    }
+    // One worker restart is survivable; endless reconnect loops are not.
+    if (keepaliveRetries < 3) {
+      keepaliveRetries++;
+      setTimeout(ensureKeepalive, 2000);
+    }
+  });
 }
 
 // ─── Privacy Audit Rendering ───────────────────────────────────────────────
@@ -1799,6 +1840,7 @@ async function submit(task?: string): Promise<void> {
   taskInput.style.height = "auto";
   setActivePanel(null);
   updatePerceptionCount();
+  ensureKeepalive();
   await send({ kind: "run", task: text, tabId: tab.id });
 }
 
@@ -1813,6 +1855,8 @@ taskInput.addEventListener("keydown", (e) => {
 
 // Voice (ElevenLabs) — lazy bootstrap; no-op if user hasn't added an API key.
 void bootstrapVoice();
+// Hold the background worker for the panel's lifetime (see ensureKeepalive).
+ensureKeepalive();
 // Re-bootstrap voice whenever the user saves options (key or toggles changed).
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && "settings" in changes) {

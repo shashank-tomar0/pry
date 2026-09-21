@@ -80,6 +80,30 @@ function handleTripwireAlert(detail: TripwireAlertDetail): void {
 
 const pendingConfirms = new Map<string, (approved: boolean) => void>();
 
+/**
+ * Keep-alive ports from open panels.
+ *
+ * WHY THIS EXISTS
+ *
+ * An MV3 worker is suspended ~30 s after its last activity — and approving a
+ * risky action is pure inactivity: the run sits inside `await askConfirm`
+ * while the human reads the dialog. Suspension kills the 120 s approval
+ * timer AND the run awaiting it; when the user then presses Allow, the
+ * worker restarts fresh with an empty `pendingConfirms`, the reply matches
+ * nothing, and the panel sits on RUNNING with a pending step forever
+ * (reported live on a Gmail Send confirmation). An open long-lived port is
+ * what keeps the worker alive through human-speed waits — holding the port
+ * object is the whole implementation.
+ */
+const keepalivePorts = new Set<chrome.runtime.Port>();
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "pry-keepalive") return;
+  keepalivePorts.add(port);
+  port.onDisconnect.addListener(() => {
+    keepalivePorts.delete(port);
+  });
+});
+
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
 
 async function loadSettings(): Promise<Settings> {
@@ -1415,7 +1439,24 @@ chrome.runtime.onMessage.addListener(
       case "confirm-reply": {
         const resolve = pendingConfirms.get(command.id);
         pendingConfirms.delete(command.id);
-        resolve?.(command.approved);
+        if (resolve) {
+          resolve(command.approved);
+        } else if (transcript.length > 0) {
+          // The approval outlived its run: the worker restarted (see the
+          // keep-alive note above) and the awaiting promise died with the old
+          // incarnation, so this reply matches nothing and the panel would sit
+          // on RUNNING forever. Name the loss and unlock the panel instead of
+          // leaving a pending step with nowhere to go.
+          emit({
+            kind: "entry",
+            entry: {
+              id: `confirm-orphan-${Date.now()}`,
+              role: "error",
+              text: "That approval arrived after the background worker restarted, so the run it belonged to is already gone — nothing was approved and nothing ran. Press NEW and run the task again; the keep-alive port now holds the worker through approval waits, so this should not repeat.",
+            },
+          });
+          emit({ kind: "status", running: false });
+        }
         sendResponse({ ok: true });
         return false;
       }

@@ -6742,4 +6742,22 @@ ok("a switch that cannot be built leaves the run on its current planner",
   /plannerSwitched = true;\s*\n\s*\}\s*\n\s*\}/.test(speedUpSource.slice(speedUpSource.indexOf("planner = createPlanner({ ...settings, fastPlanner: true })"), speedUpSource.indexOf("Join the previous action's audit-only frame pipeline"))),
   "the catch must not rethrow");
 
+// ─── Scenario BK: approvals survive human-speed waits ─────────────────────
+// Reported live: a Gmail Send confirmation sat at RUNNING with a pending step
+// forever after Allow. Approving is worker-idle time, and an idle MV3 worker
+// is suspended ~30 s in — killing the 120 s approval timer and the awaiting
+// run; the post-restart worker then matches the reply to nothing. An open
+// port holds the worker through the wait, and an orphaned reply unlocks the
+// panel with a named recovery instead of silence.
+console.log("\n=== Scenario BK: approvals survive human-speed waits ===\n");
+
+const keepaliveWorkerSource = await readFile("src/background/service-worker.ts", "utf8");
+ok("an open panel port holds the worker through approval waits",
+  /chrome\.runtime\.onConnect\.addListener/.test(keepaliveWorkerSource) &&
+    /port\.name !== "pry-keepalive"/.test(keepaliveWorkerSource) &&
+    /keepalivePorts\.add\(port\)/.test(keepaliveWorkerSource));
+ok("an approval that outlived its run unlocks the panel instead of hanging it",
+  /confirm-orphan-/.test(keepaliveWorkerSource) &&
+    /That approval arrived after the background worker restarted/.test(keepaliveWorkerSource));
+
 console.log(`\n${passed} assertions passed. Pipeline verified end-to-end.`);

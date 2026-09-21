@@ -666,6 +666,20 @@ ok(
   /stillCurrent\?: \(\) => boolean/.test(sidepanelSource) &&
     /if \(stillCurrent && !stillCurrent\(\)\) return;/.test(sidepanelSource),
 );
+// Reported live: pressing Allow on a Gmail Send confirmation left RUNNING
+// with a pending step forever — the approval wait is worker-idle time and an
+// idle MV3 worker is suspended ~30 s in. The port below holds the worker
+// through human-speed waits; if the worker dies anyway, the panel names the
+// loss instead of displaying a live run that will never move again.
+ok(
+  "an open keepalive port holds the worker through approval waits",
+  /chrome\.runtime\.connect\(\{ name: "pry-keepalive" \}\)/.test(sidepanelSource) &&
+    /Lost the connection to the background worker mid-run/.test(sidepanelSource),
+);
+ok(
+  "the disconnect card only fires on a run that was actually live",
+  /if \(panelRunning\)/.test(sidepanelSource),
+);
 
 console.log(`\nvoice-test: ${passed} assertion(s) passed.\n`);
 assert.ok(passed > 0);

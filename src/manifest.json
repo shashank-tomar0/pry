@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "PRY Agent",
   "short_name": "PRY",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Browser automation that redacts passwords, IDs, and personal data on-device before any screenshot or page text reaches an AI model.",
   "minimum_chrome_version": "120",
   "content_security_policy": {

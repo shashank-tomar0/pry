@@ -3304,6 +3304,7 @@ const {
   isClickableTarget, describeTextTarget,
   scoreFieldMatch, rankFieldMatches, pickFieldMatch,
   damerauDistance1, fuzzyWordHit,
+  rankAffordanceMatches, describeAffordanceMatch,
 } = await import("../src/shared/text-target.ts");
 
 ok("matching ignores case and collapsed whitespace",
@@ -3338,6 +3339,32 @@ ok("the distance bound is exactly one edit or one adjacent swap",
   damerauDistance1("sheriyans", "sender") === false);
 ok("find_text delegates scoring to the shared matcher (fuzzy included)",
   /scoreTextMatch\(text, query\)/.test(await readFile("src/content/act.ts", "utf8")));
+// Reported live: find_text "Search" failed on YouTube (a search INPUT has no
+// text node — its name lives in placeholder/aria-label), while field matching
+// found the same box one turn later. find_text now also sweeps control names
+// through the same shapes, labelled with their source.
+const affordances = [
+  { label: "Search", source: "placeholder" },
+  { label: "Search YouTube", source: "aria-label" },
+  { label: "Trending videos", source: "tooltip" },
+];
+ok("a control name matches with the same shapes as body text",
+  rankAffordanceMatches(affordances, "search")[0].item.label === "Search" &&
+  rankAffordanceMatches(affordances, "search")[0].reason === "exact");
+ok("exact beats prefix among affordances too",
+  rankAffordanceMatches(affordances, "search youtube")[0].item.source === "aria-label");
+ok("fuzzy is opt-out for affordances, like everywhere else",
+  rankAffordanceMatches([{ label: "Sheryians", source: "placeholder" }], "Sheriyans").length === 1 &&
+  rankAffordanceMatches([{ label: "Sheryians", source: "placeholder" }], "Sheriyans", { fuzzy: false }).length === 0);
+ok("blank labels never match",
+  rankAffordanceMatches([{ label: "  ", source: "alt" }, { label: "", source: "tooltip" }], "search").length === 0);
+ok("affordance hits name their source so the planner picks type_text",
+  describeAffordanceMatch("Search", "placeholder") === "Search [placeholder]");
+ok("find_text gathers placeholders, labels, alts and tooltips, ranked shared",
+  /input\[placeholder\], textarea\[placeholder\]/.test(await readFile("src/content/act.ts", "utf8")) &&
+    /\[aria-label\]/.test(await readFile("src/content/act.ts", "utf8")) &&
+    /img\[alt\]/.test(await readFile("src/content/act.ts", "utf8")) &&
+    /rankAffordanceMatches\(items, query, \{ fuzzy: fuzzyOk \}\)/.test(await readFile("src/content/act.ts", "utf8")));
 ok("a query shorter than 2 characters matches nothing",
   scoreTextMatch("Inbox", "I") === null && scoreTextMatch("Inbox", "") === null);
 

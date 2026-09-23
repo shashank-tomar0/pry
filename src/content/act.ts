@@ -5,6 +5,8 @@ import {
   pickTextMatch,
   pickFieldMatch,
   rankFieldMatches,
+  rankAffordanceMatches,
+  describeAffordanceMatch,
   isClickableTarget,
   describeTextTarget,
   normalizeForMatch,
@@ -12,6 +14,7 @@ import {
   boxContains,
   type FieldRun,
   type TextRun,
+  type AffordanceRun,
 } from "../shared/text-target";
 
 const fail = (detail: string): ActionResult => ({ ok: false, detail });
@@ -651,6 +654,59 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
   );
 }
 
+/** Control names that are never body text, gathered for find_text. */
+const AFFORDANCE_CAP = 120;
+
+/**
+ * What the page's controls are CALLED, as find_text candidates.
+ *
+ * A placeholder is not a text node and neither is an aria-label or an image
+ * alt — so the text-node sweep above cannot see "Search" on a YouTube search
+ * box, while field matching (same names, different index) can. Each hit is
+ * labelled with its source so the planner reaches for type_text with the
+ * field name rather than click_text on prose that is not there.
+ */
+function collectAffordances(query: string, fuzzyOk: boolean): string[] {
+  const items: AffordanceRun[] = [];
+  const push = (el: Element, label: string | null, source: AffordanceRun["source"]): void => {
+    if (items.length >= AFFORDANCE_CAP) return;
+    const text = (label ?? "").trim();
+    if (!text || text.length < 2) return;
+    // Rects, not offsetParent: a fixed-position header (YouTube's masthead is
+    // one) reports a null offsetParent while plainly visible.
+    if (el.getClientRects().length === 0) return;
+    items.push({ label: text.slice(0, 200), source });
+  };
+  for (const el of Array.from(document.querySelectorAll("input[placeholder], textarea[placeholder]"))) {
+    push(el, el.getAttribute("placeholder"), "placeholder");
+  }
+  for (const el of Array.from(document.querySelectorAll("[aria-label]"))) {
+    if (el.tagName.toLowerCase() === "input" && el.getAttribute("aria-label") === el.getAttribute("placeholder")) continue;
+    push(el, el.getAttribute("aria-label"), "aria-label");
+  }
+  for (const el of Array.from(document.querySelectorAll("img[alt]"))) {
+    push(el, el.getAttribute("alt"), "alt");
+  }
+  for (const el of Array.from(document.querySelectorAll("[title]"))) {
+    push(el, el.getAttribute("title"), "tooltip");
+  }
+  // Submit/button VALUES are attributes, never text nodes. A <button>'s own
+  // text already flows through the text sweep, so only valueless-leaf buttons
+  // with a value attribute qualify here.
+  for (const el of Array.from(document.querySelectorAll("input[type='submit'], input[type='button']"))) {
+    push(el, el.getAttribute("value"), "button");
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const m of rankAffordanceMatches(items, query, { fuzzy: fuzzyOk })) {
+    const display = describeAffordanceMatch(m.item.label, m.item.source);
+    if (seen.has(display)) continue;
+    seen.add(display);
+    out.push(display);
+  }
+  return out;
+}
+
 function findText(query: string): ActionResult {
   const needle = normalizeForMatch(query);
   if (!needle || needle.length < 2) {
@@ -682,15 +738,21 @@ function findText(query: string): ActionResult {
     return out;
   };
   // Fast path first: today's substring sweep, same cap, same cost. The wider
-  // fuzzy walk runs only when nothing matched at all.
-  let candidates = collect(24, false);
+  // fuzzy walk runs only when nothing matched at all. Affordances (below)
+  // ride both passes, so a control's NAME counts the same way body text does.
+  let candidates = [...collect(24, false), ...collectAffordances(query, false)];
   let approximate = false;
   if (candidates.length === 0) {
     const pool = collect(200, true);
     if (pool.length === 0) {
-      return fail(`No visible text matching ${JSON.stringify(query)} on this page.`);
+      const fuzzyPool = collectAffordances(query, true);
+      if (fuzzyPool.length === 0) {
+        return fail(`No visible text matching ${JSON.stringify(query)} on this page.`);
+      }
+      candidates = fuzzyPool;
+    } else {
+      candidates = pool;
     }
-    candidates = pool;
     approximate = true;
   }
   const rank = (text: string): number => {

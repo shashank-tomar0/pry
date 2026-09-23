@@ -140,8 +140,10 @@ export const TOOLS: ToolSpec[] = [
   {
     name: "find_text",
     description:
-      "Search the visible text of the page for a phrase. Cheaper than a full page " +
-      "read when you only need to confirm something is present.",
+      "Search the visible text of the page for a phrase — including what controls " +
+      "are called (search-box placeholders, aria-labels, image alts, tooltips), " +
+      "reported with their source so you can type into a named field with type_text. " +
+      "Cheaper than a full page read when you only need to confirm something is present.",
     parameters: {
       type: "object",
       properties: { query: { type: "string" } },

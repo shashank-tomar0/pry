@@ -336,3 +336,52 @@ export function describeTextTarget(text: string, tag: string, role: string | nul
   const kind = role ? `${tag} role=${role}` : tag;
   return `<${kind}> ${JSON.stringify(label)}`;
 }
+
+/**
+ * A control's NAME as a find_text candidate: placeholder, aria-label, image
+ * alt, tooltip. Body text never contains these (a placeholder is not a text
+ * node), which is how find_text reported "No visible text matching 'Search'"
+ * on a YouTube page whose search box is literally named Search — while field
+ * matching, which reads the same names, found it one turn later. One wasted
+ * turn plus a false "page unchanged" steering nudge, every time.
+ */
+export interface AffordanceRun {
+  /** What the control is called ("Search"). */
+  label: string;
+  /** Where the name came from — shown so the planner picks the right tool. */
+  source: "placeholder" | "aria-label" | "alt" | "tooltip" | "button";
+}
+
+/** How one affordance reads in a find_text result. */
+export function describeAffordanceMatch(label: string, source: AffordanceRun["source"]): string {
+  return `${label.slice(0, 200)} [${source}]`;
+}
+
+export interface AffordanceMatch {
+  item: AffordanceRun;
+  /** 100 exact · 80 prefix · 60 word-boundary · 40 substring · 20 fuzzy. */
+  score: number;
+  /** Why this scored what it did. */
+  reason: TextMatch["reason"];
+}
+
+/**
+ * Rank affordances against a query with the same shapes as body text, so the
+ * two corpora stay comparable: an exact placeholder never outranks an exact
+ * body hit, and fuzzy is opt-out like everywhere else.
+ */
+export function rankAffordanceMatches(
+  items: AffordanceRun[],
+  query: string,
+  opts?: { fuzzy?: boolean },
+): AffordanceMatch[] {
+  const matches: AffordanceMatch[] = [];
+  for (const item of items ?? []) {
+    const label = (item.label ?? "").trim();
+    if (!label) continue;
+    const reason = scoreTextMatch(label, query, opts);
+    if (!reason) continue;
+    matches.push({ item, score: SCORES[reason], reason });
+  }
+  return matches.sort((a, b) => b.score - a.score);
+}

@@ -42,13 +42,13 @@ fresh bundle.
 
 ```bash
 npm run verify && npm run build   # green first
-node scripts/package.mjs          # writes publish/pry-agent-1.0.0.zip (~125 MB)
-gh release create v1.0.0 publish/pry-agent-1.0.0.zip --title "PRY 1.0.0" --notes "..."
+node scripts/package.mjs          # writes publish/pry-agent-1.0.1.zip (~125 MB)
+gh release create v1.0.1 publish/pry-agent-1.0.1.zip --title "PRY 1.0.1" --notes "..."
 ```
 
 The landing page's download button links to
-`…/releases/latest/download/pry-agent-1.0.0.zip`, so the asset filename must stay
-`pry-agent-1.0.0.zip`. Two rules keep this honest:
+`…/releases/latest/download/pry-agent-1.0.1.zip`, so the asset filename must stay
+`pry-agent-1.0.1.zip`. Two rules keep this honest:
 
 1. **Never commit the zip.** The full build is ~125 MB, over GitHub's 100 MB
    per-file limit — a push would be rejected — and a committed copy decays

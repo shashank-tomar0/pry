@@ -116,12 +116,12 @@ after launch (recipe in `docs/launch-kit.md` §A6).
 
 1. `npm run verify` passes (605 pipeline + 27 tripwire + 11 OCR + 37 egress +
    84 offscreen integration + 20 agent-loop assertions) and `npm run build` is clean.
-2. `publish/pry-agent-1.0.0.zip` contains the full `dist/` contents — 80 entries,
+2. `publish/pry-agent-1.0.1.zip` contains the full `dist/` contents — 80 entries,
    including `models/ner/onnx/model_quantized.onnx` and
    `models/blazeface/face_detection_short_range.tflite`. It is uploaded as a
    GitHub Release asset and is deliberately NOT committed to the repo (see
    `docs/launch-kit.md` → "Ship the downloadable build"); the landing button
-   points at `…/releases/latest/download/pry-agent-1.0.0.zip`.
+   points at `…/releases/latest/download/pry-agent-1.0.1.zip`.
 3. `dist/` loaded unpacked: toolbar icon (logo), side panel opens, a real task
    runs end-to-end.
 4. `icons/` contains the brand icon at 16/32/48/128 — all replaced, none left

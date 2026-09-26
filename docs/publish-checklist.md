@@ -9,7 +9,7 @@ The complete asset inventory and the exact upload steps. Companion to
 
 | Asset | Spec required | File | Status |
 |---|---|---|---|
-| Package ZIP | `manifest.json` at zip root | `publish/pry-agent-1.0.0.zip` | Ready — real zip, `unzip -t` clean |
+| Package ZIP | `manifest.json` at zip root | `publish/pry-agent-1.0.1.zip` | Ready — real zip, `unzip -t` clean |
 | Icons (in ZIP) | 16 / 32 / 48 / 128 px PNG | `icons/icon16.png` … `icon128.png` | Ready — verified sizes |
 | Screenshot 1 | 1280×800 (min 640×400) | `assets/store/screenshot-1-in-action.png` | Ready |
 | Screenshot 2 | 1280×800 | `assets/store/screenshot-2-dashboard.png` | Ready |
@@ -36,7 +36,7 @@ SVGs open in any browser, Figma, or Illustrator; export PNG at 2x for posting.
 ## 3. Upload steps (once, ~20 min)
 
 1. `chrome.google.com/webstore/devconsole` → pay the one-time **$5** developer fee.
-2. **New item** → upload `publish/pry-agent-1.0.0.zip`.
+2. **New item** → upload `publish/pry-agent-1.0.1.zip`.
 3. Fill listing fields from `docs/store-listing.md` (name, summary, description,
    category, language).
 4. Upload the 4 screenshots, small tile, marquee.
@@ -65,7 +65,7 @@ SVGs open in any browser, Figma, or Illustrator; export PNG at 2x for posting.
 - [ ] `npm run verify` green (223 assertions)
 - [ ] Load `dist/` unpacked once: icon shows, panel opens, a real task runs,
       no console errors
-- [ ] `unzip -t publish/pry-agent-1.0.0.zip` → "No errors detected"
+- [ ] `unzip -t publish/pry-agent-1.0.1.zip` → "No errors detected"
 - [ ] Landing page + privacy page + ZIP link all HTTP 200
       (`https://shashank-tomar0.github.io/pry/`)
 - [ ] Version number in `src/manifest.json` bumped since the last upload

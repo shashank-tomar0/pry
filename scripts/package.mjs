@@ -7,7 +7,11 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SRC = join(ROOT, "dist");
-const OUT = join(ROOT, "publish", "pry-agent-1.0.0.zip");
+
+// Name the zip by the version inside the manifest we're actually shipping, so
+// the filename can never drift from the contents (as it did at 1.0.0 -> 1.0.1).
+const { version } = JSON.parse(await readFile(join(SRC, "manifest.json"), "utf8"));
+const OUT = join(ROOT, "publish", `pry-agent-${version}.zip`);
 
 // Fixed DOS timestamp: 2026-09-08 12:00:00
 const DOS_TIME = (12 << 11) | (0 << 5) | 0;
@@ -110,15 +114,15 @@ await rename(tmp, OUT);
 // page's download button looked maintained while it served a different, stale
 // file for weeks (26 entries, no model weights, no MediaPipe, no ONNX Runtime).
 // The zip is not committed any more, so the only copy is the one to upload:
-// publish/pry-agent-1.0.0.zip -> a GitHub Release asset of the same name.
+// publish/pry-agent-<version>.zip -> a GitHub Release asset of the same name.
 
 const mb = (archive.length / 1024 / 1024).toFixed(2);
 console.log(`packaged ${entries.length} files -> ${OUT} (${mb} MB)`);
 console.log(
   "\nNext: upload it as a release asset (the landing button links to the latest release):\n" +
-  "  gh release create v1.0.0 publish/pry-agent-1.0.0.zip --title \"PRY 1.0.0\" --notes \"...\"\n" +
-  "  # or: gh release upload <tag> publish/pry-agent-1.0.0.zip --clobber\n" +
-  "The asset filename must stay pry-agent-1.0.0.zip — the page URL ends in it.",
+  `  gh release create v${version} publish/pry-agent-${version}.zip --title "PRY ${version}" --notes "..."\n` +
+  `  # or: gh release upload <tag> publish/pry-agent-${version}.zip --clobber\n` +
+  `The asset filename must match pry-agent-${version}.zip — the page URL ends in it.`,
 );
 if (archive.length > 100 * 1024 * 1024) {
   console.log(

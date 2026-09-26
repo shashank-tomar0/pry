@@ -666,7 +666,7 @@ after every build — the side panel caches its bundle, and a stale bundle is wh
 produces "my fix isn't there" reports.
 
 ### 11.7 Packaged build (release artifact)
-`node scripts/package.mjs` writes `publish/pry-agent-1.0.0.zip` (~125 MB: the
+`node scripts/package.mjs` writes `publish/pry-agent-1.0.1.zip` (~125 MB: the
 model weights and wasm runtimes are included, because a build without them has no
 on-device NER, no face model, and no OCR verifier). It is **not** committed — it
 exceeds GitHub's 100 MB per-file limit — and it is published as a GitHub Release

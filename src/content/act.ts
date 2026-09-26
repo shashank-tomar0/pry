@@ -655,7 +655,6 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
       await settle({ start: attempt === 0 ? 250 : 400, ceiling: 800 });
       const popup = openSuggestionPopup();
       if (!popup) continue;
-      popupSeen = true;
       const idx = findExactEmailOption(popup.options, text);
       if (idx >= 0 && popup.elements[idx]) {
         // The address itself is offered: take it, exactly. No Enter afterwards

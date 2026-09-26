@@ -354,6 +354,17 @@ export function findExactEmailOption(options: string[], email: string): number {
 }
 
 /**
+ * Whether a compose container's text carries the address — i.e. the
+ * recipient committed as a chip. Scoped to the dialog's text by the caller:
+ * page-wide text would match the user's own account address in the header.
+ */
+export function dialogShowsEmail(dialogText: string, email: string): boolean {
+  const want = email.trim().toLowerCase();
+  if (!want || !want.includes("@")) return false;
+  return (dialogText ?? "").toLowerCase().includes(want);
+}
+
+/**
  * A control's NAME as a find_text candidate: placeholder, aria-label, image
  * alt, tooltip. Body text never contains these (a placeholder is not a text
  * node), which is how find_text reported "No visible text matching 'Search'"

@@ -3305,7 +3305,7 @@ const {
   scoreFieldMatch, rankFieldMatches, pickFieldMatch,
   damerauDistance1, fuzzyWordHit,
   rankAffordanceMatches, describeAffordanceMatch,
-  findExactEmailOption,
+  findExactEmailOption, dialogShowsEmail,
 } = await import("../src/shared/text-target.ts");
 
 ok("matching ignores case and collapsed whitespace",
@@ -3384,6 +3384,13 @@ ok("the commit path dismisses strangers, clicks exact matches, and names chips",
     /key: "Escape"/.test(await readFile("src/content/act.ts", "utf8")) &&
     /key: "Tab"/.test(await readFile("src/content/act.ts", "utf8")) &&
     /committed as a chip/.test(await readFile("src/content/act.ts", "utf8")));
+ok("late popups get a second look before the commit key",
+  /for \(let attempt = 0; attempt < 2 && !committedByClick; attempt\+\+\)/.test(await readFile("src/content/act.ts", "utf8")));
+ok("chip verification is dialog-scoped and shape-checked, never a bare contains",
+  dialogShowsEmail("To shashank.tomar.work@gmail.com Subject Hi", "shashank.tomar.work@gmail.com") === true &&
+  dialogShowsEmail("To shab@gmail.com Subject Hi", "shashank.tomar.work@gmail.com") === false &&
+  dialogShowsEmail("anything", "not-an-email") === false &&
+  dialogShowsEmail("", "shashank.tomar.work@gmail.com") === false);
 ok("a query shorter than 2 characters matches nothing",
   scoreTextMatch("Inbox", "I") === null && scoreTextMatch("Inbox", "") === null);
 

@@ -8,6 +8,7 @@ import {
   rankAffordanceMatches,
   describeAffordanceMatch,
   findExactEmailOption,
+  dialogShowsEmail,
   isClickableTarget,
   describeTextTarget,
   normalizeForMatch,
@@ -647,9 +648,14 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
   const emailLike = /[^\s@]+@[^\s@]+/.test(text);
   let committedByClick = false;
   if (emailLike) {
-    await settle({ start: 250, ceiling: 800 });
-    const popup = openSuggestionPopup();
-    if (popup) {
+    // Suggestion popups are network-bound (contact search) and can render
+    // AFTER the first look — the previous single check missed late popups and
+    // Tab then accepted the highlighted stranger anyway. Poll twice.
+    for (let attempt = 0; attempt < 2 && !committedByClick; attempt++) {
+      await settle({ start: attempt === 0 ? 250 : 400, ceiling: 800 });
+      const popup = openSuggestionPopup();
+      if (!popup) continue;
+      popupSeen = true;
       const idx = findExactEmailOption(popup.options, text);
       if (idx >= 0 && popup.elements[idx]) {
         // The address itself is offered: take it, exactly. No Enter afterwards
@@ -665,6 +671,7 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
         target.dispatchEvent(new KeyboardEvent("keydown", esc));
         target.dispatchEvent(new KeyboardEvent("keyup", esc));
         await settle({ start: 150, ceiling: 500 });
+        break;
       }
     }
     if (!committedByClick) {
@@ -708,17 +715,29 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
   // prefix what we typed (Gmail's recipient combobox showed a different
   // value than the one we sent, and the model burned turns reconciling the
   // two). Report what the field holds NOW so the model never has to guess.
-  // A chip reads empty (the address left the input for the chip row), so for
-  // email text an empty read after a correct pre-commit read means committed,
-  // not lost.
+  // A chip reads empty (the address left the input for the chip row), so an
+  // empty read proves nothing either way — the compose dialog is checked for
+  // the address instead, and anything short of proof is reported as such.
   const echo =
     target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
       ? target.value
       : (target.textContent ?? "");
-  const echoNote =
-    emailLike && !echo.trim() && preCommitEcho.trim()
-      ? " (empty because the address committed as a chip — the field held it before commit)"
-      : "";
+  let echoNote = "";
+  if (emailLike) {
+    const dialog =
+      target.closest('div[role="dialog"], form') ?? target.parentElement?.parentElement ?? undefined;
+    const dialogText = dialog instanceof Element ? dialog.textContent ?? "" : "";
+    // The dialog trivially contains the address while it sits uncommitted in
+    // the input, so only an EMPTIED input plus the address in the dialog
+    // means a chip: Gmail consumed the text into the chip row.
+    if (!echo.trim() && preCommitEcho.trim() && dialogShowsEmail(dialogText, text)) {
+      echoNote = " (the address committed as a chip — verified in the compose area)";
+    } else if (!echo.trim() && preCommitEcho.trim()) {
+      echoNote =
+        " (field reads empty and the address was NOT found in the compose area — " +
+        "verify the To field holds the intended recipient before Send)";
+    }
+  }
 
   return done(
     `Typed ${JSON.stringify(text)} into ${describe(target)}. ` +

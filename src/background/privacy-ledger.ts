@@ -11,6 +11,8 @@
  * Storage key: "pry-privacy-ledger"
  */
 
+import { persistedSet } from "./storage-guard";
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export interface LedgerEntry {
@@ -149,7 +151,7 @@ async function saveStore(store: LedgerStore): Promise<void> {
   if (store.entries.length > MAX_ENTRIES) {
     store.entries = store.entries.slice(store.entries.length - MAX_ENTRIES);
   }
-  await chrome.storage.local.set({ [STORAGE_KEY]: store });
+  await persistedSet({ [STORAGE_KEY]: store });
 }
 
 // ─── SHA-256 Helper ─────────────────────────────────────────────────────────

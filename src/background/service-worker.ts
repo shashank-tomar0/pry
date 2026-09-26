@@ -20,6 +20,7 @@ import { getActiveNerSpans, getActivePiiTargets } from "./ml-bridge";
 import { findUnlocatedValues, unplacedAfterLocators, unverifiedElementTargets } from "../shared/redaction-reconciliation";
 import { ensureOffscreenDocument } from "./offscreen-doc";
 import { runTask } from "./agent";
+import { persistedSet } from "./storage-guard";
 import { warmOcrWorker } from "../offscreen/ocr";
 import { createPlanner } from "./providers";
 import { generateLessons } from "./lesson-generator";
@@ -117,7 +118,7 @@ const LAST_REFLECTION_KEY = "pry-last-reflection";
 async function emitLearningStats(lastReflection: string = ""): Promise<void> {
   try {
     if (lastReflection) {
-      await chrome.storage.local.set({ [LAST_REFLECTION_KEY]: lastReflection });
+      await persistedSet({ [LAST_REFLECTION_KEY]: lastReflection });
     }
     const stats = await getMemoryStats();
     const rulesSummary = await getRulesSummary();

@@ -6,6 +6,7 @@
  */
 
 import type { TranscriptEntry } from "../shared/types";
+import { persistedSet } from "./storage-guard";
 
 export interface Session {
   id: string;
@@ -40,7 +41,7 @@ export async function saveSession(session: Session): Promise<void> {
     sessions.length = MAX_SESSIONS;
   }
 
-  await chrome.storage.local.set({ [STORAGE_KEY]: sessions });
+  await persistedSet({ [STORAGE_KEY]: sessions });
 }
 
 /**
@@ -58,7 +59,7 @@ export async function deleteSession(id: string): Promise<void> {
   const { [STORAGE_KEY]: existing } = await chrome.storage.local.get(STORAGE_KEY);
   const sessions: Session[] = existing ?? [];
   const filtered = sessions.filter((s) => s.id !== id);
-  await chrome.storage.local.set({ [STORAGE_KEY]: filtered });
+  await persistedSet({ [STORAGE_KEY]: filtered });
 }
 
 /**

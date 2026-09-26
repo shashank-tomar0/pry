@@ -11,6 +11,8 @@
  * domain and in total; matching is a pure function so the harness can test it.
  */
 
+import { persistedSet } from "./storage-guard";
+
 export interface Lesson {
   id: string;
   domain: string;
@@ -31,7 +33,7 @@ async function getStored(): Promise<Lesson[]> {
 }
 
 async function saveStored(lessons: Lesson[]): Promise<void> {
-  await chrome.storage.local.set({ [STORAGE_KEY]: lessons.slice(0, MAX_TOTAL) });
+  await persistedSet({ [STORAGE_KEY]: lessons.slice(0, MAX_TOTAL) });
 }
 
 export async function getLessons(): Promise<Lesson[]> {

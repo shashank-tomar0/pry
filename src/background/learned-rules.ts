@@ -10,6 +10,7 @@
  */
 
 import type { LearnedRule, ReflectionResult } from "./reflection.js";
+import { persistedSet } from "./storage-guard";
 
 // ─── Storage ────────────────────────────────────────────────────────────────
 
@@ -67,7 +68,7 @@ async function saveRules(rules: LearnedRule[]): Promise<void> {
     rules.sort((a, b) => b.confidence - a.confidence);
     rules.length = MAX_RULES;
   }
-  await chrome.storage.local.set({ [STORAGE_KEY]: rules });
+  await persistedSet({ [STORAGE_KEY]: rules });
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────────

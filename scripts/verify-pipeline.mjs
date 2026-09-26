@@ -2226,6 +2226,51 @@ const leakRecord = (await wireLog.wireRecords())[0];
 ok("leaked findings are preserved on the record (loud banner data)",
   leakRecord.leaked.length === 1 && leakRecord.leaked[0].label === "Email address");
 
+// ─── Scenario AB2: storage pressure never kills a run ─────────────────────
+// Reported live: `IO error: …000549.ldb: FILE_ERROR_NO_SPACE
+// (ChromeMethodBFE:3::WritableFileAppend::8)` printed as a run-killing card
+// with disk space available — a rejected chrome.storage write propagated into
+// the run. Every background writer now goes through a guard that returns
+// false instead of throwing, persisted wire payloads are trimmed, and the
+// manifest lifts the quota.
+const { persistedSet } = await import("../src/background/storage-guard.ts");
+// Save the file's mem-shim: these probes swap the backend and must hand it back.
+const savedChrome = globalThis.chrome;
+delete globalThis.chrome;
+ok("a missing storage backend resolves false, never throws",
+  (await persistedSet({ k: "v" })) === false);
+globalThis.chrome = { storage: { local: { set: async () => { throw new Error("FILE_ERROR_NO_SPACE"); } } } };
+ok("a rejected write resolves false, never throws",
+  (await persistedSet({ k: "v" })) === false);
+globalThis.chrome = { storage: { local: { set: async () => undefined } } };
+ok("a working backend still resolves true",
+  (await persistedSet({ k: "v" })) === true);
+globalThis.chrome = savedChrome;
+ok("persisted wire records trim message bodies with an honest marker",
+  (() => {
+    const big = "x".repeat(5000);
+    const trimmed = wireLog.trimRecordForStorage({
+      id: "w1", turn: 1, at: 1, destination: "d", systemChars: 1,
+      messages: [{ role: "user", text: big }, { role: "assistant", text: "short" }],
+      tokens: [], leaked: [], totalChars: 5001,
+    });
+    return trimmed.messages[0].text.length < big.length &&
+      /more characters not stored/.test(trimmed.messages[0].text) &&
+      trimmed.messages[1].text === "short" &&
+      trimmed.destination === "d" && trimmed.totalChars === 5001;
+  })());
+const storageWriters = await Promise.all(
+  ["experience-memory.ts", "history.ts", "learned-rules.ts", "lessons.ts",
+    "trajectories.ts", "privacy-ledger.ts", "wire-log.ts", "service-worker.ts"].map((f) =>
+    readFile(`src/background/${f}`, "utf8")),
+);
+ok("every background store writes through the guard, never raw",
+  storageWriters.every((s) => /persistedSet\(\{/.test(s)) &&
+    !storageWriters.some((s) => /chrome\.storage\.local\.set/.test(s)));
+const manifestJson = JSON.parse(await readFile("src/manifest.json", "utf8"));
+ok("the manifest lifts the storage quota",
+  Array.isArray(manifestJson.permissions) && manifestJson.permissions.includes("unlimitedStorage"));
+
 // ── Tier-0 ML: fusion detector + ml settings migration ──────────────────────
 console.log("\n=== Scenario AC: fusion detector v2 + ml settings ===\n");
 

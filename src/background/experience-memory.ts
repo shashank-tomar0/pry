@@ -9,6 +9,8 @@
  * Key: "pry-experience-memory"
  */
 
+import { persistedSet } from "./storage-guard";
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export interface PIIExperience {
@@ -123,7 +125,7 @@ async function saveExperiences(experiences: RunExperience[]): Promise<void> {
   if (experiences.length > MAX_EXPERIENCES) {
     experiences = experiences.slice(0, MAX_EXPERIENCES);
   }
-  await chrome.storage.local.set({ [STORAGE_KEY]: experiences });
+  await persistedSet({ [STORAGE_KEY]: experiences });
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────────

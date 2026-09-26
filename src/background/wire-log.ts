@@ -21,6 +21,7 @@
 
 import { matchPiiInText } from "../shared/text-pii-patterns";
 import { maskSample } from "./tokenizer";
+import { persistedSet } from "./storage-guard";
 
 export interface WireMessage {
   role: string;
@@ -61,12 +62,36 @@ let records: WireRecord[] = [];
 let sequence = 0;
 let loaded = false;
 
+/**
+ * What one persisted message may hold. Full turn payloads (tens of KB of page
+ * reads) live in memory for the run; only a bounded head is written to disk —
+ * otherwise 24 full turns steadily eat the extension storage quota until a
+ * write fails mid-run (`FILE_ERROR_NO_SPACE` reached a live transcript that
+ * way). The truncation marker states the omitted count, so a trimmed record
+ * never passes as a complete payload.
+ */
+const PERSISTED_MESSAGE_CHARS = 2000;
+
+export function trimRecordForStorage(record: WireRecord): WireRecord {
+  return {
+    ...record,
+    messages: record.messages.map((m) =>
+      m.text.length > PERSISTED_MESSAGE_CHARS
+        ? {
+            ...m,
+            text:
+              m.text.slice(0, PERSISTED_MESSAGE_CHARS) +
+              `\n[… ${m.text.length - PERSISTED_MESSAGE_CHARS} more characters not stored]`,
+          }
+        : m,
+    ),
+  };
+}
+
 async function persist(): Promise<void> {
-  try {
-    await chrome.storage.local.set({ [STORAGE_KEY]: records });
-  } catch {
-    // Storage full or unavailable — the in-memory log still serves this run.
-  }
+  // Best-effort: on a storage failure the in-memory log (full text) still
+  // serves this run, and the next load simply starts empty.
+  await persistedSet({ [STORAGE_KEY]: records.map(trimRecordForStorage) });
 }
 
 /** Lazily reload persisted records (after a service-worker suspension). */

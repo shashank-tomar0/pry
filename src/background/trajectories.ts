@@ -10,6 +10,8 @@
  * Storage: chrome.storage.local, key "pry-trajectories".
  */
 
+import { persistedSet } from "./storage-guard";
+
 export interface Trajectory {
   id: string;
   domain: string;
@@ -58,7 +60,7 @@ export async function recordTrajectory(
     perDomain.set(t.domain, n + 1);
     return true;
   });
-  await chrome.storage.local.set({ [STORAGE_KEY]: capped.slice(0, MAX_TOTAL) });
+  await persistedSet({ [STORAGE_KEY]: capped.slice(0, MAX_TOTAL) });
 }
 
 /** Pure: pick the most relevant past successes for this domain+page type. */

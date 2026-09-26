@@ -5177,9 +5177,24 @@ const storedRoute = [{
 }];
 const routeText = renderTrajectoryRoutes(storedRoute);
 ok("no matching route renders nothing at all", renderTrajectoryRoutes([]) === "");
-ok("a route still shows the older task and the path that solved it",
-  routeText.includes("Task: open youtube and play the first video") &&
-  routeText.includes("Steps: navigate → type → click_text"));
+ok("a route shows the path that solved it, sited where it worked",
+  routeText.includes("On youtube.com (video): navigate → type → click_text"));
+// Reported live: a run whose task said only "ask him to come tomorrow"
+// reasoned "compose a good invite … for their birthday, inventing things" —
+// verbatim phrasing from the PREVIOUS task, replayed as `Task: …`. The older
+// task's words are never rendered anymore, so there is nothing to quote.
+const bleedRoute = [{
+  id: "t9", domain: "mail.google.com", pageType: "email",
+  task: "write a email to <CRED_1> and compose a good invite to come for tommorw for my birthday (you can invent things)",
+  steps: "click → type → click",
+  answer: "", createdAt: 2,
+}];
+const bleedText = renderTrajectoryRoutes(bleedRoute);
+ok("an older task's wording never reaches the prompt, however salient",
+  !/birthday/i.test(bleedText) && !/invent/i.test(bleedText) && !/Task:/.test(bleedText),
+  bleedText.slice(0, 200));
+ok("but its path still does, sited by domain",
+  /On mail\.google\.com \(email\): click → type → click/.test(bleedText));
 ok("but the block now says a route's LENGTH is not part of the route",
   /A route's LENGTH is not part of it/.test(routeText));
 ok("and that the run ends when THIS task's words are satisfied, not the example's",
@@ -5335,8 +5350,9 @@ ok("the learning reset actually covers the replay stores, not just rules",
   /case "clear-learning":[\s\S]{0,1200}clearTrajectories\(\)/.test(workerMemorySource) &&
   /case "clear-learning":[\s\S]{0,1200}clearLessons\(\)/.test(workerMemorySource));
 const trajRenderSource = await readFile("src/background/trajectories.ts", "utf8");
-ok("replayed routes say their bracketed spans were removed at write time",
-  /where that older[\s\S]{0,24}task's own words were removed/.test(trajRenderSource));
+ok("replayed routes carry no prior-task words at all, not even bracketed ones",
+  /older task's own words are deliberately NOT shown/.test(trajRenderSource) &&
+    !/Task: \$\{t\.task\}/.test(trajRenderSource));
 ok("replayed lessons say they are site logic, not the current task",
   /never names,[\s\S]{0,80}search terms, or values to reuse/.test(agentHistorySource));
 

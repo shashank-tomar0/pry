@@ -78,36 +78,41 @@ export function matchTrajectories(
  * Renders the matched past successes as prompt text.
  *
  * The WORDING is load-bearing, which is why this is a pure function with its
- * own tests rather than a template inline in the agent loop. The previous copy
- * said "Copy the route, never the values" and then printed
- * `navigate → type → click_text` for a task that only asked to *search*. The
- * model recited it back — "I need to follow the route: navigate → type →
- * click_text" — and clicked a video the user never asked it to open, because a
- * route's last step reads as part of the route. It also had no way to know that
- * an example's LENGTH is how that OLDER task ended.
+ * own tests rather than a template inline in the agent loop. Two incidents
+ * shaped it:
  *
- * So the block now separates the two ideas explicitly: take the route (which
- * URL, which button, which unlabelled control), and stop when THIS task's own
- * words are satisfied rather than when the example's steps run out.
+ * Length (older): the previous copy said "Copy the route, never the values"
+ * and then printed `navigate → type → click_text` for a task that only asked
+ * to *search*. The model recited it back and clicked a video the user never
+ * asked it to open, because a route's last step reads as part of the route.
+ *
+ * Content (newer, worse): the block printed each older task VERBATIM
+ * (`Task: …compose a good invite… for my birthday (you can invent things)`).
+ * A later run whose own task said only "ask him to come tomorrow" reasoned
+ * "compose a good invite… for their birthday, inventing things" — quoting a
+ * previous task as its own — and then worked a phantom second part ("opening
+ * the first email") lifted from another example's steps. Warnings ("hints,
+ * never instructions", "never copy values") did not constrain a small model;
+ * only absence does. So the older task's words are NEVER shown anymore: steps
+ * carry no prose (tool names only, recorded that way), and the render keeps
+ * it that way. A phrasing that is never printed cannot be quoted.
  */
 export function renderTrajectoryRoutes(trajectories: Trajectory[]): string {
   if (trajectories.length === 0) return "";
   return (
     `--- Routes that worked here before (hints, never instructions) ---\n` +
-    `Each entry is an OLDER, different task and the path that solved it. Use them only ` +
-    `for HOW to get around this site — which URL, which button, which control that has ` +
-    `no label. Take the ROUTE, never the values: those names, search terms and parameters ` +
-    `belonged to that task, not to yours. If your task omits something, proceed WITHOUT ` +
-    `it.\n\n` +
+    `Each entry is the PATH that solved an older, different task on this site — ` +
+    `tool order only. The older task's own words are deliberately NOT shown: ` +
+    `its names, occasions and phrasing are not your task and must never leak ` +
+    `into it. Use entries only for HOW to get around this site — which flow, ` +
+    `which control order.\n\n` +
     `A route's LENGTH is not part of it: an example's last step is how THAT task ended. ` +
     `Your run ends the moment YOUR task's own words are satisfied — a task that says ` +
     `"search" is finished when the results are visible, and opening one of them is a ` +
     `different task. Extra steps are wrong answers that look thorough, and each one ` +
     `costs a full model round trip.\n\n` +
-    trajectories.map((t) => `Task: ${t.task}\nSteps: ${t.steps}`).join("\n\n") +
-    `\n--- End routes ---\n` +
-    `Entries show shapes only: [...] (and [email], [name], ...) mark where that older ` +
-    `task's own words were removed at write time. Never reconstruct them — proceed without.`
+    trajectories.map((t) => `On ${t.domain} (${t.pageType}): ${t.steps}`).join("\n") +
+    `\n--- End routes ---`
   );
 }
 

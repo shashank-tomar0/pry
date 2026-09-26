@@ -25,13 +25,15 @@ Developed for Smart India Hackathon 2026, Problem Statement 26171: *On-Device Vi
   - [5.2 Quantized BERT Token Classification (ONNX Runtime Web)](#52-quantized-bert-token-classification-onnx-runtime-web)
   - [5.3 Tesseract.js WebAssembly LSTM Engine (Adversarial Auditor)](#53-tesseractjs-webassembly-lstm-engine-adversarial-auditor)
   - [5.4 ElevenLabs Scribe Realtime and Flash v2.5](#54-elevenlabs-scribe-realtime-and-flash-v25)
-  - [5.5 Remote Multimodal Planner (NVIDIA NIM)](#55-remote-multimodal-planner-nvidia-nim)
+  - [5.5 Planner (multi-provider: remote or fully local)](#55-planner-multi-provider-remote-or-fully-local)
   - [5.6 Architectural Assessment: GLiNER Model Integration](#56-architectural-assessment-gliner-model-integration)
+  - [5.7 Experience replay without content bleed](#57-experience-replay-without-content-bleed)
 - [6. Mathematical and Cryptographic Specifications](#6-mathematical-and-cryptographic-specifications)
   - [6.1 Format-Preserving Surrogate Generation (hash-derived, not FF3-1)](#61-format-preserving-surrogate-generation-hash-derived-not-ff3-1)
   - [6.2 Mathematical Checksum Verification (Luhn and Verhoeff Algorithms)](#62-mathematical-checksum-verification-luhn-and-verhoeff-algorithms)
   - [6.3 Visual Redaction Tiers and the Reversibility Test](#63-visual-redaction-tiers-and-the-reversibility-test)
   - [6.4 Immutable Merkle Directed Acyclic Graph (DAG) Ledger](#64-immutable-merkle-directed-acyclic-graph-dag-ledger)
+  - [6.5 Detection Coverage and Known Gaps](#65-detection-coverage-and-known-gaps)
 - [7. Outbound Egress Tripwire and Security Invariants](#7-outbound-egress-tripwire-and-security-invariants)
   - [7.1 Observational Egress Monitoring (not interception)](#71-observational-egress-monitoring-not-interception)
   - [7.2 Ephemeral Secret Vault Management](#72-ephemeral-secret-vault-management)
@@ -42,7 +44,10 @@ Developed for Smart India Hackathon 2026, Problem Statement 26171: *On-Device Vi
   - [11.1 Prerequisites](#111-prerequisites)
   - [11.2 Verification Test Suite](#112-verification-test-suite)
   - [11.3 Production Build Process](#113-production-build-process)
-  - [11.4 Browser Deployment](#114-browser-deployment)
+  - [11.4 Latency Benchmark](#114-latency-benchmark)
+  - [11.5 Demo Fixtures](#115-demo-fixtures)
+  - [11.6 Browser Deployment](#116-browser-deployment)
+  - [11.7 Packaged build (release artifact)](#117-packaged-build-release-artifact)
 - [12. Regulatory and Compliance Alignment](#12-regulatory-and-compliance-alignment)
 - [13. License](#13-license)
 
@@ -50,42 +55,32 @@ Developed for Smart India Hackathon 2026, Problem Statement 26171: *On-Device Vi
 
 ## 1. Executive Summary
 
-Autonomous web agents require visual perception and DOM structural data to interpret context, complete transactions, and operate enterprise software. Standard agent architectures capture uncompressed viewports and send raw Document Object Model (DOM) trees to remote cloud-hosted foundational models. This approach creates critical attack surfaces and exposes confidential user data.
+Standard agent architectures capture viewports and send raw DOM trees to cloud models — exposing confidential user data. PRY establishes a local security boundary: an on-device perception engine (DOM heuristics plus neural computer vision over WebGPU/WebAssembly SIMD) redacts before anything leaves.
 
-PRY establishes a local security boundary within the client runtime. It executes an on-device perception engine combining DOM heuristics with neural computer vision models running via WebGPU and WebAssembly SIMD.
-
-Key capabilities of PRY include:
-- Client-side redaction of detected faces, government IDs, biometric data, credentials, and payment records.
-- Deterministic format-preserving surrogates: the replacement keeps the original's length, character classes, and checksum validity (Luhn for cards, Verhoeff for Aadhaar), so downstream validation and model reasoning survive the swap. The generator is a hash-derived, Feistel-style digit mapping — **not** a NIST SP 800-38G FF3-1 cipher (see §6.1).
-- Irreversible destruction of detected faces: the region is overwritten with an opaque fill. Deliberately NOT a blur — blur is a recoverable low-pass filter. Detection is best-effort across three local channels (BlazeFace run over the whole frame AND over native-resolution tiles of it, Chrome's shape detector, and a skin-colour pass that exists specifically to catch the thumbnail-sized faces a short-range model misses). The guarantee is irreversibility of what is detected; it is not a claim of complete detection.
-- On-device adversarial OCR verification of the exact bytes that ship: every redacted region is re-read from the post-JPEG frame, and the frame is rebuilt with those regions destroyed if any readable character survives. The proof covers the regions PRY redacted — it is not evidence that it detected everything on the page.
-- Tamper-evident SHA-256 ledger with an exportable Merkle root and full leaf list (`audit-proof.json`), verifying that the recorded redactions occurred in order before transmission.
-- Pre-flight egress tripwire observing the page's own outbound payloads and reporting PII-shaped sends, separating the site's own backend traffic from genuine third-party egress. **It reports; it does not block** (§7.1).
+Key capabilities:
+- Client-side redaction of faces, government IDs, credentials, and payment records — faces destroyed with an opaque fill, never a recoverable blur, across three local channels (BlazeFace over the whole frame and native-resolution tiles, Chrome's shape detector, skin-colour pass). The guarantee is irreversibility of what is detected, not complete detection.
+- Format-preserving surrogates: replacements keep length, character classes, and checksum validity (Luhn/Verhoeff), so validation and model reasoning survive the swap. Hash-derived and unkeyed — **not** NIST FF3-1 (see §6.1).
+- Adversarial OCR verification of the exact shipped bytes: every redacted region is re-read post-JPEG, and frames that leak are rebuilt fully opaque. Proof covers redacted regions, not undiscovered PII.
+- Tamper-evident SHA-256 ledger with exportable Merkle root (`audit-proof.json`).
+- Egress tripwire reporting PII-shaped page sends by destination. **Reports; never blocks** (§7.1).
 
 ---
 
 ## 2. Problem Statement and Threat Model
 
 ### 2.1 The Multimodal Screen Leakage Vulnerability
-When a multimodal browser agent takes an action, it captures a raster screenshot of the current active window and collects the rendered DOM hierarchy. This payload is transmitted over HTTPS to external inference APIs (e.g., OpenAI GPT-4o, Anthropic Claude 3.5 Sonnet, or remote open-weight models).
-
-This transmission introduces serious security vulnerabilities:
-- **Biometric Exposure:** User profile photos, passport images, and video conference feeds are ingested into third-party cloud data centers.
-- **Credential and Identity Leaks:** Government credentials (Aadhaar, PAN, SSN) and financial cards visible on screen are logged in cloud inference traces.
-- **Training Data Ingestion:** User session information may be persisted in remote model telemetry or used in training pipelines.
+A multimodal agent screenshots the active window, collects the DOM, and ships both over HTTPS to external inference APIs. That payload routinely carries profile photos and video feeds (biometrics), visible Aadhaar/PAN/cards (identity theft, cloud log traces), and session content that may persist in provider telemetry or training pipelines.
 
 ### 2.2 Threat Vectors Addressed
-PRY defends against four distinct threat vectors:
-- **Threat Vector 1: Cloud Eavesdropping and Provider Breach.** Compromise of external model providers cannot expose user secrets because payloads contain only synthetic surrogates and opaque, zero-entropy masks. No original pixel of a redacted region is transmitted, so there is nothing in the payload to reconstruct.
-- **Threat Vector 2: Super-Resolution De-Blurring Attacks.** Simple pixelation and weak blur filters are recoverable: super-resolution deanonymization reconstructs Gaussian-blurred faces, and deconvolution inverts a known blur kernel. PRY therefore does not rely on blur for biometric identifiers. Faces are destroyed with an opaque fill, and any soft-tier region that the adversarial OCR auditor can still read is escalated to an opaque fill before the image ships.
-- **Threat Vector 3: Broken Agent Reasoning via Brittle Masking.** Replacing an account number with `[REDACTED]` breaks client-side form validation and confuses model reasoning. PRY produces synthetically valid, format-preserving numbers.
-- **Threat Vector 4: Unverifiable Compliance.** Organizations cannot prove to regulatory bodies that PII was withheld from external models. PRY outputs an immutable, mathematically verifiable Merkle audit DAG.
+- **Threat Vector 1: Cloud Eavesdropping and Provider Breach.** Payloads contain only synthetic surrogates and zero-entropy masks — no original pixel of a redacted region is transmitted, so there is nothing to reconstruct.
+- **Threat Vector 2: Super-Resolution De-Blurring.** Gaussian blur and pixelation are recoverable (super-resolution, deconvolution). PRY never blurs biometric identifiers: faces are opaquely destroyed, and any soft-tier region the OCR auditor can still read is escalated to opaque before shipping.
+- **Threat Vector 3: Broken Reasoning via Brittle Masking.** `[REDACTED]` breaks form validation and confuses models. PRY substitutes synthetically valid, format-preserving numbers.
+- **Threat Vector 4: Unverifiable Compliance.** PRY outputs an immutable, verifiable Merkle audit DAG instead of server-side text logs.
 
 ### 2.3 Regulatory Non-Compliance Risks
-PRY mitigates non-compliance penalties under major privacy frameworks:
-- **India DPDP Act 2023 (Section 6):** Enforces purpose limitation and strict protection of biometric and identification numbers.
-- **GDPR Article 9 and Article 25:** Mandates Data Protection by Design and Default, prohibiting the unauthorized processing of special category personal data.
-- **HIPAA Privacy Rule (45 CFR Part 160/164):** Requires strict safeguarding of Protected Health Information (PHI) within browser sessions.
+- **India DPDP Act 2023 (Section 6):** purpose limitation and protection of biometric and identification numbers.
+- **GDPR Article 9 and Article 25:** no unauthorized processing of special-category data; protection by design and default.
+- **HIPAA Privacy Rule (45 CFR Part 160/164):** safeguarding PHI within browser sessions.
 
 ---
 
@@ -126,7 +121,7 @@ flowchart TD
     end
 
     subgraph ExternalCloud["External Cloud Endpoints"]
-        InferenceAPI["Remote Multimodal Planner<br/>- NVIDIA NIM (nemotron-3.5-lightning)"]
+        InferenceAPI["User-chosen planner<br/>- Groq / NVIDIA / OpenRouter / Ollama"]
         VoiceAPI["ElevenLabs Realtime Audio<br/>- PCM16 Streaming"]
     end
 
@@ -151,15 +146,13 @@ flowchart TD
 ```
 
 ### 3.1 Manifest V3 Architectural Topology
-- **Content Scripts:** Execute within an Isolated World. They have read-only inspection access to the host page DOM but run in an isolated JavaScript namespace, preventing webpage scripts from tampering with PRY internal state.
-- **Service Worker:** The event-driven central coordinator. Manages communication across tabs, generates format-preserving surrogates, maintains the in-memory token map, builds the Merkle audit tree, and enforces outbound network tripwires.
-- **Offscreen Document:** Service workers in Manifest V3 do not have access to the DOM or the HTML5 Canvas API. PRY instantiates a dedicated offscreen document (`offscreen/index.html`) with hardware-accelerated WebGPU and WebAssembly capabilities to perform all computer vision, convolution filtering, and adversarial OCR operations.
+- **Content Scripts:** read-only DOM inspection in an Isolated World — page scripts cannot tamper with PRY state.
+- **Service Worker:** event-driven coordinator — tab communication, surrogates, in-memory token map, Merkle tree, tripwires.
+- **Offscreen Document:** the DOM/Canvas access MV3 denies workers — all vision, convolution and adversarial OCR run here over WebGPU/WebAssembly.
 
 ### 3.2 Component Process Boundaries
-The extension maintains explicit process isolation:
-- No raw image data is stored in persistent extension storage (`chrome.storage.local`).
-- All bitmap representations reside in ephemeral offscreen memory and are garbage-collected immediately following redaction.
-- Token↔value mappings live only in the service worker's heap: never written to `chrome.storage`, and cleared when the worker is torn down (§7.2). Not encrypted, not partitioned per tab.
+- No raw image data in persistent storage; bitmaps live in ephemeral offscreen memory, garbage-collected after redaction.
+- Token↔value mappings live only in the worker heap: never in `chrome.storage`, cleared on teardown (§7.2). Plain `Map`, unencrypted, unpartitioned.
 
 ---
 
@@ -193,10 +186,10 @@ sequenceDiagram
     SW->>SW: Fuse Coordinates via Intersection-over-Union (IoU)
     SW->>SW: Compute Format-Preserving Surrogates (Plaintext Kept in the In-Memory Token Map)
     SW->>OS: Dispatch Redaction Coordinates
+    OS->>OS: Run Adversarial LSTM OCR Over the Redacted Regions
     OS->>OS: Faces to opaque destroy
     OS->>OS: Text PII to solid mask
     OS->>OS: Fields to surrogate or soft blur
-    OS->>OS: Run Adversarial LSTM OCR Over the Redacted Regions
     alt Any Readable PII Survives
         OS->>OS: Rebuild Frame From Original: Every Region Opaque (#000000), Re-encode, Re-verify
     end
@@ -211,116 +204,101 @@ sequenceDiagram
 
 ### 4.1 Mesh 1: Deterministic DOM Analysis
 - **Target:** Form controls, password inputs, text fields, rendered text nodes, and ARIA attributes.
-- **Execution:** Runs in the Content Script. Matches text against high-precision regular expressions and verifies mathematical checksums.
-- **Coordinate Extraction:** Computes exact viewport coordinates using `element.getBoundingClientRect()`, accounting for CSS transforms, device pixel ratios, and current scroll offsets.
+- **Execution:** Content-script regex matching with checksum verification; viewport coordinates via `getBoundingClientRect()`, accounting for transforms, DPR, and scroll.
 - **Control names count as findable text.** A search `<input>` has no text node — its name lives in `placeholder`/`aria-label` — so `find_text` once reported "no visible text" for a box field matching found a turn later. It now sweeps placeholders, aria-labels, image alts, tooltips and submit values through the same matcher, labelling hits by source (`Search [placeholder]`) so the planner reaches for `type_text`.
-- **Email addresses commit exactly.** Typing a correct address still delivered it to the wrong contact: the synthetic Enter landed on a highlighted non-matching suggestion, and Gmail took the suggestion. `typeInto` now clicks an offered suggestion only when it carries exactly the typed address, dismisses anything else with Escape first, commits with Tab, and verifies the address in the compose dialog — reporting "verify the To field" instead of claiming a chip it cannot prove.
+- **Email addresses commit exactly.** A correct address still reached the wrong contact: synthetic Enter landed on a highlighted non-matching suggestion, and Gmail took it. `typeInto` now clicks an offered suggestion only when it carries exactly the typed address, dismisses anything else with Escape first, commits with Tab, and verifies the address in the compose dialog — reporting "verify the To field" instead of claiming an unproven chip.
 
 ### 4.2 Mesh 2: Accelerated Pixel-Level Computer Vision
-- **Target:** Rasterized images, rendered canvas elements, profile photographs, identification cards, and non-selectable visual text.
-- **Execution:** Runs in the Offscreen Document using MediaPipe BlazeFace and quantized BERT NER.
-- **Feature:** Operates independently of DOM structure, ensuring that obfuscated DOM layouts or SVG text remain protected.
+- **Target:** Rasterized images, canvas elements, profile photos, ID cards, non-selectable text.
+- **Execution:** Offscreen MediaPipe BlazeFace plus quantized BERT NER — independent of DOM structure, so obfuscated layouts and SVG text stay protected.
 
 ### 4.3 Mesh Fusion and Coordinate Spatial Alignment
-The Service Worker reconciles regions from both meshes:
-- Computes Intersection-over-Union (IoU) metrics across candidate bounding boxes.
-- Merges overlapping or adjacent regions into a single envelope bounding box with a 4-pixel safety margin.
-- Assigns PII class identifiers (`face`, `credit_card`, `aadhaar`, `pan`, `email`, `phone`, `name`).
+The worker reconciles both meshes via IoU, merges overlaps into one envelope box (4-pixel safety margin), and assigns PII classes (`face`, `credit_card`, `aadhaar`, `pan`, `email`, `phone`, `name`).
 
 ---
 
 ## 5. Machine Learning Models and Runtime Specifications
 
-PRY embeds all perceptual machine learning models locally. Zero perceptual inference data leaves the user machine:
+All perceptual models run locally. Zero perceptual inference data leaves the machine:
 
 ### 5.1 MediaPipe BlazeFace Short-Range TFLite
-- **Model File:** `models/blazeface/face_detection_short_range.tflite` (224 KB).
-- **Network Topology:** Single-Shot Detector (SSD) architecture with a custom anchor grid optimized for 128x128 pixel receptive fields.
-- **Runtime Execution:** Initialized via `@mediapipe/tasks-vision` configured with `delegate: "GPU"`. Shaders execute over the client WebGPU pipeline.
-- **Performance:** 4 to 9 milliseconds inference latency per viewport frame on integrated graphics hardware.
-- **Degradation Contract:** If WebGPU initialization fails (due to driver blacklisting or system constraints), the runtime automatically falls back to WebAssembly SIMD execution.
+`models/blazeface/face_detection_short_range.tflite` (224 KB, SSD, 128×128 receptive field) via `@mediapipe/tasks-vision` (`delegate: "GPU"`), 4–9 ms per frame on integrated graphics, WebAssembly SIMD fallback when WebGPU is unavailable.
 
 ### 5.2 Quantized BERT Token Classification (ONNX Runtime Web)
-- **Model File:** `models/ner/onnx/model_quantized.onnx` (108 MB quantized weights).
-- **Base Architecture:** `dslim/bert-base-NER` quantized to 8-bit integers (Q8).
-- **Runtime Execution:** Managed by `@huggingface/transformers` using `onnxruntime-web` with WebAssembly SIMD multi-threading.
-- **Functional Role:** Discovers unstructured named entities (personal names, organization titles, geographical locations) that cannot be detected by regular expressions.
-- **Inference Optimization:** Input text sequences are bounded at 4,000 characters to prevent thread blocking during large document perception.
+`models/ner/onnx/model_quantized.onnx` (108 MB, Q8 `dslim/bert-base-NER`) via `@huggingface/transformers` + `onnxruntime-web` WASM SIMD. Finds names/organizations/locations no regex can; inputs bounded at 4,000 chars.
 
 ### 5.3 Tesseract.js WebAssembly LSTM Engine (Adversarial Auditor)
-- **Model Architecture:** Integer-quantized Long Short-Term Memory (LSTM) recurrent neural network compiled to WebAssembly.
-- **Functional Role:** Automated adversarial red-team auditor that both detects and REMEDIATES weak redactions.
-- **Operational Logic:**
-  1. Each redacted region is cropped from the EXACT bytes that will be shipped (the post-JPEG image) and composited into one strip.
-  2. Tesseract.js re-reads that strip. Scanning only the pipeline's own redacted crops is what keeps the check honest: PII legitimately visible elsewhere on the page (an email in an inbox row) is not a leak.
-  3. If any PII pattern still reads out of a region, the auditor does not merely warn. The whole frame is rebuilt from the untouched original pixels with every region destroyed (`#000000`), re-encoded, and re-verified.
-  4. Only the rebuilt image is allowed to reach the model, so a proven-insufficient redaction cannot ship.
-- **Pixel-level companion check:** independently of OCR, each region is compared against its pre-redaction pixels. Faces must come back near-uniformly opaque; a merely "changed" face region fails, because a change is not the same as irreversibility.
+Integer-quantized LSTM in WASM that detects **and remediates** weak redactions: each region is cropped from the exact post-JPEG shipped bytes into one strip and re-read (scanning only the pipeline's own crops keeps the check honest). Any legible region rebuilds the whole frame fully opaque (`#000000`), re-encoded and re-verified — only the rebuild ships. Companion pixel check requires faces to come back near-uniformly opaque; a merely "changed" face fails.
 
 ### 5.4 ElevenLabs Scribe Realtime and Flash v2.5
-- **Speech-to-Text (STT):** Custom Web Audio API pipeline sampling microphone input at 16,000 Hz in single-channel linear PCM16 format. Audio frames (250 ms) are streamed over WebSocket directly to the ElevenLabs Scribe endpoint.
-- **Microphone permission:** the side panel calls `getUserMedia` directly, so the manifest must declare `audioCapture`. Chrome requires it for extension pages, and without it the device list is hidden from the extension and the failure surfaces as `NotFoundError: Requested device not found` — a hardware-sounding error for a manifest problem. If the mic reports a failure, the panel now names the actual cause (missing permission, no input device, a blocked prompt, or a device held by another app) instead of echoing Chrome's message; the check is `chrome.runtime.getManifest().permissions`, so it cannot be wrong about which case it is.
-- **Text-to-Speech (TTS):** Generates low-latency operational audio responses via ElevenLabs Flash v2.5.
-- **Vocal Privacy Boundary:** All outgoing speech is decided in one place, `voice-core.toSpeakable()`. It replaces vault tokens (such as `<CRED_1>` or synthetic credit card numbers) with the spoken word "redacted", flattens markdown, and caps length — so a secret is never vocalized. A token is a reason to **redact, never a reason to refuse**: the previous `speak()` guard checked for a token first and returned an error before that transform ran, so any answer quoting one back (the Gmail tab title alone carries `<CRED_1>`) produced "Refusing to speak: raw vault token in assistant text" instead of audio. The number of tokens spoken as "redacted" is reported, so a substitution is never mistaken for the model's own wording.
+- **STT:** 16 kHz mono PCM16 over WebSocket to Scribe. The manifest must declare `audioCapture`, or the device list hides and the failure surfaces as a hardware-sounding `NotFoundError` — the panel names the real cause (permission, device, blocked prompt, held device) via `chrome.runtime.getManifest().permissions`.
+- **TTS:** Flash v2.5 narration with a vocal privacy boundary: `voice-core.toSpeakable()` speaks vault tokens as "redacted", flattens markdown, caps length. A token triggers redaction, never refusal (refusing on tokens once silenced every answer quoting one back), and the redaction count is reported.
 
 ### 5.5 Planner (multi-provider: remote or fully local)
-- **Model:** provider-configurable; the shipped default is `nvidia/nemotron-3.5-lightning-30b-a3b` through the NVIDIA NIM API (see `src/shared/models.ts`). Groq, OpenRouter, Anthropic, OpenAI and fully-local Ollama resolve through one OpenAI-compatible adapter; per-provider acknowledgement budgets (60 s on NVIDIA NIM, 25 s elsewhere) and fast-model re-routing are part of the turn policy below.
-- **Operational Role:** Consumes sanitized screenshots and synthetic DOM context, outputting structured JSON action plans (clicks, keystrokes, form submissions).
-- **Zero-Trust Intent:** the planner receives tokenized text and, when vision is enabled, the post-redaction frame rather than the raw one. This is a policy the pipeline enforces, not a proof: detectors have the failure modes listed in §6.5, so treat "no PII reached the model" as conditional on those detectors firing. Vision is off by default.
+- **Model:** provider-configurable; shipped default `nvidia/nemotron-3.5-lightning-30b-a3b` via NVIDIA NIM (`src/shared/models.ts`). Groq, OpenRouter, Anthropic, OpenAI and fully-local Ollama resolve through one OpenAI-compatible adapter; per-provider acknowledgement budgets (60 s NVIDIA NIM, 25 s elsewhere) plus fast-model re-routing live in the turn policy below.
+- **Operational Role:** consumes sanitized screenshots and synthetic DOM context, outputs structured JSON action plans.
+- **Zero-Trust Intent:** enforced policy, not proof — conditional on the detectors in §6.5 firing. Vision is off by default.
 
-#### 5.5.1 Planner turn policy: how a slow or looping turn is bounded
+#### 5.5.1 Planner turn policy: bounded by silence, not wall clock
 
-A remote planner is a network service, and the failure mode that matters to the user is not a crash — it is a turn that never ends, or one that ends in junk presented as an answer. One planner turn (`agent.ts`) is bounded by **silence, not by wall clock**, because a reasoning model that is visibly making progress must be allowed to finish:
+A reasoning model visibly progressing must finish, so one turn (`agent.ts`) is bounded by what it *stops doing*:
 
 | Boundary | Budget | What it catches |
 | :--- | :--- | :--- |
-| First output | 90 s (20 s on the retry) | A provider that never sends its first token. **Retried once** when the endpoint has proved it can serve this run — a previous turn answered, or this request was acknowledged (response headers arrived). **Not** retried for an endpoint that has never said anything at all: two 90 s silent attempts measured on NVIDIA NIM produced 180 s of dead waiting and the same error. The budget is the same on every non-retry turn deliberately: the prompt grows through a run, and the smaller cold/continuation split used to land on exactly the turns most likely to be cut. |
-| Unacknowledged request | 25 s (60 s on NVIDIA NIM) | No response **headers**: a stalled connection, a provider queue, or a machine too busy to put the request on the wire. The model has not seen the prompt, so its speed is not in question — the SAME turn is re-routed to the provider's fast model (when one exists), reusing the single retry attempt, and the note names both endpoints. With nothing to re-route to, the run stops there instead of spending the silence budget on a request nobody accepted. NVIDIA gets the longer budget because its free tier was measured queueing agent-shaped (~32 KB) requests for 51–64 s while 1 KB probes on the same key answered in ~3 s; the diagnostics block prints whichever budget the run enforced. |
-| Mid-turn silence | 30 s | A dropped connection after output started, or after the endpoint accepted a request and produced nothing. A stream that ran 45 s or more before going quiet is throughput rather than a hiccup and is not re-sent; anything shorter gets the one retry. |
-| Transport drop | — (the adapter throws) | The socket dies mid-answer. Described as the connection rather than in the socket layer's own word (`terminated`), and retried once: the prompt **did** reach the model, so this is exactly the hiccup the retry exists for. |
-| Deliberation | 12 000 reasoning chars or 90 s | A model reasoning without converging. Steered once ("act now, with what you already have"), then reported. |
-| Degeneration | 4-gram short-cycle ratio ≥ 0.5, or a 40-word block repeated 3× | A model that has collapsed into a **repetition loop**. Deltas keep arriving, so no silence window can see this, and it is the one failure that used to run to the ceiling — measured live at 100 s against `nvidia/nemotron-3.5-lightning-30b-a3b`, which collapsed into "can make it one big things. can make it." for 6 233 characters. Cut in seconds, never retried, and the loop is **not** replayed in the next turn's history. |
-| Ceiling | 210 s | The absolute bound on one turn (below Manifest V3's 5-minute limit). |
+| First output | 90 s (20 s retry) | No first token. Retried once only when the endpoint proved itself this run; never for an endpoint that said nothing (two 90 s silences measured 180 s dead). Same budget every turn: the prompt grows, and a cold/continuation split landed on the likeliest-to-cut turns. |
+| Unacknowledged request | 25 s (60 s NVIDIA NIM) | No response **headers** — stall, queue, overload. The model never saw the prompt, so the turn re-routes to the fast model when one exists; NVIDIA's budget covers its measured 51–64 s queues on ~32 KB requests. Diagnostics print the enforced budget. |
+| Mid-turn silence | 30 s | Dropped connection after output started (45 s+ of prior streaming reads as throughput, not retried). |
+| Transport drop | — (adapter throws) | Socket died mid-answer; the prompt arrived, so exactly the retryable hiccup. |
+| Deliberation | 12 000 reasoning chars or 90 s | Reasoning without converging: steered once, then reported. |
+| Degeneration | 4-gram ratio ≥ 0.5, or a 40-word block 3× | Repetition loop (deltas arrive, so silence windows can't see it; measured 100 s live). Cut in seconds, never retried or replayed. |
+| Ceiling | 210 s | Absolute bound (under MV3's 5-minute limit). |
 
-Two properties of this policy are deliberate and worth stating: the check reads **repetition, not duration**, because duration cannot tell a thorough model from a looping one; and every cut is **announced with its reason** — a withheld or stopped turn is narrated, never silent. Assistant text is also clamped (`MAX_HISTORY_TEXT_CHARS` = 1 200) before it is replayed as history, because the model's own monologue comes back to it on every later turn and an unbounded one is paid for repeatedly. Its precision is pinned in the harness against the verbatim reported loop, PRY's own system prompt, long narration, and an adversarial table of near-identical rows.
-
-**Where the time actually goes, and what the run does about it.** The number that dominates a slow run is not the model's deliberation but the endpoint's **time to first token**, and the transcript names it: a turn that waited 11 s before anything streamed reports `Planner responded in 14s (first token after 11s of that)`. The measurement is taken on every completed turn (per turn, in `settleWait`), because a single slow sample is variance and proves nothing.
-
-The measurement is split at the **response headers**, because that is where "who is late" is decided and it is not visible from outside the adapter: a first token at 11 s whose headers arrived at 10.6 s is a provider queue (fix: the fast-model switch), while the same 11 s with headers at 0.2 s is a model thinking (fix: nothing). A wait with no headers at all has a third reading, and the worst one to confuse with the other two: the request never reached the model. The adapters report all three boundaries (`PlannerMilestone`: `requested`, `headers`, `output` — where `output` is the first byte of **any** kind, because a turn that goes straight to a tool call streams no prose and would otherwise have no time-to-first-token at all, which is most of a run's turns).
-
-On that evidence a run may switch itself to the provider's fast model (`plannerSpeedUpDecision`, defaults 8 s to count as slow, 20 s to read as queueing): two slow turns, or one turn late enough that no other reading fits. It fires at most once per run, only when the provider declares a fast model that differs from the configured one, never when fast mode is already on, and never mid-turn — it re-creates the planner for the following turn and announces the model it moved to. The trade is stated rather than hidden: the provider's fast model plans worse than its reasoning default, and the run spends that judgement only after it has spent the user's time. `Options → Speed up when the provider is queueing` turns it off; nothing here writes the user's settings.
-
-**Reporting a stalled run with its timings.** Every attempt ends with one copyable block in the transcript (`plannerDiagnosticsReport`, emitted as a `diagnostics` entry with a Copy button): the planner and its fast model, the shipped budgets, then one line per attempt — the model it actually called, `headers after X, first token after Y`, how the attempt ended, how long it ran, and whether the local frame pipeline was running alongside it. "It hung for 90 seconds" is not a report anybody can act on; "the request left, no response headers arrived, the endpoint had not acknowledged it at 25 s" is. Attempts that a retry or a re-route kept going are recorded too, which is what makes the block able to name an endpoint the run abandoned.
-
-The faults that block describes cannot all be produced by a stub planner, because "no headers", "headers and then no body" and "the socket died mid-answer" are facts about a transport. `scripts/fixtures/fake-provider.mjs` is a real HTTP endpoint that speaks just enough of the OpenAI-compatible streaming API to be read by the shipped adapter, and can be told to queue, stall, drop mid-answer or never acknowledge at all; `scripts/agent-frame-audit-test.mjs` drives the whole `runTask` loop against it for each mode and asserts what the run does — what the transcript says, which model was re-sent to, how long it waited, and what the diagnostics recorded.
+Every cut is announced; repetition is checked, not duration; replay history is clamped (1 200 chars). Slow runs are dominated by time-to-first-token, split at response headers per turn: late headers mean provider queue (fix: fast-model switch — two turns past 8 s or one past 20 s, once per run, announced, never writing settings), early headers mean model thinking, no headers mean the request never arrived. Every attempt ends in a copyable diagnostics block (planner, budgets, per-attempt headers/first-token/outcome); transport faults are proven against a real fake HTTP endpoint (`scripts/fixtures/fake-provider.mjs`), since stubs cannot produce "no headers".
 
 #### 5.5.2 The frame pipeline: two waiting policies, one implementation
 
-The local pixel pipeline (capture → redact → verify → attack → record) is 1.2 s for a 1× viewport and up to 6.5 s at the 6-tile triage cap. Whether that sits in front of the next planner turn depends on exactly one question — **does the planner read the frame?**
+Capture → redact → verify → attack → record costs 1.2 s (1×) to 6.5 s (6-tile cap). Whether it blocks the next turn depends on one question — **does the planner read the frame?** Vision OFF (default): started, not awaited, joined after the next turn as `[Frame after the previous action]`. Vision ON: awaited, read via the VLM's redacted-frame description. Nothing is lost by deferring (evidence, ledger, totals, leaks all land); turns with no tool result report the line as their own entry; every wait keeps one 15 s budget — wedged captures are announced and abandoned, and after the first overrun later frames stop blocking while still filing evidence. Cold start (~10.5 s) sits inside the OCR timeout; OCR jobs queue one-at-a-time. Per-stage costs print once per over-budget run. Bare-navigation tasks (`open yt`) cost zero turns; self-narrating final answers are refused by a narrow vocabulary guard.
+
+#### 5.5.1 Planner turn policy: how a slow or looping turn is bounded
+
+One turn is bounded by **silence, not wall clock** — a reasoning model visibly progressing must finish:
+
+| Boundary | Budget | What it catches |
+| :--- | :--- | :--- |
+| First output | 90 s (20 s retry) | No first token. Retried once when the endpoint proved itself this run (a previous turn answered, or headers arrived) — never for an endpoint that said nothing at all (two 90 s silences measured 180 s of dead waiting). Same budget every non-retry turn: the prompt grows, and a cold/continuation split landed exactly on the turns most likely to be cut. |
+| Unacknowledged request | 25 s (60 s NVIDIA NIM) | No response **headers** — stall, queue, or overloaded machine. The model never saw the prompt, so the SAME turn re-routes to the provider's fast model when one exists; otherwise the run stops instead of spending the silence budget unacknowledged. NVIDIA's budget covers its measured 51–64 s queues on ~32 KB requests; diagnostics print the enforced budget. |
+| Mid-turn silence | 30 s | Dropped connection after output started. Streams that ran 45 s+ first are throughput, not hiccups — not re-sent; shorter gets the one retry. |
+| Transport drop | — (adapter throws) | Socket died mid-answer. The prompt reached the model, so this is exactly the retryable hiccup. |
+| Deliberation | 12 000 reasoning chars or 90 s | Reasoning without converging. Steered once, then reported. |
+| Degeneration | 4-gram ratio ≥ 0.5, or a 40-word block 3× | Repetition loop (deltas keep arriving, so no silence window sees it; measured at 100 s live). Cut in seconds, never retried, never replayed into history. |
+| Ceiling | 210 s | Absolute bound per turn (under MV3's 5-minute limit). |
+
+Deliberate properties: the check reads **repetition, not duration**; every cut is **announced with its reason**; assistant replay history is clamped (1 200 chars) so monologues are not re-paid each turn.
+
+**Where the time goes.** Slow runs are dominated by endpoint time-to-first-token, named per turn (`responded in 14s (first token after 11s of that)`). Headers split the blame: late headers mean provider queue (fix: fast-model switch), early headers mean model thinking (fix: nothing), no headers mean the request never arrived. Adapters report all three milestones (`requested`, `headers`, `output` — first byte of any kind, since tool-only turns stream no prose).
+
+A run may switch itself to the provider's fast model (two slow turns past 8 s, or one past 20 s): at most once, never mid-turn, announced, never writing user settings (`Options → Speed up when the provider is queueing` disables it; the fast model plans worse — that trade is stated).
+
+**Stalled runs report timings, not vibes.** Every attempt ends in a copyable diagnostics block: planner and fast model, enforced budgets, per-attempt headers/first-token/outcome plus whether the frame pipeline ran alongside. Transport faults untenable from stubs are proven against `scripts/fixtures/fake-provider.mjs`, a real HTTP endpoint told to queue, stall, drop, or never answer while `agent-frame-audit-test` drives the real loop.
+
+#### 5.5.2 The frame pipeline: two waiting policies, one implementation
+
+Capture → redact → verify → attack → record costs 1.2 s (1× viewport) to 6.5 s (6-tile cap). Whether it blocks the next turn depends on one question — **does the planner read the frame?**
 
 | Vision | Who reads the frame | Policy |
 | :--- | :--- | :--- |
-| **OFF** (default) | Nobody. The output is local evidence: the ledger entry, the audit panel, the run's PII totals, its re-OCR leak findings | Started and **not awaited**. It runs alongside the planner turn that follows and is joined after that turn returns (measured free: the capture is 1.2-6.5 s, the turn is seconds to minutes) |
-| **ON** | The planner, via the VLM's description of the redacted frame | Awaited before the next turn |
+| **OFF** (default) | Nobody — output is ledger, audit, totals, leak evidence | Started, **not awaited**: runs alongside the next turn, joined after, labelled `[Frame after the previous action]` — never mixed into the newer page read |
+| **ON** | The planner, via the VLM's redacted-frame description | Awaited before the next turn |
 
-Three properties make this safe rather than merely faster, and each is pinned in `agent-frame-audit-test` against the real loop:
+Safe because: nothing is lost by deferring (evidence, ledger, totals, leaks all land); a turn with no tool result to carry the line reports it as its own entry instead of dropping it; every wait keeps one 15 s budget — a wedged capture is announced and abandoned, and after the first overrun later frames stop blocking while still filing evidence (a run that silently dropped vision would be a feature switched off behind the user's back). Tesseract's ~10.5 s cold start sits inside the OCR call's own timeout, and OCR jobs queue so exactly one recognition runs at a time.
 
-- **Nothing is lost by deferring.** The evidence line still reaches the planner, one step later, labelled `[Frame after the previous action: N PII redacted]` / `[Opening frame: …]` — never silently mixed into the page read below it, which is from a later moment. The ledger entry, the audit record, the run's totals and its leak evidence are all unaffected.
-- **Nothing is lost when there is nowhere to deliver it.** A turn with no tool call (a final answer, a refusal, Stop) has no tool result to carry the joined line, so it is reported as its own transcript entry instead of being dropped.
-- **Every wait is bounded by one budget** (`FRAME_AUDIT_WAIT_MS`, 15 s, over 2× the measured worst case). A capture that wedges — which is how the opening frame could hang a run *before its first planner turn*, with nothing on screen to explain it — is given up on, announced ("did not finish within 15s — continuing without a visual description"), and left to finish its own ledger entry in the background. When the planner does read the frame, the run waits for it — but never indefinitely, and **not more than once**: the wait is a bet that local pixel work finishes before the planner needs the next turn, and it is only a good bet at the cost the pipeline was measured at. The face pass now also runs native-resolution crops, verification and escalation on top of a 6 s triage budget, so on a heavy page a capture can want longer than the budget on *every* action — which is exactly the reported "slow and stuck after every tool call", where the run paid the full 15 s in front of each one and got no frame for it. After the first overrun the run stops waiting: each later frame is STARTED and joined after the next turn instead, labelled as one step old, and the transcript says so once (`announcedFrameWaitAbandoned`) — because vision is a setting the user turned on, and a run that quietly stopped giving them visual descriptions would be a feature switched off behind their back. Nothing else changes: the evidence line, the ledger entry and the audit record are identical, only who waits does. Inside that budget each stage has its own, because the outer one can only ever give up on a capture, never finish it: the frame-text triage runs under a 6 s wall clock, and Tesseract's ~10.5 s cold start now sits inside the OCR call's own timeout rather than before it (an acquisition that times out returns nothing for that frame and leaves the warm-up running, so the next capture inherits it).
+**Cost is measured where spent:** per-stage timings (`decode → dom-regions → faces → frame-text-ocr → encode → verify`) print once per run for frames over budget. One implementation serves opening, post-action and deferred frames.
 
-**A frame's cost is measured where it is spent, stage by stage.** The pixel pipeline records `decode → dom-regions → faces → frame-text-ocr → encode → verify` in its own result (`stages`), which is the only place these numbers can exist — every test harness runs the pipeline against stubs — and when a frame comes back *over* `FRAME_AUDIT_WAIT_MS` the agent prints the breakdown once per run, naming the stage that cost the time and the remainder the stages do not account for. It exists because the alternative was guessing: the wait budget was chosen from a measurement taken before the face pass gained tiles, verification and escalation, and the first attempt at "is the budget big enough?" was answered with arithmetic instead of the run's own clock. The tag-along fix is the cold start itself: `ocr.ts` now queues recognitions so exactly **one** runs at a time, and each job's timeout is created *inside* its own queued slot. Tesseract's worker queues internally without saying so, so previously both OCR consumers of a first capture (frame-text triage and the re-OCR verification of the shipped bytes) raced one ~10.5 s warm-up, and the loser's recovery path terminated the engine the winner was still using — one frame, two cold starts, and neither a result nor a failure to report.
-
-One implementation serves the opening frame, the post-action frame and the deferred half of both; before this it was three copies of the same ~55-line block, which is how a fix lands in one and not the others.
-
-**The loop stops when the task is already done, and refuses an answer that narrates itself.** Two guards, both from the same reported run ("open yt" — after which the agent clicked a video, re-read the page, and answered with a paragraph about its own tooling):
-
-- A task that is *nothing but a navigation* has a checkable success state. `bareNavigationGoal` recognises the shape (`open yt`, `go to gmail`, `open youtube.com` — one navigation verb, one site token, nothing else), and the loop tests the tab's URL at the top of every step, so a satisfied goal costs no planner turn at all and the run reports the URL it is on instead of looking for work. The shape is deliberately tiny — "open yt and search for iit" and "open mail and open the first email i received" are untouched — and the host match is EXACT, because a false positive abandons the user's task while a false negative only continues the run the way it always did.
-- A final answer that talks about its own loop ("this will be the last tool call for a while", "no response yet") is not a result. The guard is intentionally narrow: it recognises the loop's own vocabulary rather than judging whether prose reads well, since an under-constrained "does this read well?" heuristic would refuse real answers — which is worse than shipping a rambling one. Past-tense talk about the tools a run actually used ("I used click_text to open it") is a normal report and passes.
+**The loop stops when done, and refuses self-narration.** Bare-navigation tasks (`open yt`, `go to gmail` — exact host match) cost zero planner turns; a final answer that talks about its own loop ("this will be the last tool call") is refused by a narrow vocabulary guard, since a broad "reads well?" check would refuse real answers.
 
 #### 5.5.3 Approval waits and worker lifetime
 
-Approving a risky action is worker-idle time, and an idle Manifest V3 worker is suspended roughly 30 seconds in — killing the 120-second approval timer and the run awaiting it. The user then pressed Allow into a freshly restarted worker whose approvals table was empty: the reply matched nothing, and the panel sat on RUNNING with a pending step forever (observed on a Gmail Send confirmation).
+Approving a risky action is worker-idle time, and an idle MV3 worker suspends ~30 s in — killing the 120 s approval timer and the awaiting run. The user then pressed Allow into a restarted worker with an empty approvals table: reply matched nothing, panel stuck on RUNNING forever (observed on Gmail Send).
 
 ```mermaid
 sequenceDiagram
@@ -338,18 +316,14 @@ sequenceDiagram
     SW->>Panel: Result + totals
 ```
 
-An open long-lived port (`pry-keepalive`, held for the panel's lifetime) keeps the worker through human-speed waits — holding the port object is the whole implementation. If the worker dies anyway, an orphaned reply unlocks the panel with a named error instead of hanging it, and a mid-run loss renders a disconnect card rather than a live run that will never move.
+An open long-lived port (`pry-keepalive`) holds the worker through human-speed waits. If the worker dies anyway, an orphaned reply unlocks the panel with a named error, and a mid-run loss renders a disconnect card — never a live run that will never move.
 
 ### 5.6 Architectural Assessment: GLiNER Model Integration
-An analysis of integrating GLiNER (Generalist and Lightweight Model for Named Entity Recognition) was conducted for the V2 roadmap:
-
-- **Technical Evaluation:** GLiNER utilizes a custom span-representation bi-encoder head that is not a standard token-classification head. The standard browser WebAssembly runtime (`@huggingface/transformers`) does not currently support the GLiNER span-pair scoring matrix natively. Existing JavaScript packages for GLiNER rely on `onnxruntime-node` (native C++ bindings) which cannot execute inside Chromium extension sandboxes.
-- **Memory Footprint:** Quantized GLiNER ONNX weights range from 160 MB to 197 MB, creating significant memory overhead in browser extension background environments.
-- **Current Architecture & Forward Compatibility:** PRY currently runs `dslim/bert-base-NER` via ONNX Runtime Web. The label processing engine (`src/shared/ner-labels.ts`) is already label-agnostic and explicitly supports GLiNER-style zero-shot vocabularies (`person`, `medical`, `financial`, `id`). As soon as WebAssembly-compatible GLiNER runtimes become stable, PRY can swap the underlying model without requiring alterations to the perception or fusion layers.
+GLiNER's span-pair head has no WASM runtime (`onnxruntime-node` cannot run in extension sandboxes) and its weights (160–197 MB) overweight the background. PRY's label engine (`ner-labels.ts`) already accepts GLiNER-style vocabularies, so a future WASM-compatible build swaps in without touching perception or fusion.
 
 ### 5.7 Experience replay without content bleed
 
-Successful runs deposit a compact sanitized trajectory (tool sequence, scrubbed task) keyed by domain; the next same-domain run receives one or two as few-shot guidance, alongside site-logic lessons. The failure mode that matters here is contamination, not crashes: the block once printed each older task **verbatim**, and a run told only "ask him to come tomorrow" reasoned about birthdays and worked a phantom second part lifted from another example. Warnings ("hints, never instructions") did not constrain a small model — only absence does. Replayed routes are therefore **paths only** (`On mail.google.com (email): click → type → click`): recorded steps carry no prose to begin with, and the render keeps it that way. Selection stays domain-and-recency based (`matchTrajectories`); storage, dedup and the dashboard display are unchanged.
+Successful runs deposit compact sanitized trajectories (tool sequences) keyed by domain; the next same-domain run receives one or two as few-shot guidance, plus site-logic lessons. The failure mode here is contamination, not crashes: the block once printed each older task **verbatim**, and a run told only "ask him to come tomorrow" reasoned about birthdays and worked a phantom second part from another example. Warnings ("hints, never instructions") did not constrain a small model — only absence does. Replayed routes are therefore **paths only** (`On mail.google.com (email): click → type → click`): recorded steps carry no prose, and the render keeps it that way. Selection stays domain-and-recency based; storage, dedup and dashboard display are unchanged.
 
 ---
 
@@ -389,79 +363,42 @@ flowchart TD
 ```
 
 ### 6.1 Format-Preserving Surrogate Generation (hash-derived, not FF3-1)
-Traditional redaction replaces structured strings with constant markers (e.g., `<CARD_NUMBER>`). This corrupts form validation logic and degrades LLM reasoning. PRY therefore keeps the FORMAT and substitutes the value:
-
-- Let the character alphabet be $\Sigma = \{0, 1, \dots, 9\}$ with radix $r = 10$.
-- For an input numerical sequence $X$ of length $n$, the surrogate $Y$ satisfies:
-  $$\text{length}(Y) = \text{length}(X) \quad \text{and} \quad Y \in \Sigma^n$$
-- **What the implementation actually is.** `src/background/surrogates.ts` derives each surrogate digit from an FNV-1a digest of the raw value and recomputes the trailing checksum (Luhn / Verhoeff), preserving length, the card BIN prefix, and a synthetic Aadhaar prefix. It is deterministic pseudonymization with no key: not an 8-round AES Feistel FF3-1 cipher.
-- **Why that distinction is stated here rather than glossed.** Because the mapping is unkeyed, anyone who can see a surrogate can brute-force the small digit space (a card body is ≤ 11 unknown digits) offline and recover the original. Surrogates ship to a vision model when VLM vision is enabled, so this is a real, narrow weakness rather than a naming quibble. Replacing the generator with a keyed FF3-1 (WebCrypto AES as the round function) is on the roadmap; until then, prefer the opaque mask path for anything that must not be recoverable.
+Constant markers (`<CARD_NUMBER>`) corrupt validation and degrade reasoning, so PRY keeps format and substitutes value: for digit string $X$ of length $n$, surrogate $Y$ satisfies $\text{length}(Y) = \text{length}(X)$, $Y \in \Sigma^n$. The implementation (`surrogates.ts`) derives digits from an FNV-1a digest and recomputes the trailing checksum — deterministic, unkeyed, **not** AES-FF3-1. Stated plainly: unkeyed means brute-forceable over small digit spaces, and surrogates ship to vision models when VLM vision is on. A keyed FF3-1 (WebCrypto AES rounds) is roadmap; until then, the opaque path is for anything that must not be recoverable.
 
 ### 6.2 Mathematical Checksum Verification (Luhn and Verhoeff Algorithms)
-Synthetic credentials generated by PRY must pass client-side validation logic without revealing genuine identity details:
-
-- **Credit Card Checksum (Luhn Algorithm):**
-  The 16th digit $c_n$ is computed such that the total checksum satisfies:
-  $$\sum_{i=1}^{n} f(c_i) \equiv 0 \pmod{10}$$
-  where:
-  $$f(c_i) = \begin{cases} c_i & \text{for odd positions from right} \\ 2c_i - 9 & \text{if } 2c_i > 9 \text{ on even positions} \\ 2c_i & \text{otherwise} \end{cases}$$
-
-- **Indian Aadhaar Checksum (Verhoeff Dihedral Permutation):**
-  Aadhaar verification relies on the non-commutative dihedral group $D_5$ (symmetries of a regular pentagon):
-  $$c_{12} = \text{inv}\left(\sum_{i=1}^{11} d(c_i, p(i, \dots))\right)$$
-  PRY applies the standard multiplication table $d(j, k)$, permutation matrix $p(i, j)$, and inversion table $\text{inv}(j)$ to ensure synthetic 12-digit Aadhaar values pass UIDAI-compliant verification checks.
+Synthetic credentials must pass client-side validation without revealing real identities:
+- **Luhn:** 16th digit $c_n$ with $\sum f(c_i) \equiv 0 \pmod{10}$, $f$ doubling alternate digits from the right (minus 9 over 9).
+- **Verhoeff:** Aadhaar's 12th digit from dihedral group $D_5$ tables ($d$, $p$, $\text{inv}$), UIDAI-compliant.
 
 ### 6.3 Visual Redaction Tiers and the Reversibility Test
 
-PRY does not use one redaction for everything, because the tiers have different reversibility properties. Each region is assigned by kind:
-
 | Tier | Applied to | Mechanism | Reversible? |
 | :--- | :--- | :--- | :--- |
-| **Opaque destroy** | Faces; PII spans in page text | Entire region overwritten with `#000000` | No — zero original pixels survive |
-| **Surrogate inpaint** | Confirmed credential / ID fields | Region cleared and repainted with a synthetic, checksum-valid value | No — original pixels are discarded, not filtered |
-| **Soft box filter** | Generic input fields, credential labels | Separable sliding-window box average (radius 6, capped at 40) | Weak by design, and accepted only for non-identifying regions |
+| **Opaque destroy** | Faces; PII spans in page text | Overwritten `#000000` | No |
+| **Surrogate inpaint** | Confirmed credential / ID fields | Cleared, repainted checksum-valid synthetic | No — originals discarded, not filtered |
+| **Soft box filter** | Generic inputs, credential labels | Sliding-window box average (radius 6, capped 40) | Weak by design; non-identifying regions only |
 
-Two properties matter more than the filter itself:
-
-- **Separability and cost.** The soft tier is implemented as two 1-D sliding-window passes (horizontal then vertical) over an `ImageData` buffer, so cost is $O(w \cdot h)$ independent of radius. It is computed with an explicit window rather than `ctx.filter = "blur(…)"`, which silently no-ops on some Chrome builds and would leave a region untouched while appearing to redact it.
-- **Reversibility is attacked, not assumed.** A box average is a low-pass operation and is invertible in principle given the kernel, so the soft tier is never the last word. Faces are excluded from it entirely (blur is the known-recoverable case for biometric identifiers), and `verifyRegions()` rejects any face region that is merely altered rather than near-uniformly opaque. Two adversarial probes then attack the bytes that are about to ship (`src/background/redaction-attack.ts`), and either one rebuilds the frame with every region opaque before it can leave the browser:
-
-  1. **Reconstruction.** Every soft-tier region is sharpened (unsharp mask, an explicit attempt to invert the blur) and the *residual* edge energy is measured: how much of the region's original structure survived the filter. Opaque fills read `0.00`; the blur the pipeline ships reads `0.05–0.26`; a blur whose radius has been weakened reads `0.29–0.97`. A residual at or above `0.35` is judged recoverable and escalated. **Why residual and not "how much did sharpening bring back":** iterated unsharp *manufactures* energy at a mask edge — three passes drive a well-destroyed region's reading above the sharp original — so a gain-based gate opened on every frame and escalated all of them to solid black. **The honest limit:** the shipped and weakened ranges touch (a radius-6 blur on coarse content retains `0.20`, a weakened radius-3 blur starts at `0.21`), so this is a coarse regression guard, not a meter. It reliably catches a blur that silently no-ops, loses its `* scale` factor, or is optimised down to ~2; it cannot resolve a marginal weakening, and separating those needs a real deconvolution rather than a gradient heuristic.
-  2. **Face coverage.** The model detector is re-run over the *shipped* frame — a face the original pass missed (detection is not deterministic across a redaction pass, and a face beside a black mask is exactly the case the visual channels were fixed for) is by definition unboxed in the audit's region list. Any detection that a destroyed region covers less than 50% of is a coverage failure rather than a weak mask: it is added to the rebuild's region list, painted, reported as a detection, and re-verified like any other region. The skin-colour channel is deliberately excluded from this probe — its false-positive rate would escalate innocent regions on the strength of a colour histogram.
-
-  The result is recorded per frame as `verification.attack` (`ran`, `reconstructableRegions`, `uncoveredFaces`, `details`) and surfaced in both the Privacy Audit panel and the Deep Inspector, so "attacked and clean" is visibly different from "not attacked" — a pass that cannot be told apart from no pass is evidence of nothing. An escalated frame is labelled `ESCALATED + VERIFIED`, not as a plain pass: the fact that the first paint was insufficient is the most audit-relevant thing about it.
-
-**Every residual says which channel found it.** A residual count alone was ambiguous — a frame reporting "13 residual detection(s)" could not be told apart from thirteen pixel failures, thirteen OCR labels, or a mixture, which made the number undiagnosable. Every entry now carries its source (`PIXEL:`, `OCR:`, `RECONSTRUCTION:`, `FACE COVERAGE:`), and "still present in the bytes that ship" (`leakedPatterns`, which must reach zero for a frame to send) is kept strictly separate from "what triggered the rebuild" (`escalationReasons`, rendered in the panel) — conflating them would have left `residualDetections` above zero and withheld the frame forever.
-
-**A surrogate region is never OCR-checked.** The re-read exists to catch a *soft* region still holding the user's text. A surrogate region holds none of it by construction — PRY discarded the original and painted a synthetic stand-in — and those stand-ins are designed to satisfy the very patterns the scan looks for: the synthetic card `4111 8703 3161 1545` matches **both** "Card number" and "Aadhaar number", and the synthetic email and phone match too. Every frame containing a masked credential field therefore reported ~4 phantom leaks, failed its own mask verification, and (once escalation existed) rebuilt the whole frame black for no reason. Excluding the tier costs no coverage: a surrogate that failed to paint is caught directly by the pixel check, which sees an unchanged region. `ocrCheckableRegions` is the single rule, and it is pinned both as a unit and differentially on the strip the module actually composites.
-
-**What the proof covers.** `verifyRegions()` answers exactly one question: *are the regions PRY chose to redact actually unrecoverable in the bytes that ship?* It cannot answer whether PRY chose the right regions — a face no channel detected, or an email no pattern matched, is invisible to it. Those are different guarantees, and the panel's badge now says so: a green frame means "everything redacted here is opaque", not "this frame contains no PII". Detection completeness is bounded by the three face channels, the regex/checksum matchers, and the on-device NER model, each with the failure modes documented in §6.5. Treat the badge as necessary, never sufficient.
-
-The verifier's own pixel sampling uses a row-phase-offset stride rather than a fixed one: a stride that shares a factor with the content's period (a fixed stride of 4 over an alternating two-tone pattern) lands on a single phase and reads as perfectly flat, which would declare a region blank and skip its redaction.
+Notes that matter: the soft tier is two explicit 1-D passes (never `ctx.filter`, which silently no-ops on some Chrome builds); faces are excluded from it; `verifyRegions()` rejects merely-altered faces. Two probes attack the shipped bytes (`redaction-attack.ts`) and either rebuilds everything opaque: **reconstruction** (unsharp-mask residual energy; opaque reads `0.00`, shipped blur `0.05–0.26`, escalate at `0.35` — a coarse guard that reliably catches dead/silent blurs, not marginal weakening) and **face coverage** (detector re-run over shipped pixels; <50% covered counts as uncovered; skin-colour excluded for its false-positive rate). Escalated frames label `ESCALATED + VERIFIED`. Every residual carries its channel (`PIXEL:`, `OCR:`, `RECONSTRUCTION:`, `FACE COVERAGE:`); leak patterns (must hit zero to ship) stay separate from rebuild reasons. Surrogate regions skip OCR (their synthetics would match the very patterns scanned — ~4 phantom leaks per credential field; failed paints are caught by the pixel check instead). The badge means "everything redacted here is opaque", never "no PII exists" (§6.5).
 
 ### 6.4 Immutable Merkle Directed Acyclic Graph (DAG) Ledger
-Every perception and redaction cycle produces a cryptographic leaf digest:
 $$L_i = \text{SHA256}(\text{Timestamp} \parallel \text{TabId} \parallel \text{SHA256}(\text{RawImage}) \parallel \text{SHA256}(\text{RedactedImage}) \parallel \text{EntityTypes})$$
-
-Leaves are aggregated into a binary Merkle tree:
 $$N_{\text{parent}} = \text{SHA256}(N_{\text{left}} \parallel N_{\text{right}})$$
-
-The resulting Merkle Root $R$ is exported within `audit-proof.json` together with every leaf's hash and the full entry list. **Exported today:** root + leaves, so an auditor recomputes $R$ from the leaves in $O(N)$ and detects any edited or reordered entry. **Not exported yet:** per-leaf sibling paths, so there is no $O(\log N)$ inclusion proof to hand a single leaf to a third party — that is a roadmap item, not a current capability.
+Root $R$ plus every leaf ships in `audit-proof.json` — auditors recompute in $O(N)$. Per-leaf $O(\log N)$ inclusion proofs are roadmap, not current.
 
 ### 6.5 Detection Coverage and Known Gaps
 
-PRY's redaction is only as good as its detection, so the bounds are stated here rather than left for a judge to discover. Every row is a real limitation of the shipped code, not a hypothetical.
+Bounds stated for judges to find, not discover. Every row is a shipped-code limitation:
 
 | Channel | Covers | Known failure modes |
 | :--- | :--- | :--- |
-| **Regex + checksum matchers** (`pii-detector.ts`, `text-pii-patterns.ts`) | Emails (including typed without their TLD), Indian phone numbers, Aadhaar (Verhoeff-validated), PAN, IFSC, SSN, card numbers (Luhn-validated, bare or spaced, in tasks and page text), honorific/cue-phrase names (page text included), provider API keys (`sk-or-v1-`, `nvapi-`, `gsk_`, `AIza`, `xai-`, `sk-proj-`, plus OpenAI/Anthropic/GitHub/Slack/AWS/JWT), and cue-word secrets (OTPs, passwords, labelled keys — shared `matchCuedSecrets` serves the pixel painter, the page-text detector and the task tokenizer from one definition) | Anything unstructured: bare names without a cue phrase (left to on-device NER by design — regexing every capitalised pair would nuke ordinary prose and re-blind the planner to its own targets), street addresses, dates of birth, medical terms, account balances. Lookalikes that fail a checksum are deliberately NOT redacted (measured as a false-positive signal instead). |
-| **Contextual analysis** (`contextual-pii.ts`) | Values in fields whose own label marks them sensitive | Needs a readable label; a bare "Account number" box on an icon-only form is not covered. |
-| **On-device NER** (token classification, `ml/ner.ts`) | Person names, organizations, locations in page prose, any casing | Bounded to 12 spans per page and to the labels in `ner-labels.ts`; the model is ~104 MB and quantized, so recall on rare or non-Latin names is imperfect; a page whose text is longer than the snapshot budget (`MAX_TEXT` = 6000 chars, `MAX_ELEMENTS` = 80) is scored only on the visible main-content region. |
-| **Face channels** (BlazeFace over the whole frame AND over its tiles → Chrome shape detector → skin colour, `offscreen.ts`) | Faces in the captured frame, down to roughly 12 px | The model channels run first and the skin-colour pass is a SUPPLEMENT rather than a fallback: a single BlazeFace hit used to skip it entirely, which is how a page with one large portrait and a grid of thumbnails destroyed the portrait and shipped every thumbnail face. The same exclusivity survived between the two MODEL channels — Chrome's detector was asked only when BlazeFace returned nothing — so a large portrait also suppressed the one detector that might have seen a small face; it is now asked whenever a supplementary face no model box covers, and its boxes are deduped so a face is painted once. BlazeFace's short-range model has a fixed ~128×128 input, which makes the small-face miss a RESOLUTION problem rather than a threshold one: a whole 1280×800 viewport scales to 0.1, so a 44 px face arrives at ~4 px before the first convolution and no confidence tuning can recover it. The pass therefore also runs over overlapping NATIVE-RESOLUTION crops (drawn 1:1 so boxes come back in frame pixels, deduped across tiles), which puts that same face at ~17 px. The grid is chosen to buy magnification: it uses the FEWEST crops that bring a crop to the 320 px target, and only when the target is unreachable inside the ≤16-crop cap does it spend the whole budget on the finest crops it can cover the frame with — 15 crops of 334 px on a 1280×800 viewport, 15 of 640 px on a 2560×1440 retina capture (model scale 0.2 there, against 0.05 for the whole frame). Tiling is refused for exactly two cases, both stated: a frame that already fits one crop, and a **stitched full-page capture**, which the caller declares (`fullPage`) because the document cannot tell a stitched image from a very tall viewport. That last point was a real bug: tiling used to be refused above an absolute 1280 px frame size — a rule written for stitched captures that silently excluded 1440×900 laptops and every retina capture, i.e. the frames where the model's fixed input does the most damage, and it hid because the tests happened to use 1280×800. The skin-colour pass — reach, `14 px` — was documented as covering 28–120 px while actually needing 40 samples on a 12 px grid, about a 76 px square, so the band between the model's floor and 76 px was covered by nothing; the grid is 4 px now and the limits are stated in pixel AREA, so the floor is the documented one. It can still miss unusual lighting and add false positives on photos, a face below ~12 px is reached by no channel at all, and supplementary additions are capped at 16 per frame so a photo wall cannot blot the page. A separate DOM channel marks `img[alt~=profile|avatar|photo]` and similar as `kind: "face"`; that matches URL/alt text, so it misses most modern avatars (YouTube's `yt3.ggpht.com` images carry neither word). **There is no biometric completeness guarantee** — a missed face is not detected, and the re-OCR verifier does not look for faces at all. |
-| **Text-PII pixel boxes** (`perceive.ts#locateSpans` / `location of detector values`) | Rendered text nodes, form fields, avatar images, and the elements the detectors read values out of (`locate-elements`) | Scan is capped (1.5 s, 8 000 nodes, 200 regions) and skips off-viewport matches, so a very heavy page redacts what it reaches before the budget, not everything. **That skip is a painting rule, not a coverage rule, and treating it as one was a bug that blinded the planner.** The locators report the values they *saw rendered but could not paint* (outside the viewport), and because a viewport screenshot has no pixels there, those values are provably absent from the image — so they no longer count as unplaceable leaks (see `unplacedAfterLocators`). They used to: a name the on-device model found in the page's text and rendered below the fold was counted as unplaceable, the frame was withheld for it, and the pixel channel was asked to clear it from an image that never contained it — an unresolvable state, so every frame on that page was withheld and vision was lost for the rest of the run. Two guards keep the excuse honest: it needs a walk that reached the end of the document (a truncated scan proves nothing about what it did not reach), and it never applies to a stitched full-page capture, where an off-viewport value is in the image. A detected value that cannot be located anywhere else is still reported explicitly (masked) rather than silently assumed covered, and it is handed to the frame-text channel: when that channel finds the value in the frame and destroys it — the case where it was inside an image or a canvas, the one place a DOM scan cannot see — the frame ships with the value covered instead of being withheld. When the channel cannot find it, the frame is withheld exactly as before, because an OCR miss is not proof of absence — but "cannot find it" now means it genuinely is not there rather than that the engine spelled it differently: for these clearance-bearing values only, matching is tolerant (case, separators and the classic glyph confusions are folded away, allowance ~1 character in 6), so `Hark1rat Singh` in the pixels covers a requested `Harkirat Singh`. The clearance RULE is unchanged: found-and-painted, or no clearance. Coverage of the detector's own element targets is checked PER TARGET too (each box echoes the target it was drawn for), where it used to be a blanket `dom-selector-coverage-unverified` whenever any target carried a selector — which withheld the frame on any page with a form field. |
-| **Images and canvas-rendered text** | Text baked into an `<img>`, a `<canvas>` (PDF viewers, Google Docs), a video frame or a photographed document, when frame-text triage runs | Closed by reading the frame back: `ocr-pii-triage.ts` runs on the ALREADY-REDACTED frame with the bundled Tesseract, matches what it can still read against the shared PII patterns, the spans the NER already found, and the values the DOM could not place (`requested`), and black-boxes those words (`image_text` regions). Running it after redaction is what makes it self-targeting — a DOM-redacted value is a black rectangle OCR cannot read, so anything legible there is by definition what no other channel covered. The pass is bounded by a 6 s wall clock as well as per tile (six 900 px slices at 8 s each is 48 s inside a capture the run waits 15 s for), which is why a frame is now triaged as far as it got instead of being abandoned unsent. Remaining limits, all real: a name inside an image that the NER never saw anywhere on the page has no pattern to match; OCR misreads are missed, so this channel never reports a value as ABSENT — only as found-and-destroyed; a very tall frame is triaged top-down over at most 6 slices of 900 px, and the shortfall is logged rather than implied covered; and disabling **Scan Frame Text** in Options returns this row to *nothing*. |
-| **Region collection failure** | — | If the page's main thread does not answer within the bounded round trip, text PII for that frame is NOT redacted (faces still are). The run emits an explicit warning entry naming the reason instead of silently shipping the frame. |
-| **Task-text tokenization** (`tokenizer.ts#tokenizeTask`) | Secrets in the user's own request — card numbers, Aadhaar, emails, keys, one-time codes — plus names that appear as a MESSAGE PAYLOAD ("send an email to Priya Sharma", "addressed to Acme Corporation", "name: …") | Names used as the ordinary object of a preposition in a non-messaging task now ride to the planner **raw**: "go to Priya Sharma's profile", "suggest me to Harkirat Singh". This is a deliberate trade, and it was bought with a real bug. The rule used to treat a bare preposition as an addressee and capture an unbounded letter run, so `"i want to open harkirat singh yt channel"` vaulted the string `"open harkirat singh yt channel"` and handed the planner `<PII_1>` where its search target should have been — the agent then typed the token's own spelling into the search box. In a task, the name is the INSTRUCTION PARAMETER: an instruction the agent cannot read is not a protected instruction, it is a broken one. Names are still tokenized where they are payloads, still redacted in every page/DOM channel, and still detected by NER on screen. Single-word names after a preposition ("forward to John") are not tokenized either, for the same reason a bare preposition is not context. |
+| **Regex + checksum matchers** | Emails (even TLD-less), Indian phones, Aadhaar (Verhoeff), PAN, IFSC, SSN, cards (Luhn, bare/spaced, tasks + pages), honorific/cue names, provider API keys (`sk-or-v1-`, `nvapi-`, `gsk_`, `AIza`, `xai-`, `sk-proj-`, OpenAI/Anthropic/GitHub/Slack/AWS/JWT), cue-word secrets (OTP/passwords via one shared matcher serving pixels, page text and tasks) | Unstructured content: bare uncured names (NER's job by design — regexing every capitalised pair would nuke prose and re-blind the planner), street addresses, DOBs, medical terms, balances. Checksum failures are measured false-positive signal, never redacted. |
+| **Contextual analysis** | Values in self-labelled sensitive fields | Needs a readable label; icon-only forms uncovered. |
+| **On-device NER** | Names, orgs, locations, any casing | 12 spans/page; ~104 MB quantized recall imperfect on rare/non-Latin names; pages beyond snapshot caps (6 000 chars, 80 elements) scored on main content only. |
+| **Face channels** (BlazeFace whole-frame + tiles → Chrome detector → skin colour) | Faces down to ~12 px | Channels run inclusively now (an early hit no longer suppresses the rest — that shipped thumbnail grids). Small-face miss is resolution, not threshold (44 px arrives at ~4 px in a 1280×800 whole frame), hence native-resolution 1:1 crops (≤16, 320 px target). Skipped only for single-crop frames and caller-declared stitched captures (the document cannot tell those from tall viewports). |
+| **Text-PII pixel boxes** | Rendered text, fields, avatars, detector-valued elements | Capped scan (1.5 s, 8 000 nodes, 200 regions) redacts what it reaches. Below-fold values provably absent from viewport screenshots no longer count as unplaceable leaks (requires a completed walk; never applies to stitched captures); genuinely unlocatable values are reported masked and handed to frame-text triage, which clears the frame only on found-and-destroyed proof. |
+| **Images and canvas text** | Text baked into images/canvas/video/PDF via frame-text triage on the already-redacted frame (self-targeting: legible leftovers are by definition uncovered) | Bounded (6 s wall, 6×900 px slices, logged shortfalls); NER-unseen names unmatchable; misreads missed (never reports absence); **Scan Frame Text** off returns this row to nothing. |
+| **Region collection failure** | — | Main thread silent in the bounded round trip: text PII unredacted that frame (faces still are), with an explicit warning — never a silent ship. |
+| **Task-text tokenization** | Secrets in the request (cards, Aadhaar, emails, keys, OTPs) plus MESSAGE-PAYLOAD names ("email Priya Sharma", "name: …") | Prepositional non-messaging names ride raw ("go to Priya Sharma's profile") — deliberate: an unreadable instruction is a broken one, not a protected one. Names stay tokenized as payloads, redacted in page/DOM channels, NER-detected on screen. |
 
 ---
 
@@ -491,28 +428,17 @@ stateDiagram-v2
 ```
 
 ### 7.1 Observational Egress Monitoring (not interception)
-The Egress Tripwire (`src/content/tripwire.ts`) hooks the page's `fetch`, `XMLHttpRequest` and `navigator.sendBeacon` in the MAIN world and inspects outbound URLs and bodies:
-- Evaluates outgoing request bodies and query parameters against PII detection patterns (cards, Aadhaar, PAN, email).
-- Distinguishes between synthetic surrogates (PRY's own redaction values) and raw values.
-- Classifies the DESTINATION: a request to the page's own registrable domain is same-site traffic (a site posting to its own backend), while a different domain is third-party egress. Only the latter raises the third-party alarm; same-site sends are still listed in the radar, labelled. That verdict is computed where the page's origin is visible (the MAIN world) and crosses the message hop through `normalizeTripwireAlert` (`src/shared/tripwire-alert.ts`) so it cannot be dropped in transit — a relay that rebuilt the alert from its own field list once lost it, and since the aggregator reads a MISSING verdict as third-party (it will not downgrade egress nobody classified), the site's own traffic was reported as exfiltration: a live Gmail run showed "5 third-party PII leaks observed" for the address the user had asked PRY to email, while the tripwire's own console line called the same request same-site.
-
-**What it does not do, stated plainly:** it does not block, cancel, delay or rewrite any request. Every hook calls through to the original unchanged and fails open, and no alert terminates a connection. An earlier revision of this section described a "Deny-by-Default" gateway that aborts transmissions and terminates sockets; no such code has ever existed in this repository. Treat the tripwire as a detector and an audit trail for egress the page performed, not as a firewall. Blocking third-party requests correctly requires a declarative rule the browser enforces (for example a `declarativeNetRequest` filter), which is roadmap rather than shipped behaviour.
-
-- Alerts are recorded in the privacy ledger and surfaced as one aggregated egress entry plus a per-request radar log.
+The tripwire hooks page `fetch`/`XHR`/`sendBeacon` in the MAIN world, checks bodies and query strings against PII patterns, separates surrogates from raw values, and classifies destination: same registrable domain is same-site (listed, labelled), anything else raises the third-party alarm. The verdict is computed where the origin is visible and crosses via `normalizeTripwireAlert` — a relay that once rebuilt it inline dropped the verdict, and since missing verdicts read as third-party, Gmail's own traffic was once reported as exfiltration. **It never blocks, cancels, delays or rewrites anything** — hooks call through unchanged and fail open (an earlier draft section describing a deny-gateway never existed as code). True blocking needs browser-enforced `declarativeNetRequest`: roadmap. Alerts land in the ledger, one aggregated entry plus a per-request radar log.
 
 ### 7.2 Ephemeral Secret Vault Management
-- Token↔value mappings are held in RAM only, inside the service worker's tokenizer vault (`src/background/tokenizer.ts`). Nothing about a vault entry is written to `chrome.storage`.
-- **These values are not encrypted at rest in memory, and the vault is not partitioned or purged per tab.** They live in a plain `Map` for the life of the service worker, which is what makes tokenization fast enough to run per snapshot; MV3 tearing the worker down is what eventually clears them. An AES-GCM vault with per-tab partitioning is on the roadmap — until then, treat an active service worker's memory as the trust boundary.
+- Mappings live in worker RAM only (`tokenizer.ts`), never `chrome.storage`.
+- Plain `Map`, unencrypted, unpartitioned per tab — fast enough for per-snapshot use, cleared on teardown. AES-GCM with per-tab partitioning is roadmap; treat live worker memory as the trust boundary.
 
 ---
 
 ## 8. Deep Canvas Inspector and Visual Verification
 
-PRY provides a visual verification utility accessible via the extension interface:
-- **Side-by-Side Verification:** Displays the raw viewport canvas adjacent to the sanitized canvas.
-- **Bounding Box Overlay:** Outlines detected PII regions with color-coded classification tags (e.g., green for faces, blue for cards, purple for Aadhaar).
-- **Vault Inspector:** Lists the active token↔value mappings the running service worker holds, so a reviewer can confirm that original values exist only in local memory and that every detector value became a token.
-- **Proof Generation:** Exports the audit proof document (`audit-proof.json`): the SHA-256 hash chain, chain-validity verdict, Merkle root, and every leaf entry.
+Split-view utility (raw vs sanitized canvas, color-coded boxes, live vault mapping for reviewers, `audit-proof.json` export: hash chain, verdict, Merkle root, leaves).
 
 ---
 
@@ -520,16 +446,16 @@ PRY provides a visual verification utility accessible via the extension interfac
 
 | Evaluation Vector | RAIDX Agent | PRY (This Solution) |
 | :--- | :--- | :--- |
-| **Architectural Model** | Cloud-centric proxy architecture | Fully client-side Zero-Trust Chrome extension (Manifest V3) |
-| **Visual Processing Perimeter** | Transmits uncompressed raw screen captures to external servers | Captures, inspects, and sanitizes viewports entirely in client RAM |
-| **Face Redaction Engine** | Dependent on external cloud vision APIs | Local MediaPipe BlazeFace (WebGPU delegate when available) fused with a skin-colour pass, opaque fill on every detected face |
-| **Surrogate Integrity** | Static string masking (e.g., `<REDACTED>`) | Deterministic format-preserving surrogates with valid Luhn and Verhoeff checksums (hash-derived; a keyed FF3-1 cipher is roadmap, see §6.1) |
-| **Cryptographic Accountability** | Ephemeral server-side text logs | Client-side SHA-256 hash chain plus a Merkle root over the exported leaves |
-| **Adversarial Verification** | Assumes visual blur filters are secure | Tesseract re-OCR of the shipped bytes over the redacted regions, with an opaque-mask rebuild as the remediation |
-| **Voice Streaming Pipeline** | Standard HTTP REST / Audio upload | 16 kHz raw PCM16 streaming over WebSocket with token suppression |
-| **Memory Security Guarantee** | Session data cached on remote infrastructure | Token map held only in service-worker memory — never persisted, cleared on worker teardown (§7.2) |
-| **Outbound Defense Layer** | Relies on LLM system prompt instructions | Deterministic tripwire observer with same-site/third-party classification — reports PII-shaped egress, does not block it (§7.1) |
-| **Full-Page Capability** | Single viewport capture | Automated scroll-and-stitch engine with coordinate re-mapping |
+| **Architectural Model** | Cloud-centric proxy | Client-side Zero-Trust MV3 extension |
+| **Visual Processing** | Raw screenshots to external servers | Captured, inspected, sanitized in client RAM |
+| **Face Redaction** | Cloud vision APIs | Local BlazeFace (WebGPU) + skin-colour pass, opaque fill |
+| **Surrogate Integrity** | Static `<REDACTED>` masking | Format-preserving, Luhn/Verhoeff-valid (hash-derived; keyed FF3-1 roadmap §6.1) |
+| **Accountability** | Ephemeral server logs | Client SHA-256 chain + Merkle root |
+| **Adversarial Verification** | Assumes blur is secure | Re-OCR of shipped bytes with opaque rebuild |
+| **Voice Pipeline** | HTTP REST audio upload | 16 kHz PCM16 WebSocket, token suppression |
+| **Memory Guarantee** | Remote session caching | Worker-memory-only token map, never persisted |
+| **Outbound Defense** | LLM prompt instructions | Deterministic tripwire, same-site/third-party split — reports, never blocks (§7.1) |
+| **Full-Page Capability** | Single viewport | Scroll-and-stitch with coordinate re-mapping |
 
 ---
 
@@ -615,106 +541,42 @@ pry/
 - Google Chrome 120 or higher (with WebGPU support enabled)
 
 ### 11.2 Verification Test Suite
-Execute the comprehensive test harness:
 ```bash
 npm run verify
 ```
-*Expected Output:* All assertions pass cleanly — **1544 total: 1172 pipeline + 31 tripwire + 11 OCR + 41 egress + 98 offscreen integration + 119 agent-loop + 72 voice** — covering detection, tokenization, redaction, face-channel fusion, region→image mapping, detected-vs-boxed reconciliation, OCR frame-text triage, planner turn policy, ledger integrity, Scribe wire shapes, the adversarial attack (reconstruction thresholds calibrated against PRY's own blur kernel across five content patterns, plus the face-coverage re-probe and its escalation), the offscreen pipeline driven end-to-end through its real message listener over real pixels, and the loop's judgement calls (a bare navigation goal ending the run, a final answer that narrates the loop being refused, the frame wait not being paid twice after an overrun, the stage breakdown a late frame prints, approvals surviving worker restarts, replayed routes carrying no prior-task wording, control names in `find_text`, and exact email commits). The OCR assertions run real Tesseract on rendered images, so they prove the engine returns word boxes the triage can paint over — not just that the code compiles. `offscreen-integration-test` bundles the real offscreen document, stubs only its browser-facing dependencies, and asserts the reported box equals the black actually present in the shipped bytes. `agent-frame-audit-test` does the same one layer up: it drives the **real** `runTask` loop with only browser I/O and the two model endpoints stubbed, and asserts the frame-evidence contract — that a deferred frame's line still reaches the planner labelled with the step it describes, that the ledger and the run's totals still count it, that a residual leak it finds is still reported, that the pixel work overlaps the planner turns instead of preceding them, and that a capture which never returns ends the run instead of hanging it.
+*Expected Output:* **1544 total: 1172 pipeline + 31 tripwire + 11 OCR + 41 egress + 98 offscreen integration + 119 agent-loop + 72 voice** — detection, tokenization, redaction, face fusion, region→image mapping, OCR triage, turn policy, ledger integrity, adversarial attack (thresholds calibrated against PRY's own blur kernel; face re-probe plus escalation), the offscreen pipeline over real pixels, and loop judgement calls (bare-navigation goals, self-narrating answers refused, single-paid frame waits, late-frame stage breakdowns, approvals surviving restarts, wording-free replay, `find_text` control names, exact email commits). OCR runs real Tesseract (word boxes triage can paint, not just compile clean). `offscreen-integration-test` asserts the reported box equals the black in the shipped bytes. `agent-frame-audit-test` drives the **real** `runTask` loop — deferred frame lines, ledger/totals accounting, residual leaks, overlapped pixel work, wedged captures ending the run.
 
 ### 11.3 Production Build Process
-Compile the TypeScript source files and assemble production bundles:
 ```bash
 npm run build
 ```
-*Output:* Assembles 7 compiled bundles in `dist/`:
-- `dist/service-worker.js` (Coordinator core)
-- `dist/content.js` (Isolated world DOM perception)
-- `dist/offscreen/offscreen.js` (WebGPU canvas and computer vision)
-- `dist/sidepanel.js` (User interface and voice client)
-- `dist/options.js` (Configuration management)
-- `dist/inspector.js` (Deep visual verification utility)
-- `dist/tripwire.js` (Egress network security hook)
+*Output:* 7 bundles in `dist/`: `service-worker.js`, `content.js`, `offscreen/offscreen.js`, `sidepanel.js`, `options.js`, `inspector.js`, `tripwire.js`.
 
 ### 11.4 Latency Benchmark
-The per-capture cost is dominated by local pixel work, not by the model. Measure it
-with the shipped Tesseract stack and the tile geometry the pipeline actually produces:
-```bash
-npm run bench:latency
-```
-It reports the OCR cost per tile, the cost of the 6-tile triage cap, the per-tile PNG
-encode, and the cold-start cost of the first recognition. The first run on a cold file
-cache is several times slower than an immediate re-run, so compare like with like — the
-cold number is what a user pays on the first capture of a session.
-
-It also reports the **face-tiling geometry**, which is the other per-capture cost and the
-one that used to be reasoned about rather than measured: how many detector calls a given
-frame costs, how large its crops are, the model-space scale a face gets from them, and a
-labelled sensitivity table for what N calls cost at different per-call speeds. The call
-count and the geometry are exact (computed from the shipped planner); the per-call speed
-is not measured there, because `OffscreenCanvas` and the GPU delegate do not exist in
-Node. Two findings came out of printing it: 1440×900 and every retina capture were not
-being tiled at all, and the tile cap was being spent on crops 25 % coarser than the
-target.
-
-The other half of the wait is what each planner turn is charged, and unlike the pixel
-work it cannot be overlapped — the model cannot start before the request is built. A
-request is `{ system, tools, messages }`, measured on the real loop by
-`agent-frame-audit-test`:
-
-| Part | Measured |
-| :--- | :--- |
-| system prompt | 9.9 KB |
-| tool schemas (15 tools) | 4.5 KB |
-| conversation, per turn | ~10 KB |
-| **whole request, per turn** | **~24 KB, flat** |
-
-Two rules keep that flat. Stale page reads are pruned out of older tool results, and
-the page read the run *opened* with is pruned once an action has produced a fresher one
-— it used to sit in the first message for the whole run, so every turn carried two full
-page reads (one current, one stale) and the run's own payload grew with every step. A
-page read at the caps above is ~9 KB, which was ~48% of the conversation and ~27% of
-the whole request on every turn after the first. Earlier snapshots are only pruned when
-a fresher one genuinely exists: a read-only action (`find_text`, `wait`, `read_page`)
-renders nothing, and there the opening read is still the planner's only view of the
-page.
+Per-capture cost is local pixel work, measured with the shipped Tesseract stack and real tile geometry (`npm run bench:latency`): OCR per tile, 6-tile cap, PNG encode, first-recognition cold start (compare like with like — cold cache runs several times slower). Face-tiling geometry (calls, crop sizes, model-space scale, sensitivity table) is exact; per-call speed is not measurable in Node (no `OffscreenCanvas`/GPU delegate). Planner-turn cost (`{ system, tools, messages }`, ~24 KB flat per turn via pruning) is measured on the real loop: system prompt 9.9 KB, 15 tool schemas 4.5 KB, ~10 KB conversation — stale reads pruned once fresher ones exist (a run once carried two full page reads every turn).
 
 ### 11.5 Demo Fixtures
-Serve the synthetic fixtures (and the local collector sink the egress-tripwire demo
-posts to) without installing anything:
 ```bash
 npm run demo:serve      # http://127.0.0.1:8787/pii-fixture.html
 ```
-Content scripts do not run on `file://` without enabling *Allow access to file URLs*,
-and a page the extension cannot see looks identical to a broken build — serving over
-loopback removes that failure mode. See `test/pages/README.md`.
+Content scripts skip `file://` without *Allow access to file URLs* — loopback serving removes that failure mode. See `test/pages/README.md`.
 
 ### 11.6 Browser Deployment
-1. Open Google Chrome and navigate to `chrome://extensions/`.
-2. Enable **Developer mode** using the toggle in the upper right corner.
-3. Click **Load unpacked**. Load `dist/` (never `src/`) and reload the extension
-after every build — the side panel caches its bundle, and a stale bundle is what
-produces "my fix isn't there" reports.
+1. Open `chrome://extensions/`, enable **Developer mode**.
+2. **Load unpacked** → select `dist/` (never `src/`); reload after every build (stale bundles cause "my fix isn't there" reports).
+3. Toolbar icon or sidepanel to run.
 
 ### 11.7 Packaged build (release artifact)
-`node scripts/package.mjs` writes `publish/pry-agent-1.0.1.zip` (~125 MB: the
-model weights and wasm runtimes are included, because a build without them has no
-on-device NER, no face model, and no OCR verifier). It is **not** committed — it
-exceeds GitHub's 100 MB per-file limit — and it is published as a GitHub Release
-asset that the landing page's download button points at. Verify an artifact by
-listing its entries (80, including `models/ner/onnx/model_quantized.onnx`), not by
-its filename.
-4. Select the root directory containing `manifest.json` and the compiled `dist/` directory.
-5. Access the extension via the Chrome toolbar or sidepanel.
+`node scripts/package.mjs` writes `publish/pry-agent-1.0.1.zip` (~125 MB with model weights and wasm runtimes — without them, no NER, face model, or OCR verifier). **Not committed** (over GitHub's 100 MB/file limit); published as a GitHub Release asset behind the landing page download button. Verify by listing entries (80, including `models/ner/onnx/model_quantized.onnx`), not by filename.
 
 ---
 
 ## 12. Regulatory and Compliance Alignment
 
-PRY satisfies strict regulatory requirements without requiring server-side data processing agreements:
-
-- **Digital Personal Data Protection Act 2023 (India):** Complies with Section 6 consent and purpose limitation by guaranteeing that biometric identifiers, government IDs, and Aadhaar numbers never cross network boundaries into model training sets.
-- **General Data Protection Regulation (GDPR):** Fulfills Article 25 (Data Protection by Design and Default) and Article 9 (Special Categories of Personal Data) by enforcing client-side cryptographic masking.
-- **Zero-Trust Security Architecture:** Implements strict deny-by-default egress policies. No unverified payload is permitted to exit the browser client.
+Compliant without server-side data processing agreements:
+- **DPDP Act 2023 (India), Section 6:** biometrics, IDs and Aadhaar numbers never cross into model training sets.
+- **GDPR Article 25 + Article 9:** protection by design/default; no unauthorized special-category processing.
+- **Zero-Trust:** deny-by-default egress posture — unverified payloads never exit the client.
 
 ---
 

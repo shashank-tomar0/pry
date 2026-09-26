@@ -98,36 +98,36 @@ flowchart TD
     subgraph ClientBrowser["Chromium Client Runtime (Manifest V3)"]
         subgraph IsolatedWorld["Content Script Context"]
             DOM["DOM Tree and ARIA Tree"]
-            DOMScanner["DOM Perception Engine\n- Regex Checksums\n- Input Type Resolution\n- Coordinate Mapping"]
-            Stitcher["Full-Page Scroll Engine\n- Viewport Offsets\n- Coordinate Transform"]
+            DOMScanner["DOM Perception Engine<br/>- Regex Checksums<br/>- Input Type Resolution<br/>- Coordinate Mapping"]
+            Stitcher["Full-Page Scroll Engine<br/>- Viewport Offsets<br/>- Coordinate Transform"]
         end
 
         subgraph BackgroundSW["Service Worker (Event-Driven Core)"]
             Controller["Coordinator State Machine"]
-            Vault["Token Map (service-worker RAM)\n- Plain Map, no encryption"]
-            FPE["Surrogate Engine\n- Format-preserving (unkeyed)\n- Luhn / Verhoeff Checksums"]
-            Merkle["Merkle Audit Engine\n- SHA-256 DAG Computation"]
-            Tripwire["Egress Tripwire\n- Outbound Payload Observer\n- Reports only, does not block"]
+            Vault["Token Map (service-worker RAM)<br/>- Plain Map, no encryption"]
+            FPE["Surrogate Engine<br/>- Format-preserving (unkeyed)<br/>- Luhn / Verhoeff Checksums"]
+            Merkle["Merkle Audit Engine<br/>- SHA-256 DAG Computation"]
+            Tripwire["Egress Tripwire<br/>- Outbound Payload Observer<br/>- Reports only, does not block"]
         end
 
         subgraph OffscreenEnv["Offscreen Document (Hardware Accelerated)"]
             Canvas["Offscreen Canvas Target"]
-            BlazeFace["MediaPipe BlazeFace\n- WebGPU Acceleration\n- Wasm SIMD Fallback"]
-            BERT["Quantized BERT NER\n- ONNX Runtime Wasm"]
-            Convolution["Redaction Engine\n- Opaque Destroy\n- Surrogate Inpaint\n- Box-Filter (soft tier)"]
-            AdversarialOCR["Tesseract.js Wasm\n- Adversarial LSTM Re-OCR"]
+            BlazeFace["MediaPipe BlazeFace<br/>- WebGPU Acceleration<br/>- Wasm SIMD Fallback"]
+            BERT["Quantized BERT NER<br/>- ONNX Runtime Wasm"]
+            Convolution["Redaction Engine<br/>- Opaque Destroy<br/>- Surrogate Inpaint<br/>- Box-Filter (soft tier)"]
+            AdversarialOCR["Tesseract.js Wasm<br/>- Adversarial LSTM Re-OCR"]
         end
 
         subgraph UserInterfaces["User Interfaces"]
-            Sidepanel["Agent Control Panel\n- ElevenLabs Scribe / Flash"]
-            Inspector["Deep Canvas Inspector\n- Split Verification View"]
+            Sidepanel["Agent Control Panel<br/>- ElevenLabs Scribe / Flash"]
+            Inspector["Deep Canvas Inspector<br/>- Split Verification View"]
             Options["Extension Preferences"]
         end
     end
 
     subgraph ExternalCloud["External Cloud Endpoints"]
-        InferenceAPI["Remote Multimodal Planner\n- NVIDIA NIM (nemotron-3.5-lightning)"]
-        VoiceAPI["ElevenLabs Realtime Audio\n- PCM16 Streaming"]
+        InferenceAPI["Remote Multimodal Planner<br/>- NVIDIA NIM (nemotron-3.5-lightning)"]
+        VoiceAPI["ElevenLabs Realtime Audio<br/>- PCM16 Streaming"]
     end
 
     DOM --> DOMScanner
@@ -193,7 +193,9 @@ sequenceDiagram
     SW->>SW: Fuse Coordinates via Intersection-over-Union (IoU)
     SW->>SW: Compute Format-Preserving Surrogates (Plaintext Kept in the In-Memory Token Map)
     SW->>OS: Dispatch Redaction Coordinates
-    OS->>OS: Faces -> Opaque Destroy; Text PII -> Solid Mask; Fields -> Surrogate / Soft Blur
+    OS->>OS: Faces to opaque destroy
+    OS->>OS: Text PII to solid mask
+    OS->>OS: Fields to surrogate or soft blur
     OS->>OS: Run Adversarial LSTM OCR Over the Redacted Regions
     alt Any Readable PII Survives
         OS->>OS: Rebuild Frame From Original: Every Region Opaque (#000000), Re-encode, Re-verify
@@ -211,8 +213,8 @@ sequenceDiagram
 - **Target:** Form controls, password inputs, text fields, rendered text nodes, and ARIA attributes.
 - **Execution:** Runs in the Content Script. Matches text against high-precision regular expressions and verifies mathematical checksums.
 - **Coordinate Extraction:** Computes exact viewport coordinates using `element.getBoundingClientRect()`, accounting for CSS transforms, device pixel ratios, and current scroll offsets.
-- **Control names count as findable text.** A search `<input>` has no text node — its name lives in `placeholder`/`aria-label` — so `find_text` used to report "no visible text" for a box field matching found a turn later. It now sweeps placeholders, aria-labels, image alts, tooltips and submit-button values through the same exact→fuzzy matcher, with hits labelled by source (`Search [placeholder]`) so the planner reaches for `type_text` with the field name.
-- **Email addresses commit exactly.** Typing a full correct address into a recipient box still delivered it to the wrong contact: the synthetic Enter landed while a non-matching autocomplete suggestion was highlighted, and Gmail took the suggestion. `typeInto` now clicks an offered suggestion only when it carries exactly the typed address, dismisses anything else with Escape first (polling twice, since contact search is network-bound and popups render late), commits with Tab, and verifies the address inside the compose dialog — reporting "verify the To field" instead of claiming a chip it cannot prove.
+- **Control names count as findable text.** A search `<input>` has no text node — its name lives in `placeholder`/`aria-label` — so `find_text` once reported "no visible text" for a box field matching found a turn later. It now sweeps placeholders, aria-labels, image alts, tooltips and submit values through the same matcher, labelling hits by source (`Search [placeholder]`) so the planner reaches for `type_text`.
+- **Email addresses commit exactly.** Typing a correct address still delivered it to the wrong contact: the synthetic Enter landed on a highlighted non-matching suggestion, and Gmail took the suggestion. `typeInto` now clicks an offered suggestion only when it carries exactly the typed address, dismisses anything else with Escape first, commits with Tab, and verifies the address in the compose dialog — reporting "verify the To field" instead of claiming a chip it cannot prove.
 
 ### 4.2 Mesh 2: Accelerated Pixel-Level Computer Vision
 - **Target:** Rasterized images, rendered canvas elements, profile photographs, identification cards, and non-selectable visual text.
@@ -336,7 +338,7 @@ sequenceDiagram
     SW->>Panel: Result + totals
 ```
 
-An open long-lived port (`pry-keepalive`, held for the panel's lifetime) is what keeps the worker through human-speed waits — holding the port object is the whole implementation. Two recoveries cover the cases the port cannot: a reply that outlives its run (worker restarted anyway) unlocks the panel with a named error instead of hanging it, and a mid-run worker loss renders a disconnect card rather than a live run that will never move again.
+An open long-lived port (`pry-keepalive`, held for the panel's lifetime) keeps the worker through human-speed waits — holding the port object is the whole implementation. If the worker dies anyway, an orphaned reply unlocks the panel with a named error instead of hanging it, and a mid-run loss renders a disconnect card rather than a live run that will never move.
 
 ### 5.6 Architectural Assessment: GLiNER Model Integration
 An analysis of integrating GLiNER (Generalist and Lightweight Model for Named Entity Recognition) was conducted for the V2 roadmap:
@@ -347,7 +349,7 @@ An analysis of integrating GLiNER (Generalist and Lightweight Model for Named En
 
 ### 5.7 Experience replay without content bleed
 
-Successful runs deposit a compact sanitized trajectory (tool sequence, scrubbed task) keyed by domain; the next same-domain run receives one or two as few-shot guidance, alongside site-logic lessons. The failure mode that matters here is not a crash but contamination: the block used to print each older task **verbatim** (`Task: …compose a good invite… for my birthday (you can invent things)`), and a later run whose own task said only "ask him to come tomorrow" reasoned about birthdays and worked a phantom second part ("opening the first email") lifted from another example's steps. Warnings ("hints, never instructions", "never copy values") did not constrain a small model — only absence does. Replayed routes are therefore **paths only, never prior tasks' wording** (`On mail.google.com (email): click → type → click`): the recorded steps carry no prose to begin with (tool names only), and the render keeps it that way. A phrasing that is never printed cannot be quoted. Selection stays domain-and-recency based (`matchTrajectories`); storage, dedup and the learning-dashboard display are unchanged.
+Successful runs deposit a compact sanitized trajectory (tool sequence, scrubbed task) keyed by domain; the next same-domain run receives one or two as few-shot guidance, alongside site-logic lessons. The failure mode that matters here is contamination, not crashes: the block once printed each older task **verbatim**, and a run told only "ask him to come tomorrow" reasoned about birthdays and worked a phantom second part lifted from another example. Warnings ("hints, never instructions") did not constrain a small model — only absence does. Replayed routes are therefore **paths only** (`On mail.google.com (email): click → type → click`): recorded steps carry no prose to begin with, and the render keeps it that way. Selection stays domain-and-recency based (`matchTrajectories`); storage, dedup and the dashboard display are unchanged.
 
 ---
 
@@ -367,8 +369,8 @@ flowchart TD
     end
 
     subgraph ChecksumRecalc["Mathematical Checksum Generation"]
-        LuhnCheck["Luhn Modulus-10 Algorithm\n- Generates Valid Check Digit 4"]
-        VerhoeffCheck["Verhoeff Dihedral Group D5\n- Permutation Matrix Checksum"]
+        LuhnCheck["Luhn Modulus-10 Algorithm<br/>- Generates Valid Check Digit 4"]
+        VerhoeffCheck["Verhoeff Dihedral Group D5<br/>- Permutation Matrix Checksum"]
     end
 
     subgraph SyntheticOut["Valid Synthetic Surrogates"]

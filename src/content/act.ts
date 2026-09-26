@@ -647,6 +647,7 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
   // this path — search boxes keep today's Enter behaviour.
   const emailLike = /[^\s@]+@[^\s@]+/.test(text);
   let committedByClick = false;
+  let suggestionNote = "";
   if (emailLike) {
     // Suggestion popups are network-bound (contact search) and can render
     // AFTER the first look — the previous single check missed late popups and
@@ -663,6 +664,7 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
         realClick(popup.elements[idx]);
         await settle({ ceiling: 1500 });
         committedByClick = true;
+        suggestionNote = ` (suggestion popup: ${popup.options.length} shown, exact match clicked)`;
       } else {
         // Nothing offered IS the address: dismiss first, so the commit below
         // takes the typed text instead of the highlighted stranger.
@@ -670,8 +672,12 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
         target.dispatchEvent(new KeyboardEvent("keydown", esc));
         target.dispatchEvent(new KeyboardEvent("keyup", esc));
         await settle({ start: 150, ceiling: 500 });
+        suggestionNote = ` (suggestion popup: ${popup.options.length} shown, none matched — dismissed)`;
         break;
       }
+    }
+    if (!committedByClick && !suggestionNote) {
+      suggestionNote = " (suggestion popup: none open)";
     }
     if (!committedByClick) {
       // Tab commits typed text as a chip in recipient boxes; in a plain input
@@ -740,7 +746,7 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
 
   return done(
     `Typed ${JSON.stringify(text)} into ${describe(target)}. ` +
-      `Field now shows: ${JSON.stringify(echo.trim().slice(0, 60))}${echoNote}` +
+      `Field now shows: ${JSON.stringify(echo.trim().slice(0, 60))}${echoNote}${suggestionNote}` +
       (submit && !committedByClick ? ", and pressed Enter." : "."),
   );
 }

@@ -3384,6 +3384,12 @@ ok("the commit path dismisses strangers, clicks exact matches, and names chips",
     /key: "Escape"/.test(await readFile("src/content/act.ts", "utf8")) &&
     /key: "Tab"/.test(await readFile("src/content/act.ts", "utf8")) &&
     /committed as a chip/.test(await readFile("src/content/act.ts", "utf8")));
+ok("the type result names the suggestion evidence, not just the outcome",
+  /suggestion popup: none open/.test(await readFile("src/content/act.ts", "utf8")) &&
+    /none matched — dismissed/.test(await readFile("src/content/act.ts", "utf8")) &&
+    /exact match clicked/.test(await readFile("src/content/act.ts", "utf8")));
+ok("the task-privacy line carries the vault value's length, so same-mask values tell apart",
+  /maskSample\(e\.original\)\}" \(\$\{e\.original\.length\} chars\)/.test(await readFile("src/background/service-worker.ts", "utf8")));
 ok("late popups get a second look before the commit key",
   /for \(let attempt = 0; attempt < 2 && !committedByClick; attempt\+\+\)/.test(await readFile("src/content/act.ts", "utf8")));
 ok("chip verification is dialog-scoped and shape-checked, never a bare contains",

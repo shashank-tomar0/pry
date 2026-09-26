@@ -1211,9 +1211,13 @@ async function start(task: string, tabId: number): Promise<void> {
   // invisible in your own request is indistinguishable from the agent
   // misreading you.
   if (taskTokens.length > 0) {
+    // Length rides along with the masked sample: it is the one fact that
+    // tells "my 29-char address" from "an 11-char something" when two values
+    // mask identically ("sh•••@gmail.com" fits both). Lengths leak nothing the
+    // shape class does not already state.
     const shown = taskTokens
       .slice(0, 4)
-      .map((e) => `"${maskSample(e.original)}" → ${e.token}`)
+      .map((e) => `"${maskSample(e.original)}" (${e.original.length} chars) → ${e.token}`)
       .join(", ");
     const more = taskTokens.length > 4 ? ` (+${taskTokens.length - 4} more)` : "";
     emit({

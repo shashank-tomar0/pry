@@ -7,6 +7,7 @@ import {
   rankFieldMatches,
   rankAffordanceMatches,
   describeAffordanceMatch,
+  findExactEmailOption,
   isClickableTarget,
   describeTextTarget,
   normalizeForMatch,
@@ -591,6 +592,26 @@ function writableTarget(el: Element): Element | null {
     : null;
 }
 
+/**
+ * An open autocomplete/suggestion popup, if any: the visible listbox and its
+ * visible options, in order. Only a rendered popup counts — a hidden listbox
+ * in the DOM cannot steal a commit.
+ */
+function openSuggestionPopup(): { options: string[]; elements: Element[] } | null {
+  for (const box of Array.from(document.querySelectorAll('[role="listbox"]'))) {
+    if (box.getClientRects().length === 0) continue;
+    const opts = Array.from(box.querySelectorAll('[role="option"]')).filter(
+      (o) => o.getClientRects().length > 0,
+    );
+    if (opts.length === 0) continue;
+    return {
+      options: opts.map((o) => (o.textContent ?? "").trim()),
+      elements: opts,
+    };
+  }
+  return null;
+}
+
 async function typeInto(el: Element, text: string, submit: boolean): Promise<ActionResult> {
   const target = writableTarget(el);
   if (!target) {
@@ -612,7 +633,52 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
     return fail(`${describe(target)} is not a text field.`);
   }
 
-  if (submit) {
+  // What the field held right after typing, before any commit key. Recipient
+  // boxes convert addresses to chips on commit (the input then reads empty),
+  // so a post-commit read alone cannot tell "committed" from "lost".
+  const preCommitEcho =
+    target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
+      ? target.value
+      : (target.textContent ?? "");
+  // An email address committed while a NON-matching suggestion is highlighted
+  // goes to the suggestion instead of the typed text (observed: a full correct
+  // address became a different contact on Enter). Only email-shaped text takes
+  // this path — search boxes keep today's Enter behaviour.
+  const emailLike = /[^\s@]+@[^\s@]+/.test(text);
+  let committedByClick = false;
+  if (emailLike) {
+    await settle({ start: 250, ceiling: 800 });
+    const popup = openSuggestionPopup();
+    if (popup) {
+      const idx = findExactEmailOption(popup.options, text);
+      if (idx >= 0 && popup.elements[idx]) {
+        // The address itself is offered: take it, exactly. No Enter afterwards
+        // — the chip is formed and a stray keypress would only add noise.
+        await bringIntoView(popup.elements[idx]);
+        realClick(popup.elements[idx]);
+        await settle({ ceiling: 1500 });
+        committedByClick = true;
+      } else {
+        // Nothing offered IS the address: dismiss first, so the commit below
+        // takes the typed text instead of the highlighted stranger.
+        const esc = { bubbles: true, cancelable: true, key: "Escape", code: "Escape" };
+        target.dispatchEvent(new KeyboardEvent("keydown", esc));
+        target.dispatchEvent(new KeyboardEvent("keyup", esc));
+        await settle({ start: 150, ceiling: 500 });
+      }
+    }
+    if (!committedByClick) {
+      // Tab commits typed text as a chip in recipient boxes; in a plain input
+      // it only moves focus. Either way the text is no longer hostage to
+      // whatever the popup highlights next.
+      const tab = { bubbles: true, cancelable: true, key: "Tab", code: "Tab" };
+      target.dispatchEvent(new KeyboardEvent("keydown", tab));
+      target.dispatchEvent(new KeyboardEvent("keyup", tab));
+      await settle({ start: 150, ceiling: 500 });
+    }
+  }
+
+  if (submit && !committedByClick) {
     const enter = {
       bubbles: true,
       cancelable: true,
@@ -642,15 +708,22 @@ async function typeInto(el: Element, text: string, submit: boolean): Promise<Act
   // prefix what we typed (Gmail's recipient combobox showed a different
   // value than the one we sent, and the model burned turns reconciling the
   // two). Report what the field holds NOW so the model never has to guess.
+  // A chip reads empty (the address left the input for the chip row), so for
+  // email text an empty read after a correct pre-commit read means committed,
+  // not lost.
   const echo =
     target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
       ? target.value
       : (target.textContent ?? "");
+  const echoNote =
+    emailLike && !echo.trim() && preCommitEcho.trim()
+      ? " (empty because the address committed as a chip — the field held it before commit)"
+      : "";
 
   return done(
     `Typed ${JSON.stringify(text)} into ${describe(target)}. ` +
-      `Field now shows: ${JSON.stringify(echo.trim().slice(0, 60))}` +
-      (submit ? ", and pressed Enter." : "."),
+      `Field now shows: ${JSON.stringify(echo.trim().slice(0, 60))}${echoNote}` +
+      (submit && !committedByClick ? ", and pressed Enter." : "."),
   );
 }
 

@@ -3305,6 +3305,7 @@ const {
   scoreFieldMatch, rankFieldMatches, pickFieldMatch,
   damerauDistance1, fuzzyWordHit,
   rankAffordanceMatches, describeAffordanceMatch,
+  findExactEmailOption,
 } = await import("../src/shared/text-target.ts");
 
 ok("matching ignores case and collapsed whitespace",
@@ -3365,6 +3366,24 @@ ok("find_text gathers placeholders, labels, alts and tooltips, ranked shared",
     /\[aria-label\]/.test(await readFile("src/content/act.ts", "utf8")) &&
     /img\[alt\]/.test(await readFile("src/content/act.ts", "utf8")) &&
     /rankAffordanceMatches\(items, query, \{ fuzzy: fuzzyOk \}\)/.test(await readFile("src/content/act.ts", "utf8")));
+// Reported live: a full correct address typed into Gmail To went to a
+// DIFFERENT contact — the synthetic Enter landed while a non-matching
+// suggestion was highlighted, and Gmail took the suggestion. typeInto now
+// clicks the suggestion only when it carries exactly the address, dismisses
+// anything else first, and says when the field chipped (reads empty).
+ok("an offered suggestion counts only when it carries the address",
+  findExactEmailOption(["Shashank Tomar <shashank.tomar.work@gmail.com>", "shab@gmail.com"], "shashank.tomar.work@gmail.com") === 0 &&
+  findExactEmailOption(["SHASHANK.TOMAR.WORK@GMAIL.COM"], "shashank.tomar.work@gmail.com") === 0);
+ok("a near-miss suggestion never counts, however similar",
+  findExactEmailOption(["shab@gmail.com", "shashank@gmail.com"], "shashank.tomar.work@gmail.com") === -1 &&
+  findExactEmailOption([], "shashank.tomar.work@gmail.com") === -1 &&
+  findExactEmailOption(["anything"], "not-an-email") === -1);
+ok("the commit path dismisses strangers, clicks exact matches, and names chips",
+  /openSuggestionPopup\(\)/.test(await readFile("src/content/act.ts", "utf8")) &&
+    /findExactEmailOption\(popup\.options, text\)/.test(await readFile("src/content/act.ts", "utf8")) &&
+    /key: "Escape"/.test(await readFile("src/content/act.ts", "utf8")) &&
+    /key: "Tab"/.test(await readFile("src/content/act.ts", "utf8")) &&
+    /committed as a chip/.test(await readFile("src/content/act.ts", "utf8")));
 ok("a query shorter than 2 characters matches nothing",
   scoreTextMatch("Inbox", "I") === null && scoreTextMatch("Inbox", "") === null);
 

@@ -338,6 +338,22 @@ export function describeTextTarget(text: string, tag: string, role: string | nul
 }
 
 /**
+ * Index of the suggestion that IS the email address, or -1.
+ *
+ * A recipient box with an open autocomplete popup is a loaded gun: pressing
+ * Enter accepts whatever suggestion is highlighted, which is how a full,
+ * correct address turned into a different contact. The typed text wins only
+ * when a suggestion carries exactly it (name + address rows count — the
+ * option "Shashank Tomar <shashank.tomar.work@gmail.com>" contains the
+ * address); otherwise the popup must be dismissed before committing.
+ */
+export function findExactEmailOption(options: string[], email: string): number {
+  const want = email.trim().toLowerCase();
+  if (!want || !want.includes("@")) return -1;
+  return options.findIndex((o) => (o ?? "").toLowerCase().includes(want));
+}
+
+/**
  * A control's NAME as a find_text candidate: placeholder, aria-label, image
  * alt, tooltip. Body text never contains these (a placeholder is not a text
  * node), which is how find_text reported "No visible text matching 'Search'"

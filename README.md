@@ -336,4 +336,4 @@ Load `dist/` unpacked at `chrome://extensions/` (Developer mode; never `src/`; r
 
 ## 10. Regulatory Alignment and License
 
-DPDP Act 2023 §6, GDPR Articles 9/25, HIPAA Privacy Rule — compliant with no server-side data agreements, since PII never leaves the client. Licensed under Apache 2.0 (see LICENSE).
+DPDP Act 2023 §6, GDPR Articles 9/25, HIPAA Privacy Rule — compliant with no server-side data agreements, since PII never leaves the client. Licensed under the PolyForm Strict License 1.0.0 (see [LICENSE](LICENSE)) — all rights reserved. This software is source-available for personal study, research, and noncommercial use only; you may not copy, modify, distribute, or use it commercially without explicit written permission from the copyright holder.

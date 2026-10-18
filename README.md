@@ -211,6 +211,8 @@ sequenceDiagram
 
 **Learning without contamination:** successful runs deposit tool-order trajectories keyed by domain, replayed as few-shot guidance plus site-logic lessons. Replays print **paths only** (`On mail.google.com (email): click → type → click`) — an earlier version printed prior tasks verbatim and a later run hallucinated birthdays from them, so older wording is never rendered. GLiNER stays roadmap (no WASM runtime; `ner-labels.ts` already accepts its vocabularies).
 
+**Optional web search (TinyFish):** a `web_search` planner tool is designed but **not wired by default**. TinyFish's Search API (`GET https://api.search.tinyfish.ai`, `X-API-Key`, 12 000 free requests/day) returns ranked URLs without a page load, so "find the page" costs one tool call instead of a search-results navigation plus a snapshot and frame. It runs in the service worker (no page CORS, key never in a content script), counts request + response bytes on the egress meter, and writes a `wire-log` record — and it **refuses vault tokens in a query by default**, because a search is egress to a third party. Transport and harness: [`src/background/tinyfish.ts`](src/background/tinyfish.ts), [`scripts/tinyfish-test.mjs`](scripts/tinyfish-test.mjs). Architecture analysis, privacy analysis, and the file-by-file wiring guide: [docs/tinyfish-integration.md](docs/tinyfish-integration.md).
+
 ---
 
 ## 6. Mathematical and Cryptographic Specifications

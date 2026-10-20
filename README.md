@@ -13,6 +13,7 @@ Developed for Smart India Hackathon 2026, Problem Statement 26171: *On-Device Vi
 - [3. System Architecture and Process Isolation](#3-system-architecture-and-process-isolation)
 - [4. Dual-Mesh Perception Engine](#4-dual-mesh-perception-engine)
 - [5. Models, Planner Policy, and Learning](#5-models-planner-policy-and-learning)
+  - [Optional web search (TinyFish)](#optional-web-search-tinyfish)
 - [6. Mathematical and Cryptographic Specifications](#6-mathematical-and-cryptographic-specifications)
 - [7. Outbound Egress Tripwire and Security Invariants](#7-outbound-egress-tripwire-and-security-invariants)
 - [8. Inspector, Comparison, Repository](#8-inspector-comparison-repository)
@@ -219,7 +220,9 @@ sequenceDiagram
 
 **Learning without contamination:** successful runs deposit tool-order trajectories keyed by domain, replayed as few-shot guidance plus site-logic lessons. Replays print **paths only** (`On mail.google.com (email): click → type → click`) — an earlier version printed prior tasks verbatim and a later run hallucinated birthdays from them, so older wording is never rendered. GLiNER stays roadmap (no WASM runtime; `ner-labels.ts` already accepts its vocabularies).
 
-**Optional web search (TinyFish):** a `web_search` planner tool, wired but **off until a key is set**. TinyFish's Search API (`GET https://api.search.tinyfish.ai`, `X-API-Key`, 12 000 free requests/day) returns ranked URLs without a page load, so "find the page" costs one tool call instead of a search-results navigation plus a snapshot and frame. With no key the dependency is absent, so the tool is never offered — a planner cannot spend a turn discovering a configuration fact. The transport lives in [`src/background/tinyfish.ts`](src/background/tinyfish.ts) and is injected from the service worker, which means the loop holds no key; it parses the documented response and returns the request and response byte counts, which the run puts on the egress meter and records in the wire log as `tinyfish:search`.
+### Optional web search (TinyFish)
+
+A `web_search` planner tool, wired but **off until a key is set**. TinyFish's Search API (`GET https://api.search.tinyfish.ai`, `X-API-Key`, 12 000 free requests/day) returns ranked URLs without a page load, so "find the page" costs one tool call instead of a search-results navigation plus a snapshot and frame. With no key the dependency is absent, so the tool is never offered — a planner cannot spend a turn discovering a configuration fact. The transport lives in [`src/background/tinyfish.ts`](src/background/tinyfish.ts) and is injected from the service worker, which means the loop holds no key; it parses the documented response and returns the request and response byte counts, which the run puts on the egress meter and records in the wire log as `tinyfish:search`.
 
 ```mermaid
 sequenceDiagram

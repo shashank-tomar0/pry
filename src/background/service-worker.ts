@@ -20,6 +20,7 @@ import { getActiveNerSpans, getActivePiiTargets } from "./ml-bridge";
 import { findUnlocatedValues, unplacedAfterLocators, unverifiedElementTargets } from "../shared/redaction-reconciliation";
 import { ensureOffscreenDocument } from "./offscreen-doc";
 import { runTask } from "./agent";
+import { searchWeb, formatSearchResults } from "./tinyfish";
 import { persistedSet } from "./storage-guard";
 import { warmOcrWorker } from "../offscreen/ocr";
 import { createPlanner } from "./providers";
@@ -1249,6 +1250,30 @@ async function start(task: string, tabId: number): Promise<void> {
         runTally = tally;
       },
       history: conversationMemory,
+      // One closure owns the key. The loop never sees it, and with no key the
+      // dependency is absent — which is what removes the tool from the
+      // planner's list rather than leaving it there to refuse.
+      webSearch: settings.search.apiKey
+        ? async (request, signal) => {
+            const response = await searchWeb(
+              settings.search.apiKey,
+              {
+                query: request.query,
+                purpose: request.purpose,
+                domainType: request.domainType,
+                includeDomains: request.includeDomains,
+                excludeDomains: request.excludeDomains,
+                maxResults: request.maxResults,
+              },
+              { signal },
+            );
+            return {
+              text: formatSearchResults(response, { maxResults: request.maxResults }),
+              bytes: response.bytes,
+              results: response.results.length,
+            };
+          }
+        : undefined,
     });
   } catch (error) {
     emit({

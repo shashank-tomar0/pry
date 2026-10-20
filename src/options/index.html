@@ -444,6 +444,33 @@
     </div>
 
     <div class="section">
+      <div class="section-title">Web Search (TinyFish)</div>
+      <div class="section-subtitle">Off by default. With a key set, the planner can find out which page the user named in one round trip instead of navigating to a search engine and reading it.</div>
+      <div class="field-row" style="margin-top: 8px;">
+        <div class="field-group" style="flex: 2;">
+          <label class="field-label">API Key</label>
+          <input type="password" class="field-input" id="search-api-key" placeholder="Paste your TinyFish search key" autocomplete="off" />
+          <div class="toggle-desc">Stored in this browser with the other provider keys. The query leaves the browser; results are tokenized before the planner reads them, and a query containing a value this run redacted is refused.</div>
+        </div>
+        <div class="field-group">
+          <label class="field-label">Results per search</label>
+          <input type="number" class="field-input" id="search-max-results" min="1" max="20" step="1" />
+        </div>
+        <div class="field-group">
+          <label class="field-label">Searches per run</label>
+          <input type="number" class="field-input" id="search-max-per-run" min="1" max="20" step="1" />
+        </div>
+      </div>
+      <div class="toggle-row" style="margin-top: 8px;">
+        <div>
+          <div class="toggle-label">Allow searching for vaulted values</div>
+          <div class="toggle-desc">Off by default. When off, a query containing a value PRY already tokenized is refused rather than resolved and sent in clear text.</div>
+        </div>
+        <input type="checkbox" class="toggle" id="search-allow-resolved" />
+      </div>
+    </div>
+
+    <div class="section">
       <div class="section-title">ElevenLabs Voice</div>
       <div class="section-subtitle">Voice task input (Scribe) and spoken narration (Flash v2.5). Off by default.</div>
       <div class="field-row" style="margin-top: 8px;">

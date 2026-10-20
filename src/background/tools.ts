@@ -216,6 +216,72 @@ export const TOOLS: ToolSpec[] = [
   },
 ];
 
+/**
+ * Read-only tool added behind a TinyFish key plus a design doc.
+ *
+ * Kept out of `TOOLS` by default so a fresh checkout is usable without one,
+ * and so the loop never makes a network call it has not been told about.
+ * Wiring guide: [docs/tinyfish-integration.md](../../docs/tinyfish-integration.md).
+ *
+ * `scripts/tinyfish-test.mjs` asserts this stays out of `TOOLS` and stays in
+ * `READ_ONLY_ACTIONS`, so "designed but not wired" is a check rather than a
+ * sentence in the README.
+ */
+export const TINYFISH_WEB_SEARCH_TOOL: ToolSpec = {
+  name: "web_search",
+  description:
+    "Search the public web for the page the user named, and return ranked URLs. " +
+    "Use it when the right site is unknown and the user has not pointed at a URL; " +
+    "a search is one round trip that answers \"which URL is it?\" without navigating " +
+    "to a search engine and clicking a result. If the target site is already known or " +
+    "the user named it, navigate there directly instead of searching.",
+  parameters: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        description:
+          "What to search for — usually the target the user named, not a sentence. " +
+          "A query leaves the browser, so never put a private value in it: no name, " +
+          "number, address or credential the user did not explicitly ask you to search " +
+          "for. Search for the public thing you need, then act on the page itself.",
+      },
+      purpose: {
+        type: "string",
+        description:
+          "A short statement of why this search is happening, used as a ranking signal. " +
+          "Keep it to a sentence.",
+      },
+      domain_type: {
+        type: "string",
+        enum: ["web", "news", "research_paper"],
+        description:
+          "Restrict results to web, news, or research papers. Defaults to web. Only use " +
+          "news or research_paper when the task is explicitly about recent news or " +
+          "published research.",
+      },
+      include_domains: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "Optional list of domains to include, e.g. [\"github.com\", \"pypi.org\"].",
+      },
+      exclude_domains: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "Optional list of domains to omit from results, e.g. [\"pinterest.com\"].",
+      },
+      max_results: {
+        type: "number",
+        description: "How many ranked URLs to return. 1-20, default 5.",
+      },
+    },
+    required: ["query"],
+    additionalProperties: false,
+  },
+};
+
 /** Actions that run in the page rather than against the tabs API. */
 export const PAGE_ACTIONS = new Set([
   "click",
@@ -243,7 +309,7 @@ export const PAGE_ACTIONS = new Set([
  * Reading the page as text cannot alter it, so re-capturing after a read is
  * cost with no new evidence attached to it.
  */
-export const READ_ONLY_ACTIONS = new Set(["find_text", "wait", "read_page"]);
+export const READ_ONLY_ACTIONS = new Set(["find_text", "wait", "read_page", "web_search"]);
 
 /**
  * Whether an action justifies re-capturing the tab's pixels.

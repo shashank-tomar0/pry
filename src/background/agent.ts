@@ -24,7 +24,17 @@ import { tierForKind, type RegionTier } from "../shared/region-paint";
 import type { ProcessedScreenshotResult } from "../shared/types";
 
 import { SYSTEM_PROMPT, SYSTEM_PROMPT_LOCAL, taskPrompt } from "./prompt";
-import { TOOLS, actionChangesFrame, actionLoopFinding, LOOP_THRESHOLD, LOOP_WINDOW, type ActionStamp } from "./tools";
+import {
+  TOOLS,
+  TINYFISH_WEB_SEARCH_TOOL,
+  actionChangesFrame,
+  actionLoopFinding,
+  LOOP_THRESHOLD,
+  LOOP_WINDOW,
+  type ActionStamp,
+} from "./tools";
+import { WEB_SEARCH_TOOL, dispatchSearch } from "./web-search";
+import { maskSample } from "./tokenizer";
 import { TabController, execute, isRestricted } from "./executor";
 import { detectInjection, gate } from "./safety";
 import { estimateUtf8Bytes, fnv1a, formatBytes } from "../shared/primitives";
@@ -466,6 +476,24 @@ export interface AgentDeps {
   /** Compact memory of finished exchanges so follow-ups can continue the chat. */
   history?: Array<{ task: string; answer: string; timestamp: number }>;
   /**
+   * Runs one TinyFish search. Injected so the loop never holds the key, and so
+   * the harness can drive the whole `web_search` path with a stub.
+   *
+   * Absent means the tool is not offered at all: the planner list is built from
+   * this dependency, so a run without a key cannot even ask for a search.
+   */
+  webSearch?: (
+    request: {
+      query: string;
+      purpose?: string;
+      domainType?: "web" | "news" | "research_paper";
+      includeDomains?: string[];
+      excludeDomains?: string[];
+      maxResults?: number;
+    },
+    signal: AbortSignal,
+  ) => Promise<{ text: string; bytes: number; results: number }>;
+  /**
    * Override for how long the run will wait on one frame pipeline.
    *
    * Defaults to FRAME_AUDIT_WAIT_MS, which sits above the measured worst case
@@ -547,6 +575,20 @@ export async function runTask(
   const systemPrompt = isLocalModel ? SYSTEM_PROMPT_LOCAL : SYSTEM_PROMPT;
   // Cap snapshot elements: free-tier providers need smaller snapshots for speed.
   const maxSnapshotElements = isLocalModel ? 15 : isFreeTier ? 30 : 50;
+
+  /**
+   * `web_search` exists only when there is a transport AND a key.
+   *
+   * The planner's tool list is the contract: a tool that appears there but can
+   * only refuse is worse than no tool, because the model spends a turn and a
+   * retry discovering a configuration fact. One list, built once, used for both
+   * the request and the egress estimate so the two can never disagree.
+   */
+  const canWebSearch = deps.webSearch !== undefined && settings.search.apiKey !== "";
+  const plannerTools = canWebSearch ? [...TOOLS, TINYFISH_WEB_SEARCH_TOOL] : TOOLS;
+  /** Searches made this run. The transport enforces the same cap; this is the
+   * cheap pre-check that keeps a refusal local. */
+  let searchesThisRun = 0;
 
   // `let`, not `const`: a run that measures a queueing provider switches itself
   // to the provider's fast model and continues — see plannerSpeedUpDecision.
@@ -2033,7 +2075,7 @@ export async function runTask(
     // actually ship bytes to the cloud, so the badge shows a real count.
     if (remotePlanner) {
       try {
-        const payload = JSON.stringify({ system: systemPrompt, messages, tools: TOOLS });
+        const payload = JSON.stringify({ system: systemPrompt, messages, tools: plannerTools });
         const bytes = estimateUtf8Bytes(payload);
         sessionEgressBytes += bytes;
         estimatedTokens += Math.ceil(bytes / 4);
@@ -2268,7 +2310,7 @@ export async function runTask(
         planner.run({
           system: systemPrompt,
           messages,
-          tools: TOOLS,
+          tools: plannerTools,
           signal: mergeAbort(signal, turnAbort.signal),
           onMilestone: (milestone, at) => {
             if (milestone === "requested") {
@@ -2776,6 +2818,85 @@ export async function runTask(
           pending: true,
         },
       });
+
+      // ── web_search: the one tool whose ARGUMENT leaves the browser ────────
+      //
+      // Dispatched BEFORE the page-action path, deliberately. Everything below
+      // validates element ids against a snapshot, resolves vault tokens at the
+      // last moment, and runs `gate()` as if the tool were about to touch the
+      // page. A search is none of those things: there is no element to validate,
+      // and resolving tokens first would hand `planSearch` the real value —
+      // exactly the value it exists to refuse. So the policy sees the RAW query.
+      //
+      // A refusal is a tool error, not a thrown run: the planner gets one
+      // actionable sentence and the loop continues (see web-search.ts).
+      if (call.name === WEB_SEARCH_TOOL) {
+        if (!canWebSearch || deps.webSearch === undefined) {
+          emit({ kind: "patch", id: stepId, text: "Blocked — web search is not configured.", pending: false });
+          results.push({
+            id: call.id,
+            isError: true,
+            content:
+              "Web search is not available in this run: no TinyFish API key is set. " +
+              "Continue on the page, or ask the user to add a key in Options → Web search.",
+          });
+          continue;
+        }
+        const search = await dispatchSearch(
+          call.input,
+          {
+            vaultTokens: tokensIn,
+            resolve: (value) => tokenizer.resolveAll(value),
+            mask: maskSample,
+            search: (plan, sig) => deps.webSearch!(plan, sig),
+            signal,
+            searchesUsed: searchesThisRun,
+            maxSearchesPerRun: settings.search.maxSearchesPerRun,
+            tokenize: (value, kind) => tokenizer.tokenize(value, kind),
+          },
+          {
+            // The default, and the reason the refusal exists: resolving a token
+            // to search for it would send a value the run already removed.
+            allowResolvedQueries: settings.search.allowResolvedQueries,
+            maxResults: settings.search.maxResults,
+          },
+        );
+
+        if (!search.ok) {
+          emit({ kind: "patch", id: stepId, text: "Search refused — nothing was sent.", pending: false });
+          results.push({ id: call.id, isError: true, content: search.error });
+          continue;
+        }
+
+        searchesThisRun++;
+        // The result bytes are real egress on the user's behalf, even though
+        // they arrived rather than left: the audit counts what the network did
+        // for this run, not just what the planner uploaded.
+        sessionEgressBytes += search.bytes;
+        estimatedTokens += Math.ceil(search.bytes / 4);
+        emit({ kind: "egress", bytes: sessionEgressBytes });
+
+        // Record what left exactly as the query planner wrote it. A search is a
+        // wire record like any other outbound payload, and the wire log is where
+        // "what did we send" must stay answerable.
+        try {
+          recordWire({
+            turn: step,
+            destination: "tinyfish:search",
+            systemChars: 0,
+            messages: [{ role: "user", text: search.query }],
+            tokens: tokensIn(search.query),
+            leaked: scanForLeaks(search.query),
+            totalChars: search.query.length,
+          });
+        } catch {
+          // The wire log must never break the run it is auditing.
+        }
+
+        emit({ kind: "patch", id: stepId, text: `Searched — ${search.results} result(s).`, pending: false });
+        results.push({ id: call.id, content: search.content });
+        continue;
+      }
 
       // Gate runs AFTER token resolution (below) so the value-level secret
       // checks see the real resolved value, not the <CRED_1> token the model
@@ -4658,6 +4779,8 @@ function describeIntent(name: string, input: Record<string, unknown>): string {
       return `Scroll ${input.direction}`;
     case "find_text":
       return `Look for "${input.query}"`;
+    case "web_search":
+      return reason || `Search the web for "${String(input.query ?? "").slice(0, 80)}"`;
     default:
       return reason || name.replace(/_/g, " ");
   }

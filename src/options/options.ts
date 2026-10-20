@@ -26,6 +26,12 @@ const elVoiceIdEl = $<HTMLInputElement>("elevenlabs-voice-id");
 const elSttEl = $<HTMLInputElement>("elevenlabs-stt-enabled");
 const elTtsEl = $<HTMLInputElement>("elevenlabs-tts-enabled");
 
+// TinyFish web search.
+const searchApiKeyEl = $<HTMLInputElement>("search-api-key");
+const searchMaxResultsEl = $<HTMLInputElement>("search-max-results");
+const searchMaxPerRunEl = $<HTMLInputElement>("search-max-per-run");
+const searchAllowResolvedEl = $<HTMLInputElement>("search-allow-resolved");
+
 // On-device ML (Tier 0).
 const mlNerEl = $<HTMLInputElement>("ml-ner");
 const mlGuardEl = $<HTMLInputElement>("ml-guard");
@@ -131,6 +137,13 @@ function renderAll(): void {
   elSttEl.checked = settings.elevenlabs.sttEnabled;
   elTtsEl.checked = settings.elevenlabs.ttsEnabled;
 
+  // TinyFish web search. An empty key renders as empty: the field is the only
+  // place the key is visible, and a masked placeholder would look like a key.
+  searchApiKeyEl.value = settings.search.apiKey;
+  searchMaxResultsEl.value = String(settings.search.maxResults);
+  searchMaxPerRunEl.value = String(settings.search.maxSearchesPerRun);
+  searchAllowResolvedEl.checked = settings.search.allowResolvedQueries;
+
   // On-device ML.
   mlNerEl.checked = settings.ml.ner;
   mlGuardEl.checked = settings.ml.guard;
@@ -178,6 +191,21 @@ function captureFields(): void {
   settings.privacy.tokenizePII = tokenizePIIEl.checked;
   settings.privacy.showRedactionLabels = showRedactionLabelsEl.checked;
   settings.privacy.scanFrameText = scanFrameTextEl.checked;
+
+  // The two numbers are clamped here rather than trusted: a typed 0 would make
+  // the transport build an empty result set, and a typed 5000 would ask for
+  // every page the API has on offer. The ceiling matches the tool schema.
+  settings.search.apiKey = searchApiKeyEl.value.trim();
+  settings.search.maxResults = clampInt(searchMaxResultsEl.value, 1, 20, 5);
+  settings.search.maxSearchesPerRun = clampInt(searchMaxPerRunEl.value, 1, 20, 3);
+  settings.search.allowResolvedQueries = searchAllowResolvedEl.checked;
+}
+
+/** Integer from a text field, bounded, with the default when it is not a number. */
+function clampInt(raw: string, min: number, max: number, fallback: number): number {
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
 }
 
 // ─── Event Listeners ───────────────────────────────────────────────────────

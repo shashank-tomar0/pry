@@ -30,6 +30,7 @@ Standard agents screenshot viewports, dump raw DOM trees, and ship both to cloud
 - **Verification:** every redacted region re-read by local OCR from the exact shipped bytes; leaking frames rebuilt fully opaque. Proof covers redacted regions, not undiscovered PII.
 - **Accountability:** tamper-evident SHA-256 ledger, exportable Merkle root (`audit-proof.json`).
 - **Egress:** tripwire reports PII-shaped page sends by destination. **Reports; never blocks.**
+- **Search (optional):** a TinyFish `web_search` tool resolves the target URL in one round trip. **Off until a key is set**, and a query containing a value this run already redacted is **refused, not resolved** — the one channel where a string has to stay readable is the one string a redaction cannot protect.
 
 ---
 
@@ -43,6 +44,8 @@ A multimodal agent's screenshot + DOM payload routinely carries biometrics, visi
 - **Unverifiable compliance:** an immutable Merkle audit DAG instead of server logs.
 
 Regulatory cover: India DPDP Act 2023 §6, GDPR Articles 9/25 (protection by design/default), HIPAA Privacy Rule.
+
+The integration adds one surface **by choice, not by attack**: the optional TinyFish search channel (§5). It is off until the user supplies a key, and a query that holds a value this run redacted is refused rather than resolved — PRY's own outbound requests answer to the same disclosure standard as the page's.
 
 ---
 
@@ -65,6 +68,7 @@ flowchart TD
             FPE["Surrogate Engine<br/>- Format-preserving (unkeyed)<br/>- Luhn / Verhoeff Checksums"]
             Merkle["Merkle Audit Engine<br/>- SHA-256 DAG Computation"]
             Tripwire["Egress Tripwire<br/>- Outbound Payload Observer<br/>- Reports only, does not block"]
+            SearchPolicy["Query Egress Policy<br/>- Bounds, then Vault Tokens, then PII<br/>- Refuses a redacted query"]
         end
 
         subgraph OffscreenEnv["Offscreen Document (Hardware Accelerated)"]
@@ -85,6 +89,7 @@ flowchart TD
     subgraph ExternalCloud["External Cloud Endpoints"]
         InferenceAPI["User-chosen planner<br/>- Groq / NVIDIA / OpenRouter / Ollama"]
         VoiceAPI["ElevenLabs Realtime Audio<br/>- PCM16 Streaming"]
+        SearchAPI["TinyFish Search API<br/>- GET api.search.tinyfish.ai<br/>- X-API-Key, service worker only"]
     end
 
     DOM --> DOMScanner
@@ -101,6 +106,9 @@ flowchart TD
     Controller --> FPE
     Controller --> Merkle
     Controller --> Tripwire
+    Controller --> SearchPolicy
+    SearchPolicy --> SearchAPI
+    SearchAPI -. "Ranked URLs, tokenized" .-> Controller
     Tripwire --> InferenceAPI
     Sidepanel --> Controller
     VoiceAPI <--> Sidepanel
@@ -211,7 +219,38 @@ sequenceDiagram
 
 **Learning without contamination:** successful runs deposit tool-order trajectories keyed by domain, replayed as few-shot guidance plus site-logic lessons. Replays print **paths only** (`On mail.google.com (email): click → type → click`) — an earlier version printed prior tasks verbatim and a later run hallucinated birthdays from them, so older wording is never rendered. GLiNER stays roadmap (no WASM runtime; `ner-labels.ts` already accepts its vocabularies).
 
-**Optional web search (TinyFish):** a `web_search` planner tool is designed but **not wired by default**. TinyFish's Search API (`GET https://api.search.tinyfish.ai`, `X-API-Key`, 12 000 free requests/day) returns ranked URLs without a page load, so "find the page" costs one tool call instead of a search-results navigation plus a snapshot and frame. It runs in the service worker (no page CORS, key never in a content script), counts request + response bytes on the egress meter, and writes a `wire-log` record — and it **refuses vault tokens in a query by default**, because a search is egress to a third party. Transport and harness: [`src/background/tinyfish.ts`](src/background/tinyfish.ts), [`scripts/tinyfish-test.mjs`](scripts/tinyfish-test.mjs). Architecture analysis, privacy analysis, and the file-by-file wiring guide: [docs/tinyfish-integration.md](docs/tinyfish-integration.md).
+**Optional web search (TinyFish):** a `web_search` planner tool, wired but **off until a key is set**. TinyFish's Search API (`GET https://api.search.tinyfish.ai`, `X-API-Key`, 12 000 free requests/day) returns ranked URLs without a page load, so "find the page" costs one tool call instead of a search-results navigation plus a snapshot and frame. With no key the dependency is absent, so the tool is never offered — a planner cannot spend a turn discovering a configuration fact. The transport lives in [`src/background/tinyfish.ts`](src/background/tinyfish.ts) and is injected from the service worker, which means the loop holds no key; it parses the documented response and returns the request and response byte counts, which the run puts on the egress meter and records in the wire log as `tinyfish:search`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant LLM as Planner
+    participant SW as Service Worker
+    participant Policy as Query Egress Policy
+    participant TF as TinyFish Search API
+    participant Vault as Token Vault
+
+    LLM->>SW: web_search(query, purpose)
+    SW->>Policy: Plan the query (raw — never resolved first)
+    alt Query holds a value this run redacted
+        Policy-->>SW: Refuse (vault token or PII)
+        SW-->>LLM: Tool error — nothing was sent
+    else Query is public and in bounds
+        Policy->>TF: GET /?query=… (X-API-Key)
+        TF-->>Policy: Ranked results + byte count
+        Policy->>Vault: Tokenize PII found in the results
+        Policy-->>SW: Result text, bytes, result count
+        SW-->>LLM: Ranked URLs — navigate to one, never invent one
+    end
+```
+
+The decision about **what may leave** lives in [`src/background/web-search.ts`](src/background/web-search.ts), a pure, dependency-injected module: bounds first, then vault tokens, then PII patterns. A query that contains a value this run already redacted is **refused, not rewritten** — a search query is the one string a redaction cannot protect, because it must stay readable to be useful, and resolving a vault token to search for it would send a value the run deliberately removed. `allowResolvedQueries` defaults to `false`, and a per-run cap (`maxSearchesPerRun`, default 3) stops a planner that has lost the thread from burning the 30/min quota. Results come back through the same PII matchers that guard page text, so a snippet that publishes an email cannot park it in the planner's context forever.
+
+The base `TOOLS` list stays the 16 page tools, untouched — the run composes `TOOLS + web_search` only when a key exists, so a default install behaves exactly like main, and `web_search` is registered read-only so a search does not trigger a screenshot. Configure it in Options → Web search.
+
+Verification: [`scripts/tinyfish-test.mjs`](scripts/tinyfish-test.mjs) runs 102 assertions — the transport against a stubbed `fetch`, the dispatch policy driven with a stub transport (every refusal proven as "the transport was never called"), and invariants that fail if `web_search` ever lands in `TOOLS`, if the read-only table changes, or if the settings slot stops defaulting to empty. It is part of `npm run verify`.
+
+Two live tests cover what a stub cannot, gated on keys so they never run unattended: [`tinyfish-live.mjs`](scripts/tinyfish-live.mjs) against the real service (response shape, byte counts, `include_domains` filtering to zero, a bad key failing closed), and [`tinyfish-planner-live.mjs`](scripts/tinyfish-planner-live.mjs), which drives the real planner adapter to confirm a real model calls `web_search` with arguments that survive the policy and then names a URL **from the results** rather than from memory.
 
 ---
 
@@ -286,6 +325,8 @@ stateDiagram-v2
 
 Page `fetch`/`XHR`/`sendBeacon` hooks inspect bodies against PII patterns, separate surrogates from raw values, and classify destination where the origin is visible (missing verdicts read as third-party — fail closed on classification, open on traffic). **Never blocks, cancels, or rewrites** — true blocking needs `declarativeNetRequest`: roadmap. Vault mappings live in worker RAM only, unencrypted and unpartitioned (AES-GCM per-tab roadmap).
 
+This tripwire watches the **page's** traffic, not PRY's own. The planner's search query is a separate channel with its own controls: the query egress policy decides whether it may leave (§5), the bytes land on the run's egress meter, and the exact query is written to the wire log as `tinyfish:search`.
+
 ---
 
 ## 8. Inspector, Comparison, Repository
@@ -304,12 +345,13 @@ Split-view raw-vs-sanitized canvas, color-coded boxes, live vault mapping, `audi
 | Memory | Remote session caching | Worker-memory-only, never persisted |
 | Egress defense | Prompt instructions | Deterministic tripwire — reports, never blocks |
 | Full page | Single viewport | Scroll-and-stitch with re-mapping |
+| Find the page | Drive a search engine, read the results | One read-only `web_search` round trip — off by default, refuses a query holding a redacted value |
 
 ```
 pry/
 ├── build.mjs / package.json / tsconfig.json
 ├── src/
-│   ├── background/   # agent loop, budgets, tokenizer, ledger, re-OCR, vision, wire-log
+│   ├── background/   # agent loop, budgets, tokenizer, ledger, re-OCR, vision, wire-log, web-search
 │   ├── content/      # perceive, act, tripwire, settle
 │   ├── offscreen/    # canvas, faces, OCR verifier
 │   ├── ml/           # NER, guard loader, ONNX env
@@ -317,7 +359,7 @@ pry/
 │   ├── inspector/ options/  # verification UI, settings
 │   └── shared/       # pure policy: types, models, PII patterns, checksums
 ├── models/           # BlazeFace + quantized NER weights
-├── scripts/          # verify, tripwire/OCR/bench/packaging harnesses
+├── scripts/          # verify, tripwire/OCR/bench/packaging harnesses, tinyfish
 └── test/pages/       # local fixtures
 ```
 
@@ -326,11 +368,11 @@ pry/
 ## 9. Installation, Verification, and Build
 
 ```bash
-npm install && npm run verify   # 1544 assertions green first
+npm install && npm run verify   # 1656 assertions green first
 npm run build                   # bundles dist/
 ```
 
-**1544 total: 1172 pipeline + 31 tripwire + 11 OCR + 41 egress + 98 offscreen + 119 agent-loop + 72 voice** — real shipped modules under test (OCR runs live Tesseract; `runTask` driven with stubbed browser), plus adversarial reconstruction attacks, transport-fault fixtures, and loop-judgement pins. `npm run bench:latency` measures pixel/OCR/tiling costs and the flat ~24 KB/turn request (9.9 KB system + 4.5 KB tools + ~10 KB conversation, stale reads pruned). `npm run demo:serve` serves fixtures over loopback (`file://` blinds content scripts).
+**1656 total: 1182 pipeline + 31 tripwire + 11 OCR + 41 egress + 98 offscreen + 119 agent-loop + 72 voice + 102 tinyfish** — real shipped modules under test (OCR runs live Tesseract; `runTask` driven with stubbed browser), plus adversarial reconstruction attacks, transport-fault fixtures, and loop-judgement pins. `npm run bench:latency` measures pixel/OCR/tiling costs and the flat ~24 KB/turn request (9.9 KB system + 4.5 KB tools + ~10 KB conversation, stale reads pruned). `npm run demo:serve` serves fixtures over loopback (`file://` blinds content scripts).
 
 Load `dist/` unpacked at `chrome://extensions/` (Developer mode; never `src/`; reload after every build). `node scripts/package.mjs` writes the ~125 MB release ZIP (weights + wasm included) — uncommitted (over GitHub's 100 MB/file limit), shipped as a Release asset; verify by listing its 80 entries, not its filename.
 
@@ -338,4 +380,4 @@ Load `dist/` unpacked at `chrome://extensions/` (Developer mode; never `src/`; r
 
 ## 10. Regulatory Alignment and License
 
-DPDP Act 2023 §6, GDPR Articles 9/25, HIPAA Privacy Rule — compliant with no server-side data agreements, since PII never leaves the client. Licensed under the PolyForm Strict License 1.0.0 (see [LICENSE](LICENSE)) — all rights reserved. This software is source-available for personal study, research, and noncommercial use only; you may not copy, modify, distribute, or use it commercially without explicit written permission from the copyright holder.
+DPDP Act 2023 §6, GDPR Articles 9/25, HIPAA Privacy Rule — compliant with no server-side data agreements, since PII never leaves the client. One declared exception, and only where the user asks for it: the optional TinyFish search channel (§5) sends a **query** to a third party, which is exactly why the query policy refuses a query holding a value this run redacted, and why the feature stays off until a key is set. Licensed under the PolyForm Strict License 1.0.0 (see [LICENSE](LICENSE)) — all rights reserved. This software is source-available for personal study, research, and noncommercial use only; you may not copy, modify, distribute, or use it commercially without explicit written permission from the copyright holder.

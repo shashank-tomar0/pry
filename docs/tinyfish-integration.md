@@ -3,10 +3,13 @@
 **A code-level analysis of PRY, a verified map of TinyFish's web-search API, and the
 concrete ways this agent (or its harness) can use it.**
 
-Written against the working tree on 2026-10-18. Line references are to the files as
-they exist now. The transport module described here is implemented and tested:
-[`src/background/tinyfish.ts`](../src/background/tinyfish.ts) with
-[`scripts/tinyfish-test.mjs`](../scripts/tinyfish-test.mjs) (47 assertions, passing).
+Written against the working tree on 2026-10-19. Line references are to the files as
+they exist now. The integration is **implemented and tested**: the transport
+([`src/background/tinyfish.ts`](../src/background/tinyfish.ts)), the query-egress policy
+([`src/background/web-search.ts`](../src/background/web-search.ts)), the loop dispatch
+([`src/background/agent.ts`](../src/background/agent.ts)) and the Options section, with
+[`scripts/tinyfish-test.mjs`](../scripts/tinyfish-test.mjs) (102 assertions, passing,
+part of `npm run verify`).
 
 ---
 
@@ -38,10 +41,17 @@ The recommended first version:
 - results sanitized with the existing text pipeline before entering `messages`
 - request + response bytes counted in the egress meter and written to the wire log
 - search counts as a read-only action (no screenshot, no stale-frame cost)
-- one search per distinct query per run, hard-capped at 5 per run
+- hard-capped at N searches per run (default 3, configurable in Options)
 
-That is ~120 lines of wiring across six files. The rest of this document explains why
-each of those clauses exists.
+The policy is ~120 lines across `web-search.ts`; the wiring is ~80 more in `agent.ts`
+and `service-worker.ts`. The rest of this document explains why each of those clauses
+exists.
+
+One clause was **not** built, and it is worth naming: de-duplicating repeated queries
+within a run. The per-run cap bounds the damage (a planner that re-searches the same
+words still cannot exceed 3), so the duplicate is merely wasted, not unbounded — and a
+normalised-query map would need to be careful about what counts as "the same" query,
+which is a judgement call better made against observed runs than guessed at now.
 
 ---
 
@@ -318,74 +328,99 @@ sanitation as Option C. Do not ship this before Search.
 
 ## 4. Wiring `web_search` — file by file
 
-The transport is already written and tested. What follows is the remaining wiring.
+**Status: shipped, gated on a key.** This section describes what is in the tree, then
+names the three pieces that are deliberately still open. The feature is on whenever
+`settings.search.apiKey` is non-empty; with no key the dependency is absent and the
+tool is never offered to the planner, so a default install behaves exactly as before.
+
+| Piece | State |
+|---|---|
+| Transport ([`tinyfish.ts`](../src/background/tinyfish.ts)) | Shipped |
+| Policy module ([`web-search.ts`](../src/background/web-search.ts)) | Shipped — `planSearch`, `dispatchSearch`, `tokenizePiiInText` |
+| Settings block (`types.ts`) | Shipped — 4 fields, deep-merged |
+| Loop dispatch + `AgentDeps.webSearch` ([`agent.ts`](../src/background/agent.ts)) | Shipped |
+| Service-worker injection ([`service-worker.ts`](../src/background/service-worker.ts)) | Shipped |
+| Options UI ([`options/index.html`](../src/options/index.html)) | Shipped |
+| System-prompt paragraph (§4.5) | **Not done** |
+| Sidepanel glyph (§4.6) | **Not done** |
+| `ledgerRecordAction` (§4.7) | **Not done** |
+
+The harness pins the one invariant that must not drift: `TOOLS` stays the 16 page
+tools, because the run composes `TOOLS + TINYFISH_WEB_SEARCH_TOOL` per-run. Putting
+the tool in `TOOLS` directly would offer it to a no-key install, where it can only
+refuse — worse than not having it, since the model spends a turn discovering a
+configuration fact. (An earlier draft of this guide proposed `TOOLS.push(...)`; the
+per-run composition is why that line does not exist.)
 
 ### 4.1 Settings
 
-Add to `Settings` in [`src/shared/types.ts`](../src/shared/types.ts#L472):
+Shipped in [`src/shared/types.ts`](../src/shared/types.ts#L535) as
+`search: TinyFishSettings` (required, like `elevenlabs`/`ml`), defaulted in
+`DEFAULT_SETTINGS` and deep-merged in `normaliseSettings` (the same
+`{ ...defaults, ...(raw.block ?? {}) }` pattern, so a stored `{}` cannot wipe the
+default). An empty `apiKey` **is** the off switch — there is no separate `enabled`
+flag, because a master switch and an empty key would be two ways to say the same
+thing, and the key check is the one the transport already makes:
 
 ```ts
-export interface SearchSettings {
-  /** Master switch; the tool is not offered when false or no key. */
-  enabled: boolean;
-  /** TinyFish key. Stored with the other provider keys in chrome.storage.local. */
+export interface TinyFishSettings {
+  /**
+   * TinyFish API key. An empty key is the feature switch: with no key the
+   * `web_search` tool is not offered to the planner at all.
+   */
   apiKey: string;
-  /** Client-side cap per call. */
+  /** Ranked results per search. 1-20. */
   maxResults: number;
-  /** Hard cap per run, so a confused planner cannot burn the 30/min limit. */
+  /**
+   * Hard cap per run. The free tier allows 30 requests/minute per key, and a
+   * planner that has lost the thread will happily search in a loop.
+   */
   maxSearchesPerRun: number;
   /**
-   * Allow a vault token in a query to be resolved and sent to TinyFish.
-   * DEFAULT FALSE. When false, a token in a query is a tool error, not a
-   * silent value leak.
+   * Allow a query containing a vault token to be resolved and sent.
+   * DEFAULT FALSE. A token in a query means the run is about to search for a
+   * value it deliberately removed from its own reasoning; refusing is the only
+   * default that cannot silently undo a redaction.
    */
   allowResolvedQueries: boolean;
 }
 ```
 
-Add `search: SearchSettings` to `Settings`, a default block in `DEFAULT_SETTINGS`
-([`types.ts:591`](../src/shared/types.ts#L591)), and a merge in `normaliseSettings`
-(same pattern as `elevenlabs`/`ml`). Do **not** add it to `apiKeys: Record<ProviderId,…>`:
-TinyFish is not a planner provider, and widening `ProviderId` would ripple through
-`PROVIDERS`, `createPlanner`, and the options list.
+Not in `apiKeys: Record<ProviderId,…>`: TinyFish is not a planner provider, and
+widening `ProviderId` would ripple through `PROVIDERS`, `createPlanner`, and the
+options list.
 
 ### 4.2 Tool schema
 
-In [`src/background/tools.ts`](../src/background/tools.ts#L8):
+Exported from [`src/background/tools.ts`](../src/background/tools.ts#L230) as
+`TINYFISH_WEB_SEARCH_TOOL` — **not** as an entry in `TOOLS`. The six properties,
+`query` required, `purpose` optional:
 
 ```ts
-{
+export const TINYFISH_WEB_SEARCH_TOOL: ToolSpec = {
   name: "web_search",
-  description:
-    "Search the public web for a URL or a fact. Use this when you do not already " +
-    "know the address of the page you need, or when the site's own search would " +
-    "cost a page read. Returns ranked titles, URLs and snippets — then use " +
-    "navigate/open_tab with a returned URL. Do not search for anything the user " +
-    "marked private: queries leave the browser and vault tokens are refused.",
   parameters: {
     type: "object",
     properties: {
-      query: { type: "string", description: "Search terms, not a full sentence" },
-      purpose: { type: "string", description: "One line: why this search" },
-      include_domains: {
-        type: "array",
-        items: { type: "string" },
-        description: "Restrict to these domains, e.g. [\"github.com\"]",
-      },
-      domain_type: {
-        type: "string",
-        enum: ["web", "news", "research_paper"],
-        description: "Defaults to web",
-      },
-      max_results: { type: "number", description: "1-10, default 6" },
+      query: { type: "string" },
+      purpose: { type: "string" },
+      domain_type: { type: "string", enum: ["web", "news", "research_paper"] },
+      include_domains: { type: "array", items: { type: "string" } },
+      exclude_domains: { type: "array", items: { type: "string" } },
+      max_results: { type: "number" },
     },
-    required: ["query", "purpose"],
+    required: ["query"],
     additionalProperties: false,
   },
-},
+};
 ```
 
-And extend the read-only table:
+Only `query` is required: `purpose` improves ranking, but a planner that must supply a
+justification to search will write a worse query. The description text carries the
+policy instead (prefer navigating when the URL is known; a private value must not be
+searched for).
+
+The read-only table is likewise extended in the tree:
 
 ```ts
 export const READ_ONLY_ACTIONS = new Set(["find_text", "wait", "read_page", "web_search"]);
@@ -397,199 +432,149 @@ This one line matters: without it, `actionChangesFrame("web_search")` returns `t
 
 ### 4.3 Dependency
 
-In `AgentDeps` ([`agent.ts:433`](../src/background/agent.ts#L433)), mirror
-`captureScreenshot`:
+`AgentDeps` in [`agent.ts`](../src/background/agent.ts#L485) carries one optional
+closure. It takes the run's `AbortSignal` and returns the byte count plus the result
+count (the transport's `formatSearchResults` already renders the text):
 
 ```ts
-/**
- * Runs one TinyFish search. Injected so the loop never holds a key, and so the
- * harness can drive it with a stub. Returns text already safe for `messages`
- * plus the bytes that left, for the egress meter.
- */
-webSearch?: (request: {
-  query: string;
-  purpose: string;
-  includeDomains?: string[];
-  domainType?: "web" | "news" | "research_paper";
-  maxResults?: number;
-}) => Promise<{ text: string; bytes: number; query: string }>;
+webSearch?: (
+  request: {
+    query: string;
+    purpose?: string;
+    domainType?: "web" | "news" | "research_paper";
+    includeDomains?: string[];
+    excludeDomains?: string[];
+    maxResults?: number;
+  },
+  signal: AbortSignal,
+) => Promise<{ text: string; bytes: number; results: number }>;
 ```
 
-Wire it in `start()` ([`service-worker.ts:1238`](../src/background/service-worker.ts#L1238)):
+Injected in the `runTask` call in [`service-worker.ts`](../src/background/service-worker.ts#L1238),
+absent when the key is empty:
 
 ```ts
-webSearch: settings.search.enabled && settings.search.apiKey
-  ? async (req) => {
+webSearch: settings.search.apiKey
+  ? async (request, signal) => {
       const response = await searchWeb(settings.search.apiKey, {
-        query: req.query,
-        purpose: req.purpose,
-        includeDomains: req.includeDomains,
-        domainType: req.domainType,
-        maxResults: Math.min(req.maxResults ?? settings.search.maxResults, 10),
-      });
+        query: request.query,
+        purpose: request.purpose,
+        domainType: request.domainType,
+        includeDomains: request.includeDomains,
+        excludeDomains: request.excludeDomains,
+        maxResults: request.maxResults,
+      }, { signal });
       return {
-        text: sanitizeTextPII(formatSearchResults(response)),
+        text: formatSearchResults(response, { maxResults: request.maxResults }),
         bytes: response.bytes,
-        query: response.query,
+        results: response.results.length,
       };
     }
   : undefined,
 ```
 
-`sanitizeTextPII` is the existing shallow sanitizer used for titles
-([`agent.ts:100`](../src/background/agent.ts#L100)). It is a floor, not the full
-pipeline: names and organisations in snippets are only caught if the detectors fire.
-A stronger version routes the rendered text through `detectContextualPII` and replaces
-matches with `[REDACTED]` before returning. That is the right default for snippets from
-arbitrary pages, and it is the one place this integration can quietly undermine the
-project if skipped.
+The loop builds its tool list from this dependency, so an absent key means the tool is
+never shown — see `canWebSearch` in [`agent.ts`](../src/background/agent.ts#L596).
+
+Sanitation of the returned text is **not** done here. It is done in `dispatchSearch`
+(`tokenizePiiInText`, below), so the sanitizer and the policy live in the same module
+and cannot be separated by a caller who forgets.
 
 ### 4.4 Dispatch in the loop
 
-Insert in the `for (const call of turn.toolCalls)` block, right after the step card is
-emitted ([`agent.ts:2760`](../src/background/agent.ts#L2760)) and before the
-`element_id` validation:
+Shipped in [`agent.ts`](../src/background/agent.ts), inside the
+`for (const call of turn.toolCalls)` block, right after the step card is emitted and
+**before** the `element_id` validation. That placement is deliberate: everything after
+it validates element ids against a snapshot, resolves vault tokens at the last moment,
+and runs `gate()` as though the tool were about to touch the page. A search is none of
+those things — there is no element to validate, and resolving tokens first would hand
+`planSearch` the very value it exists to refuse. So the policy sees the RAW query.
+
+The branch itself is thin; the decisions live in `dispatchSearch`
+([`web-search.ts`](../src/background/web-search.ts)). Roughly:
 
 ```ts
-// ── web_search: a network read, not a page action ──────────────────────────
-if (call.name === "web_search") {
-  const rawQuery = String(call.input.query ?? "").trim();
-  const purpose = String(call.input.purpose ?? "").trim();
+if (call.name === WEB_SEARCH_TOOL) {
+  if (!canWebSearch || deps.webSearch === undefined) { /* refuse, naming the fix */ continue; }
 
-  if (!deps.webSearch) {
-    results.push({
-      id: call.id,
-      isError: true,
-      content:
-        "Web search is off. Add a TinyFish key in Options → Web search, or find the " +
-        "page by navigating to it directly.",
-    });
-    continue;
-  }
+  const search = await dispatchSearch(call.input, {
+    vaultTokens: tokensIn,
+    resolve: (value) => tokenizer.resolveAll(value),
+    mask: maskSample,
+    search: (plan, sig) => deps.webSearch!(plan, sig),
+    signal,
+    searchesUsed: searchesThisRun,
+    maxSearchesPerRun: settings.search.maxSearchesPerRun,
+    tokenize: (value, kind) => tokenizer.tokenize(value, kind),
+  }, {
+    allowResolvedQueries: settings.search.allowResolvedQueries,
+    maxResults: settings.search.maxResults,
+  });
 
-  // Tokens are REFUSED by default. A query is egress to a third party, and the
-  // vault exists so real values do not leave. allowResolvedQueries is the
-  // explicit opt-in, and it still only resolves — it never invents.
-  if (/<[A-Z]+_\d+>/.test(rawQuery + " " + purpose)) {
-    if (!settings.search.allowResolvedQueries) {
-      emit({
-        kind: "patch",
-        id: stepId,
-        text: "Blocked — the query contains a private value.",
-        pending: false,
-      });
-      results.push({
-        id: call.id,
-        isError: true,
-        content:
-          "That query contains a vault token, so sending it would put the user's " +
-          "private value on the wire to a third-party search API. Do not retry it. " +
-          "Either search for generic words, or navigate directly to the site.",
-      });
-      continue;
-    }
-    call.input.query = tokenizer.resolveAll(rawQuery);
-  }
+  if (!search.ok) { emit(/* refused */); results.push({ id: call.id, isError: true, content: search.error }); continue; }
 
-  // Per-run cap and de-duplication: 30 req/min is a real limit, and a loop
-  // that searches the same words twice has learned nothing.
-  const searchKey = rawQuery.toLowerCase().replace(/\s+/g, " ").trim();
-  if (searchSeen.has(searchKey)) {
-    results.push({ id: call.id, content: `Already searched for ${JSON.stringify(rawQuery)} this run; use the earlier results.` });
-    continue;
-  }
-  if (searchCount >= settings.search.maxSearchesPerRun) {
-    results.push({ id: call.id, isError: true, content: `Search limit for this run reached (${settings.search.maxSearchesPerRun}). Use the results you have or navigate directly.` });
-    continue;
-  }
-
-  try {
-    const outcome = await deps.webSearch({
-      query: String(call.input.query ?? ""),
-      purpose,
-      includeDomains: Array.isArray(call.input.include_domains)
-        ? call.input.include_domains.map(String)
-        : undefined,
-      domainType: call.input.domain_type as never,
-      maxResults: typeof call.input.max_results === "number" ? call.input.max_results : undefined,
-    });
-    searchSeen.add(searchKey);
-    searchCount++;
-
-    // The bytes left the browser: count them on the same meter the planner
-    // and vision use, and put the payload in the wire log for the audit.
-    sessionEgressBytes += outcome.bytes;
-    estimatedTokens += Math.ceil(outcome.bytes / 4);
-    emit({ kind: "egress", bytes: sessionEgressBytes });
-    recordWire({
-      turn: step,
-      destination: "tinyfish:search",
-      systemChars: 0,
-      messages: [
-        { role: "user", text: `${outcome.query}\n${purpose}` },
-        { role: "tool", text: outcome.text },
-      ],
-      tokens: tokensIn(outcome.text),
-      leaked: scanForLeaks(outcome.text),
-      totalChars: outcome.text.length,
-    });
-    ledgerRecordAction("web_search", true).catch(() => {});
-
-    emit({ kind: "patch", id: stepId, text: `Searched the web — ${outcome.text.split("\n").length} lines of results.`, pending: false });
-    results.push({ id: call.id, content: outcome.text });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    ledgerRecordAction("web_search", false).catch(() => {});
-    emit({ kind: "patch", id: stepId, text: "Search failed — continuing without it.", pending: false });
-    results.push({
-      id: call.id,
-      isError: true,
-      content: `${message} If this keeps failing, navigate to the site directly and use its own search.`,
-    });
-  }
+  searchesThisRun++;
+  sessionEgressBytes += search.bytes;
+  estimatedTokens += Math.ceil(search.bytes / 4);
+  emit({ kind: "egress", bytes: sessionEgressBytes });
+  recordWire({ turn: step, destination: "tinyfish:search", systemChars: 0,
+    messages: [{ role: "user", text: search.query }], tokens: tokensIn(search.query),
+    leaked: scanForLeaks(search.query), totalChars: search.query.length });
+  emit({ kind: "patch", id: stepId, text: `Searched — ${search.results} result(s).`, pending: false });
+  results.push({ id: call.id, content: search.content });
   continue;
 }
 ```
 
-Add `let searchCount = 0; const searchSeen = new Set<string>();` near the run's other
-counters. Two details:
+`canWebSearch` is `deps.webSearch !== undefined && settings.search.apiKey !== ""`, and
+`plannerTools` is `canWebSearch ? [...TOOLS, TINYFISH_WEB_SEARCH_TOOL] : TOOLS` — one
+list feeds both the request and the egress estimate, so they cannot disagree.
 
-- **Do not** let the result imply the page changed. `actionChangesFrame` is false for
-  this action, and the `continue` skips the re-perceive block entirely.
-- **Do not** put the search result in `messages` without the sanitizer. The tool result
-  is re-sent on every later turn, so an unsanitized snippet is a per-turn leak.
+Three properties the harness pins:
 
-### 4.5 System prompt
+- **The policy runs before the transport.** Every refusal is proven as "the transport
+  was never called". A policy that refused *after* sending would be a leak with an
+  error message attached.
+- **The result never implies the page changed.** `actionChangesFrame` is false for this
+  action, and the `continue` skips the re-perceive block entirely.
+- **Returned text is tokenized before it reaches `messages`.** `tokenizePiiInText`
+  runs the same `matchPiiInText` set that guards page text, because the tool result is
+  re-sent on every later turn — an unsanitized snippet would be a per-turn leak.
 
-Add one paragraph to `SYSTEM_PROMPT` in [`prompt.ts:1`](../src/background/prompt.ts#L1):
+### 4.5 System prompt — not done
 
-> **Finding a page.** If you do not already know the URL, call `web_search` once with
-> terse terms and a one-line purpose. Then `navigate` to one of the returned URLs. Do not
-> search for the site you are already on, do not search twice for the same thing, and do
-> not paste private values into a query — tokens are refused there by design. If the task
-> is to use a site's own search box, type into that box instead.
-
-Keep it out of `SYSTEM_PROMPT_LOCAL`: small local models have 2–8 K contexts, and the
-tool adds ~150 tokens of schema plus results. Offer the tool only when
-`provider !== "ollama"` (or make it a setting).
+`SYSTEM_PROMPT` in [`prompt.ts`](../src/background/prompt.ts) has no `web_search`
+paragraph yet. The tool description carries the policy instead (prefer navigating when
+the URL is known; a private value must not be searched for), which is enough for the
+tool to function but leaves one behavior unprompted: searching for a site the agent is
+already sitting on. If a run is observed doing that, add a short paragraph — and keep
+it out of `SYSTEM_PROMPT_LOCAL`, since small local models have 2–8 K contexts and the
+tool adds ~150 tokens of schema plus results.
 
 ### 4.6 UI
 
-- **Options**: a "Web search (TinyFish)" section with key, enable toggle, max results,
-  searches/run, and the resolved-query warning. Follow the ElevenLabs section's markup
-  and save path in [`options.ts`](../src/options/options.ts#L297).
-- **Side panel**: `web_search: "⌕"` in `GLYPHS` ([`sidepanel.ts:435`](../src/sidepanel/sidepanel.ts#L435)).
-- **`describeIntent`**: `case "web_search": return `Search the web for "${...}"`;`.
-- **Egress badge**: already counts `sessionEgressBytes`; no change needed.
+- **Options — shipped.** A "Web search (TinyFish)" section in
+  [`options/index.html`](../src/options/index.html) with the key, results per search,
+  searches per run, and the resolved-query warning. The two numbers are clamped on save
+  (`clampInt`) rather than trusted, so a typed 0 or 5000 cannot reach the transport.
+- **Side panel — not done.** `GLYPHS` in [`sidepanel.ts`](../src/sidepanel/sidepanel.ts)
+  has no `web_search` entry, so the step card shows the generic fallback rendering of
+  the action name. Cosmetic; add `web_search: "⌕"` the next time that file is touched.
+- **`describeIntent` — shipped.** `Search the web for "…"`.
+- **Egress badge — no change needed.** It already counts `sessionEgressBytes`.
 
-### 4.7 Learning, ledger, audit
+### 4.7 Learning, ledger, audit — partially done
 
-- `ledgerRecordAction("web_search", ok)` gives the run a hash-chained entry. There is no
-  snapshot, so do not call `recordSnapshot`.
-- `reflectOnRun` sees actions by name; `web_search` will simply appear in the trajectory.
-  That is accurate — it *is* what happened.
-- The privacy audit card counts redactions, not searches. Do not inflate it. If you want
-  searches visible, add a separate "searches: N, bytes: B" line, not a redaction count.
+- **Wire log — shipped.** Each search is recorded with `destination: "tinyfish:search"`,
+  the query that left, its token scan, and a `scanForLeaks` pass over it.
+- **`ledgerRecordAction` — not done.** A search has no snapshot, so it would be a
+  hash-chained entry with no frame to attach. Left out rather than recorded blind; add
+  it if the ledger should count network reads alongside page actions.
+- **`reflectOnRun`** sees actions by name, so `web_search` will appear in the
+  trajectory. That is accurate — it *is* what happened.
+- **Privacy audit card** counts redactions, not searches, and is correct as-is:
+  searches belong on the egress meter and in the wire log, which is where a network
+  read is answerable.
 
 ---
 
@@ -677,22 +662,36 @@ channel explicit in `audit-proof.json`'s source chain.
 | Artifact | Status |
 |---|---|
 | [`src/background/tinyfish.ts`](../src/background/tinyfish.ts) | Transport: URL builder, auth header, parse, byte counting, classified errors, formatter. No imports, no `chrome`/DOM APIs, injectable `fetch`. |
-| [`scripts/tinyfish-test.mjs`](../scripts/tinyfish-test.mjs) | 47 assertions against a stubbed fetch: parameter mapping, validation, parsing, egress bytes, 401/402/429/500/503, timeouts, abort, formatting. **Passing.** |
-| TypeScript | `tsc --strict --noUnusedLocals` on the module: clean. |
+| [`scripts/tinyfish-test.mjs`](../scripts/tinyfish-test.mjs) | 102 assertions: parameter mapping, validation, parsing, egress bytes, 401/402/429/500/503, timeouts, abort and formatting against a stubbed fetch; the dispatch policy driven with a stub transport (vault-token refusal, PII refusal, per-run cap, transport failure, result tokenization — each proven as "the transport was never called"); plus the wiring invariant (`TOOLS` unchanged, `web_search` read-only, settings slot defaulting to empty). **Passing.** |
+| [`scripts/tinyfish-live.mjs`](../scripts/tinyfish-live.mjs) | LIVE smoke test against the real service, gated on `TINYFISH_API_KEY` (skips, sending nothing, when unset — so it is deliberately **not** in `npm run verify`). Covers what a stub cannot: the documented response shape as actually served, byte counts, `include_domains` genuinely filtering to zero, the vault-token refusal meaning nothing was sent, and a bad key failing **closed** (`401`, `retryable=false`, message names the fix without echoing the key). **Passing live: 17/17.** |
+| [`scripts/tinyfish-planner-live.mjs`](../scripts/tinyfish-planner-live.mjs) | LIVE model test, gated on `OPENROUTER_API_KEY`. Drives the REAL adapter (`createOpenAIPlanner`), the REAL schema, and the REAL policy: does a real model call `web_search`, do its arguments survive `planSearch`, and does it then name a URL **from the returned results** rather than from memory? Walks a model list because free-tier tool-calling is flaky (observed: the same model and prompt succeeded then failed 3× minutes later). **Passing live.** |
+| TypeScript | `tsc --noEmit` on the whole project: clean (0 errors, `strict` + `noUnusedLocals`). |
+| [`src/background/web-search.ts`](../src/background/web-search.ts) | The query-egress policy: `planSearch` (bounds → vault tokens → PII), `dispatchSearch` (per-run cap → policy → transport → result tokenization), `tokenizePiiInText`, `searchResultPreamble`. Pure, no browser imports. |
+| [`src/background/agent.ts`](../src/background/agent.ts) | `AgentDeps.webSearch`, per-run `plannerTools`, and the `web_search` dispatch branch, placed before the page-action path. |
+| [`src/background/service-worker.ts`](../src/background/service-worker.ts) | The injected transport closure; absent when `search.apiKey` is empty. |
+| [`src/shared/types.ts`](../src/shared/types.ts) | `TinyFishSettings` (4 fields), `DEFAULT_SETTINGS.search`, deep merge in `normaliseSettings`. |
+| [`src/options/index.html`](../src/options/index.html) | The Web search section: key, results per search, searches per run, resolved-query toggle. |
 
 Run it:
 
 ```bash
-node scripts/tinyfish-test.mjs
+node scripts/tinyfish-test.mjs   # or as part of npm run verify
 ```
 
-It is not yet in `npm run verify`; adding it there is a one-line change to the `verify`
-script in `package.json` (after the `esbuild` steps, next to `voice-test.mjs`).
+The two live tests above need keys, cost real requests, and are therefore run by hand:
 
-**What is not built:** the settings block, tool schema, dispatch, prompt line, UI, and
-the sanitizer routing. Those are the ~120 lines described in §4; they were left as a
-reviewable design because they change what can leave the browser, which is a product
-decision, not a refactor.
+```bash
+TINYFISH_API_KEY=…              node scripts/tinyfish-live.mjs
+OPENROUTER_API_KEY=… [TINYFISH_API_KEY=…] node scripts/tinyfish-planner-live.mjs
+```
+
+It is in `npm run verify` (appended after `voice-test.mjs`), so the whole chain —
+1656 assertions across 8 suites — runs it on every verification.
+
+**What is not built:** the system-prompt paragraph (§4.5), the sidepanel glyph (§4.6),
+and `ledgerRecordAction` for searches (§4.7). None of them change behavior the user
+can observe as a privacy property: the tool works, the policy is enforced, and the
+bytes are counted without them. They are named rather than quietly skipped.
 
 ---
 

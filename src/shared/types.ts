@@ -524,6 +524,42 @@ export interface Settings {
    * guard, skin-color faces). Fetch models with scripts/fetch-models.mjs.
    */
   ml: MlSettings;
+  /**
+   * TinyFish web search (off until a key is set).
+   *
+   * Required rather than optional, matching `elevenlabs`/`ml`: `normaliseSettings`
+   * always fills it, so `search` is never undefined at a call site and the block
+   * can be deep-merged without a `?? {}` widening its fields to optional. An empty
+   * key is the same as "not configured".
+   */
+  search: TinyFishSettings;
+}
+
+export interface TinyFishSettings {
+  /**
+   * TinyFish API key. Set in Options → Web search. The key leaves the browser
+   * only on a search, in an `X-API-Key` header from the service worker.
+   *
+   * An empty key is the feature switch: with no key the `web_search` tool is
+   * not offered to the planner at all, so a default install behaves exactly as
+   * it did before this feature existed.
+   */
+  apiKey: string;
+  /** Ranked results per search. 1-20. */
+  maxResults: number;
+  /**
+   * Hard cap per run. The free tier allows 30 requests/minute per key, and a
+   * planner that has lost the thread will happily search in a loop.
+   */
+  maxSearchesPerRun: number;
+  /**
+   * Allow a query containing a vault token to be resolved and sent.
+   *
+   * DEFAULT FALSE. A token in a query means the run is about to search for a
+   * value it deliberately removed from its own reasoning; refusing is the only
+   * default that cannot silently undo a redaction.
+   */
+  allowResolvedQueries: boolean;
 }
 
 export interface MlSettings {
@@ -625,6 +661,12 @@ export const DEFAULT_SETTINGS: Settings = {
     ner: true,
     guard: true,
   },
+  search: {
+    apiKey: "",
+    maxResults: 5,
+    maxSearchesPerRun: 3,
+    allowResolvedQueries: false,
+  },
 };
 
 /** The shape stored before multi-provider support landed. */
@@ -680,6 +722,10 @@ export function normaliseSettings(stored: unknown): Settings {
     },
     elevenlabs: { ...DEFAULT_SETTINGS.elevenlabs, ...(raw.elevenlabs ?? {}) },
     ml: { ...DEFAULT_SETTINGS.ml, ...(raw.ml ?? {}) },
+    // Deep-merged like every other block: a stored `search` written by an older
+    // build may be `{}` or carry only some fields, and a shallow spread would
+    // replace the whole default with it.
+    search: { ...DEFAULT_SETTINGS.search, ...(raw.search ?? {}) },
   };
 
   // Pre-multi-provider installs stored a bare Anthropic key and model.
